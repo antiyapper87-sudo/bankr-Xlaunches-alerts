@@ -13,12 +13,16 @@ import logging
 import os
 import time
 import re
+import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 # ─── Config from environment ──────────────────────────────────────────────────
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+WHAPI_TOKEN = os.getenv("WHAPI_TOKEN", "")
+WHATSAPP_GROUP_ID = os.getenv("WHATSAPP_GROUP_ID", "")
 MIN_FOLLOWERS = int(os.getenv("MIN_FOLLOWERS", "10000"))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))  # seconds
 BANKR_API_URL = "https://api.bankr.bot/token-launches"
@@ -36,6 +40,34 @@ log = logging.getLogger("bankr-whale")
 
 seen_tokens: set[str] = set()
 follower_cache: dict[str, int | None] = {}  # xUsername -> follower count
+
+# ─── Blocklist (persists to file) ─────────────────────────────────────────────
+
+BLOCKLIST_FILE = Path("/data/blocklist.json") if Path("/data").exists() else Path("blocklist.json")
+
+def load_blocklist() -> set[str]:
+    """Load blocked X usernames from file."""
+    try:
+        if BLOCKLIST_FILE.exists():
+            with open(BLOCKLIST_FILE) as f:
+                data = json.load(f)
+                blocked = {u.lower().strip().lstrip("@") for u in data}
+                log.info(f"🚫 Loaded {len(blocked)} blocked accounts")
+                return blocked
+    except Exception as e:
+        log.error(f"Error loading blocklist: {e}")
+    return set()
+
+def save_blocklist(blocked: set[str]):
+    """Save blocked X usernames to file."""
+    try:
+        BLOCKLIST_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(BLOCKLIST_FILE, "w") as f:
+            json.dump(sorted(blocked), f, indent=2)
+    except Exception as e:
+        log.error(f"Error saving blocklist: {e}")
+
+blocked_accounts: set[str] = load_blocklist()
 
 
 # ─── Telegram ─────────────────────────────────────────────────────────────────
@@ -64,6 +96,127 @@ async def send_telegram(session: aiohttp.ClientSession, text: str) -> bool:
     except Exception as e:
         log.error(f"❌ Telegram send failed: {e}")
         return False
+
+
+# ─── WhatsApp via Whapi ───────────────────────────────────────────────────────
+
+async def send_whatsapp(session: aiohttp.ClientSession, text: str) -> bool:
+    """Send a message to WhatsApp group via Whapi."""
+    if not WHAPI_TOKEN or not WHATSAPP_GROUP_ID:
+        return False
+    url = "https://gate.whapi.cloud/messages/text"
+    headers = {
+        "Authorization": f"Bearer {WHAPI_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "to": WHATSAPP_GROUP_ID,
+        "body": text,
+    }
+    try:
+        async with session.post(url, json=payload, headers=headers, timeout=10) as resp:
+            if resp.status in (200, 201):
+                log.info("✅ WhatsApp alert sent")
+                return True
+            else:
+                body = await resp.text()
+                log.error(f"❌ WhatsApp error {resp.status}: {body}")
+                return False
+    except Exception as e:
+        log.error(f"❌ WhatsApp send failed: {e}")
+        return False
+
+
+# ─── Send to all channels ────────────────────────────────────────────────────
+
+async def send_alert(session: aiohttp.ClientSession, telegram_text: str, whatsapp_text: str):
+    """Send alert to both Telegram and WhatsApp."""
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        await send_telegram(session, telegram_text)
+    if WHAPI_TOKEN and WHATSAPP_GROUP_ID:
+        await send_whatsapp(session, whatsapp_text)
+
+
+# ─── Telegram Command Handler ─────────────────────────────────────────────────
+
+last_update_id: int = 0
+
+async def check_telegram_commands(session: aiohttp.ClientSession):
+    """Poll Telegram for /block and /unblock commands."""
+    global last_update_id, blocked_accounts
+
+    if not TELEGRAM_BOT_TOKEN:
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    params = {"offset": last_update_id + 1, "timeout": 0, "limit": 10}
+
+    try:
+        async with session.get(url, params=params, timeout=5) as resp:
+            if resp.status != 200:
+                return
+            data = await resp.json()
+            if not data.get("ok"):
+                return
+
+            for update in data.get("result", []):
+                last_update_id = update["update_id"]
+                msg = update.get("message", {})
+                text = msg.get("text", "").strip()
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+
+                # Only accept commands from our configured chat
+                if chat_id != TELEGRAM_CHAT_ID:
+                    continue
+
+                # /block @username or /block username
+                if text.lower().startswith("/block"):
+                    parts = text.split(maxsplit=1)
+                    if len(parts) < 2:
+                        await send_telegram(session, "Usage: /block @username")
+                        continue
+                    username = parts[1].strip().lstrip("@").lower()
+                    blocked_accounts.add(username)
+                    save_blocklist(blocked_accounts)
+                    # Also clear from follower cache so we don't waste lookups
+                    follower_cache.pop(username, None)
+                    log.info(f"🚫 Blocked @{username}")
+                    await send_telegram(session, f"🚫 Blocked <b>@{username}</b> — their launches will be ignored.\n\n{len(blocked_accounts)} accounts blocked total.")
+
+                # /unblock @username
+                elif text.lower().startswith("/unblock"):
+                    parts = text.split(maxsplit=1)
+                    if len(parts) < 2:
+                        await send_telegram(session, "Usage: /unblock @username")
+                        continue
+                    username = parts[1].strip().lstrip("@").lower()
+                    blocked_accounts.discard(username)
+                    save_blocklist(blocked_accounts)
+                    log.info(f"✅ Unblocked @{username}")
+                    await send_telegram(session, f"✅ Unblocked <b>@{username}</b>")
+
+                # /blocklist — show all blocked accounts
+                elif text.lower().startswith("/blocklist"):
+                    if blocked_accounts:
+                        names = "\n".join(f"• @{u}" for u in sorted(blocked_accounts))
+                        await send_telegram(session, f"🚫 <b>Blocked accounts ({len(blocked_accounts)}):</b>\n{names}")
+                    else:
+                        await send_telegram(session, "No accounts blocked.")
+
+                # /status
+                elif text.lower().startswith("/status"):
+                    await send_telegram(
+                        session,
+                        f"🐋 <b>Bankr Whale Alert Bot</b>\n"
+                        f"• Tracking: {len(seen_tokens)} tokens seen\n"
+                        f"• Blocked: {len(blocked_accounts)} accounts\n"
+                        f"• Cached: {len(follower_cache)} follower lookups\n"
+                        f"• Min followers: {MIN_FOLLOWERS:,}\n"
+                        f"• Poll interval: {POLL_INTERVAL}s",
+                    )
+
+    except Exception as e:
+        log.debug(f"Telegram command check error: {e}")
 
 
 # ─── X/Twitter Follower Lookup ────────────────────────────────────────────────
@@ -225,8 +378,8 @@ async def fetch_launches(session: aiohttp.ClientSession) -> list[dict]:
 
 # ─── Alert Formatting ─────────────────────────────────────────────────────────
 
-def format_alert(launch: dict, follower_count: int) -> str:
-    """Format a Telegram alert message."""
+def format_alert(launch: dict, follower_count: int) -> tuple[str, str]:
+    """Format alert messages for Telegram (HTML) and WhatsApp (plain text)."""
     name = launch.get("tokenName", "Unknown")
     symbol = launch.get("tokenSymbol", "Unknown")
     address = launch.get("tokenAddress", "")
@@ -243,7 +396,8 @@ def format_alert(launch: dict, follower_count: int) -> str:
     else:
         followers_str = str(follower_count)
 
-    lines = [
+    # ── Telegram (HTML) ──
+    tg_lines = [
         f"🐋 <b>WHALE LAUNCH DETECTED</b>",
         f"",
         f"🪙 <b>{name}</b> (${symbol})",
@@ -254,18 +408,40 @@ def format_alert(launch: dict, follower_count: int) -> str:
     ]
 
     if tweet_url:
-        lines.append(f"🐦 <a href='{tweet_url}'>Original Tweet</a>")
+        tg_lines.append(f"🐦 <a href='{tweet_url}'>Original Tweet</a>")
 
     if website:
-        lines.append(f"🌐 <a href='{website}'>Website</a>")
+        tg_lines.append(f"🌐 <a href='{website}'>Website</a>")
 
-    # Trading links
     if address:
-        lines.append(f"")
-        lines.append(f"📊 <a href='https://dexscreener.com/base/{address}'>DexScreener</a> | <a href='https://www.dextools.io/app/en/base/pair-explorer/{address}'>DexTools</a>")
-        lines.append(f"💰 <a href='https://app.uniswap.org/swap?outputCurrency={address}&chain=base'>Buy on Uniswap</a>")
+        tg_lines.append(f"")
+        tg_lines.append(f"📊 <a href='https://dexscreener.com/base/{address}'>DexScreener</a> | <a href='https://www.dextools.io/app/en/base/pair-explorer/{address}'>DexTools</a>")
+        tg_lines.append(f"💰 <a href='https://app.uniswap.org/swap?outputCurrency={address}&chain=base'>Buy on Uniswap</a>")
 
-    return "\n".join(lines)
+    # ── WhatsApp (plain text) ──
+    wa_lines = [
+        f"🐋 *WHALE LAUNCH DETECTED*",
+        f"",
+        f"🪙 *{name}* (${symbol})",
+        f"👤 @{x_username} — *{followers_str} followers*",
+        f"https://x.com/{x_username}",
+        f"",
+        f"📍 Chain: Base",
+        f"📋 CA: {address}",
+    ]
+
+    if tweet_url:
+        wa_lines.append(f"🐦 Tweet: {tweet_url}")
+
+    if website:
+        wa_lines.append(f"🌐 {website}")
+
+    if address:
+        wa_lines.append(f"")
+        wa_lines.append(f"📊 https://dexscreener.com/base/{address}")
+        wa_lines.append(f"💰 https://app.uniswap.org/swap?outputCurrency={address}&chain=base")
+
+    return "\n".join(tg_lines), "\n".join(wa_lines)
 
 
 # ─── Main Loop ────────────────────────────────────────────────────────────────
@@ -277,17 +453,22 @@ async def poll_loop():
     log.info(f"  Min followers: {MIN_FOLLOWERS:,}")
     log.info(f"  Poll interval: {POLL_INTERVAL}s")
     log.info(f"  Telegram: {'✅ configured' if TELEGRAM_BOT_TOKEN else '❌ not configured'}")
+    log.info(f"  WhatsApp: {'✅ configured' if WHAPI_TOKEN else '❌ not configured'}")
     log.info("=" * 60)
 
     async with aiohttp.ClientSession() as session:
         # Send startup message
-        if TELEGRAM_BOT_TOKEN:
-            await send_telegram(
-                session,
-                f"🐋 <b>Bankr Whale Alert Bot started</b>\n"
-                f"Monitoring for launches by accounts with {MIN_FOLLOWERS:,}+ followers\n"
-                f"Polling every {POLL_INTERVAL}s",
-            )
+        startup_tg = (
+            f"🐋 <b>Bankr Whale Alert Bot started</b>\n"
+            f"Monitoring for launches by accounts with {MIN_FOLLOWERS:,}+ followers\n"
+            f"Polling every {POLL_INTERVAL}s"
+        )
+        startup_wa = (
+            f"🐋 *Bankr Whale Alert Bot started*\n"
+            f"Monitoring for launches by accounts with {MIN_FOLLOWERS:,}+ followers\n"
+            f"Polling every {POLL_INTERVAL}s"
+        )
+        await send_alert(session, startup_tg, startup_wa)
 
         # Initial fetch to populate seen_tokens (don't alert on existing ones)
         log.info("📋 Initial fetch to seed seen tokens...")
@@ -327,6 +508,11 @@ async def poll_loop():
                         log.debug(f"  {launch.get('tokenSymbol', '?')} — no X account, skipping")
                         continue
 
+                    # Check blocklist
+                    if x_username.lower() in blocked_accounts:
+                        log.info(f"  ${launch.get('tokenSymbol', '?')} by @{x_username} — BLOCKED, skipping")
+                        continue
+
                     # Check follower count
                     follower_count = await get_follower_count(session, x_username)
 
@@ -341,8 +527,8 @@ async def poll_loop():
                     # 🐋 WHALE DETECTED!
                     whale_count += 1
                     log.info(f"  🐋 ${launch.get('tokenSymbol', '?')} by @{x_username} — {follower_count:,} followers — ALERT!")
-                    alert_text = format_alert(launch, follower_count)
-                    await send_telegram(session, alert_text)
+                    tg_text, wa_text = format_alert(launch, follower_count)
+                    await send_alert(session, tg_text, wa_text)
 
                     # Small delay between alerts to avoid Telegram rate limits
                     await asyncio.sleep(1)
@@ -354,6 +540,9 @@ async def poll_loop():
 
             except Exception as e:
                 log.error(f"Poll loop error: {e}", exc_info=True)
+
+            # Check for Telegram commands (/block, /unblock, etc.)
+            await check_telegram_commands(session)
 
             await asyncio.sleep(POLL_INTERVAL)
 
