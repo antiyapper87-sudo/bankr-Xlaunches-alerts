@@ -1,8 +1,15 @@
 """
-Bankr Whale Alert Bot
-======================
-Monitors https://api.bankr.bot/token-launches for new token launches.
-When a token is launched by an X account with 10K+ followers → Telegram alert.
+Whale Alert Bot — Bankr + Clanker
+==================================
+Monitors TWO sources for new token launches on Base:
+  1. Bankr API  — https://api.bankr.bot/token-launches
+  2. Clanker API — https://www.clanker.world/api/tokens
+
+When a token is launched by an X account with 10K+ followers → alerts to
+Telegram + WhatsApp.
+
+Deduplicates by contract address so Bankr tokens (which also appear in
+Clanker) aren't double-alerted.
 
 Deploy: GitHub + Railway
 """
@@ -11,11 +18,9 @@ import asyncio
 import aiohttp
 import logging
 import os
-import time
 import re
 import json
 from datetime import datetime, timezone
-from pathlib import Path
 
 # ─── Config from environment ──────────────────────────────────────────────────
 
@@ -25,7 +30,9 @@ WHAPI_TOKEN = os.getenv("WHAPI_TOKEN", "")
 WHATSAPP_GROUP_ID = os.getenv("WHATSAPP_GROUP_ID", "")
 MIN_FOLLOWERS = int(os.getenv("MIN_FOLLOWERS", "10000"))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))  # seconds
+
 BANKR_API_URL = "https://api.bankr.bot/token-launches"
+CLANKER_API_URL = "https://www.clanker.world/api/tokens"
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -34,40 +41,37 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("bankr-whale")
+log = logging.getLogger("whale-alert")
 
 # ─── State ────────────────────────────────────────────────────────────────────
 
-seen_tokens: set[str] = set()
+seen_tokens: set[str] = set()          # contract addresses (lowercase)
 follower_cache: dict[str, int | None] = {}  # xUsername -> follower count
+blocked_accounts: set[str] = set()     # blocked X usernames (lowercase)
+BLOCKLIST_FILE = "/data/blocklist.json" if os.path.exists("/data") else "blocklist.json"
 
-# ─── Blocklist (persists to file) ─────────────────────────────────────────────
 
-BLOCKLIST_FILE = Path("/data/blocklist.json") if Path("/data").exists() else Path("blocklist.json")
+# ─── Blocklist persistence ────────────────────────────────────────────────────
 
-def load_blocklist() -> set[str]:
-    """Load blocked X usernames from file."""
+def load_blocklist():
+    global blocked_accounts
     try:
-        if BLOCKLIST_FILE.exists():
-            with open(BLOCKLIST_FILE) as f:
-                data = json.load(f)
-                blocked = {u.lower().strip().lstrip("@") for u in data}
-                log.info(f"🚫 Loaded {len(blocked)} blocked accounts")
-                return blocked
+        with open(BLOCKLIST_FILE, "r") as f:
+            blocked_accounts = set(json.load(f))
+        log.info(f"📋 Loaded {len(blocked_accounts)} blocked accounts")
+    except FileNotFoundError:
+        blocked_accounts = set()
     except Exception as e:
         log.error(f"Error loading blocklist: {e}")
-    return set()
+        blocked_accounts = set()
 
-def save_blocklist(blocked: set[str]):
-    """Save blocked X usernames to file."""
+
+def save_blocklist():
     try:
-        BLOCKLIST_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(BLOCKLIST_FILE, "w") as f:
-            json.dump(sorted(blocked), f, indent=2)
+            json.dump(list(blocked_accounts), f)
     except Exception as e:
         log.error(f"Error saving blocklist: {e}")
-
-blocked_accounts: set[str] = load_blocklist()
 
 
 # ─── Telegram ─────────────────────────────────────────────────────────────────
@@ -75,7 +79,6 @@ blocked_accounts: set[str] = load_blocklist()
 async def send_telegram(session: aiohttp.ClientSession, text: str) -> bool:
     """Send a message to Telegram chat."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram not configured")
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -129,264 +132,232 @@ async def send_whatsapp(session: aiohttp.ClientSession, text: str) -> bool:
 
 # ─── Send to all channels ────────────────────────────────────────────────────
 
-async def send_alert(session: aiohttp.ClientSession, telegram_text: str, whatsapp_text: str):
+async def send_alert(session: aiohttp.ClientSession, tg_text: str, wa_text: str):
     """Send alert to both Telegram and WhatsApp."""
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        await send_telegram(session, telegram_text)
+        await send_telegram(session, tg_text)
     if WHAPI_TOKEN and WHATSAPP_GROUP_ID:
-        await send_whatsapp(session, whatsapp_text)
+        await send_whatsapp(session, wa_text)
 
 
-# ─── Telegram Command Handler ─────────────────────────────────────────────────
-
-last_update_id: int = 0
-
-async def check_telegram_commands(session: aiohttp.ClientSession):
-    """Poll Telegram for /block and /unblock commands."""
-    global last_update_id, blocked_accounts
-
-    if not TELEGRAM_BOT_TOKEN:
-        return
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    params = {"offset": last_update_id + 1, "timeout": 0, "limit": 10}
-
-    try:
-        async with session.get(url, params=params, timeout=5) as resp:
-            if resp.status != 200:
-                return
-            data = await resp.json()
-            if not data.get("ok"):
-                return
-
-            for update in data.get("result", []):
-                last_update_id = update["update_id"]
-                msg = update.get("message", {})
-                text = msg.get("text", "").strip()
-                chat_id = str(msg.get("chat", {}).get("id", ""))
-
-                # Only accept commands from our configured chat
-                if chat_id != TELEGRAM_CHAT_ID:
-                    continue
-
-                # /block @username or /block username
-                if text.lower().startswith("/block"):
-                    parts = text.split(maxsplit=1)
-                    if len(parts) < 2:
-                        await send_telegram(session, "Usage: /block @username")
-                        continue
-                    username = parts[1].strip().lstrip("@").lower()
-                    blocked_accounts.add(username)
-                    save_blocklist(blocked_accounts)
-                    # Also clear from follower cache so we don't waste lookups
-                    follower_cache.pop(username, None)
-                    log.info(f"🚫 Blocked @{username}")
-                    await send_telegram(session, f"🚫 Blocked <b>@{username}</b> — their launches will be ignored.\n\n{len(blocked_accounts)} accounts blocked total.")
-
-                # /unblock @username
-                elif text.lower().startswith("/unblock"):
-                    parts = text.split(maxsplit=1)
-                    if len(parts) < 2:
-                        await send_telegram(session, "Usage: /unblock @username")
-                        continue
-                    username = parts[1].strip().lstrip("@").lower()
-                    blocked_accounts.discard(username)
-                    save_blocklist(blocked_accounts)
-                    log.info(f"✅ Unblocked @{username}")
-                    await send_telegram(session, f"✅ Unblocked <b>@{username}</b>")
-
-                # /blocklist — show all blocked accounts
-                elif text.lower().startswith("/blocklist"):
-                    if blocked_accounts:
-                        names = "\n".join(f"• @{u}" for u in sorted(blocked_accounts))
-                        await send_telegram(session, f"🚫 <b>Blocked accounts ({len(blocked_accounts)}):</b>\n{names}")
-                    else:
-                        await send_telegram(session, "No accounts blocked.")
-
-                # /status
-                elif text.lower().startswith("/status"):
-                    await send_telegram(
-                        session,
-                        f"🐋 <b>Bankr Whale Alert Bot</b>\n"
-                        f"• Tracking: {len(seen_tokens)} tokens seen\n"
-                        f"• Blocked: {len(blocked_accounts)} accounts\n"
-                        f"• Cached: {len(follower_cache)} follower lookups\n"
-                        f"• Min followers: {MIN_FOLLOWERS:,}\n"
-                        f"• Poll interval: {POLL_INTERVAL}s",
-                    )
-
-    except Exception as e:
-        log.debug(f"Telegram command check error: {e}")
-
-
-# ─── X/Twitter Follower Lookup ────────────────────────────────────────────────
+# ─── Follower Count Lookup ────────────────────────────────────────────────────
 
 async def get_follower_count(session: aiohttp.ClientSession, username: str) -> int | None:
-    """
-    Get follower count for an X/Twitter username.
-    Uses multiple free methods as fallbacks:
-    1. Twitter syndication API (unofficial but reliable)
-    2. Nitter instances
-    3. Direct profile scrape
-    Returns follower count or None if all methods fail.
-    """
+    """Look up X follower count. Uses cache to avoid repeated lookups."""
+    username = username.lstrip("@").strip()
     if not username:
         return None
 
-    username = username.strip().lstrip("@")
-
-    # Check cache first
-    if username.lower() in follower_cache:
-        cached = follower_cache[username.lower()]
-        log.debug(f"Cache hit for @{username}: {cached}")
-        return cached
+    if username in follower_cache:
+        return follower_cache[username]
 
     count = None
 
-    # Method 1: Twitter syndication/embed API
-    count = await _try_syndication(session, username)
+    # Method 1: Twitter syndication API (works sometimes)
+    try:
+        url = f"https://syndication.twitter.com/srv/timeline-profile/screen-name/{username}"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        async with session.get(url, headers=headers, timeout=10) as resp:
+            if resp.status == 200:
+                text = await resp.text()
+                # Look for follower count patterns
+                patterns = [
+                    r'"followers_count":(\d+)',
+                    r'"followersCount":(\d+)',
+                    r'followers_count&quot;:(\d+)',
+                ]
+                for pattern in patterns:
+                    match = re.search(pattern, text)
+                    if match:
+                        count = int(match.group(1))
+                        break
+    except Exception:
+        pass
 
-    # Method 2: Try scraping the X profile page
+    # Method 2: Try nitter instances
     if count is None:
-        count = await _try_profile_scrape(session, username)
+        nitter_instances = [
+            "https://nitter.privacydev.net",
+            "https://nitter.poast.org",
+        ]
+        for instance in nitter_instances:
+            try:
+                url = f"{instance}/{username}"
+                async with session.get(url, timeout=8, allow_redirects=True) as resp:
+                    if resp.status == 200:
+                        text = await resp.text()
+                        match = re.search(r'class="profile-stat-num"[^>]*>([\d,]+)', text)
+                        if match:
+                            # The followers count is typically the 2nd stat
+                            stats = re.findall(r'class="profile-stat-num"[^>]*>([\d,]+)', text)
+                            if len(stats) >= 3:
+                                count = int(stats[2].replace(",", ""))
+                                break
+            except Exception:
+                continue
 
-    # Method 3: Try Nitter
     if count is None:
-        count = await _try_nitter(session, username)
-
-    # Cache result (even None, to avoid hammering)
-    follower_cache[username.lower()] = count
-
-    if count is not None:
-        log.info(f"@{username} → {count:,} followers")
-    else:
         log.warning(f"@{username} → could not determine follower count")
 
+    follower_cache[username] = count
     return count
 
 
-async def _try_syndication(session: aiohttp.ClientSession, username: str) -> int | None:
-    """Try Twitter's syndication/user endpoint."""
-    url = f"https://syndication.twitter.com/srv/timeline-profile/screen-name/{username}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml",
-    }
-    try:
-        async with session.get(url, headers=headers, timeout=10) as resp:
-            if resp.status != 200:
-                return None
-            text = await resp.text()
-            # Look for follower count in the HTML
-            # Pattern: "followers_count":12345 or similar
-            match = re.search(r'"followers_count"\s*:\s*(\d+)', text)
-            if match:
-                return int(match.group(1))
-            # Also try: "1.2M Followers" or "12.5K Followers" pattern
-            match = re.search(r'([\d,.]+)\s*[KkMm]?\s*[Ff]ollowers', text)
-            if match:
-                return _parse_follower_string(match.group(0))
-    except Exception:
-        pass
-    return None
+# ─── Extract X username from various formats ──────────────────────────────────
 
-
-async def _try_profile_scrape(session: aiohttp.ClientSession, username: str) -> int | None:
-    """Try scraping follower count from X profile page."""
-    url = f"https://x.com/{username}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    try:
-        async with session.get(url, headers=headers, timeout=10, allow_redirects=True) as resp:
-            if resp.status != 200:
-                return None
-            text = await resp.text()
-            # Look for "followers_count" in embedded data
-            match = re.search(r'"followers_count"\s*:\s*(\d+)', text)
-            if match:
-                return int(match.group(1))
-    except Exception:
-        pass
-    return None
-
-
-async def _try_nitter(session: aiohttp.ClientSession, username: str) -> int | None:
-    """Try Nitter instances for follower count."""
-    nitter_instances = [
-        f"https://nitter.privacydev.net/{username}",
-        f"https://nitter.poast.org/{username}",
-    ]
-    for url in nitter_instances:
-        try:
-            headers = {"User-Agent": "Mozilla/5.0"}
-            async with session.get(url, headers=headers, timeout=8) as resp:
-                if resp.status != 200:
-                    continue
-                text = await resp.text()
-                # Nitter shows followers as "123,456 Followers"
-                match = re.search(r'class="profile-stat-num"[^>]*>([\d,]+)</span>\s*<span[^>]*>Followers', text)
-                if match:
-                    return int(match.group(1).replace(",", ""))
-                # Alternative pattern
-                match = re.search(r'([\d,]+)\s*Followers', text)
-                if match:
-                    return int(match.group(1).replace(",", ""))
-        except Exception:
-            continue
-    return None
-
-
-def _parse_follower_string(s: str) -> int | None:
-    """Parse strings like '12.5K Followers', '1.2M Followers'."""
-    match = re.search(r'([\d,.]+)\s*([KkMm]?)', s)
-    if not match:
+def extract_x_username(urls: list[str] | None) -> str | None:
+    """Extract X/Twitter username from a list of social media URLs."""
+    if not urls:
         return None
-    num = float(match.group(1).replace(",", ""))
-    suffix = match.group(2).upper()
-    if suffix == "K":
-        return int(num * 1_000)
-    elif suffix == "M":
-        return int(num * 1_000_000)
-    return int(num)
+    for url in urls:
+        if not isinstance(url, str):
+            continue
+        # Match x.com/username or twitter.com/username
+        match = re.search(r'(?:x\.com|twitter\.com)/(@?[\w]+)/?', url, re.IGNORECASE)
+        if match:
+            username = match.group(1).lstrip("@")
+            # Skip generic pages
+            if username.lower() not in ("home", "explore", "search", "settings", "i", "intent"):
+                return username
+    return None
 
 
-# ─── Bankr API ────────────────────────────────────────────────────────────────
+# ─── Fetch Bankr launches ────────────────────────────────────────────────────
 
-async def fetch_launches(session: aiohttp.ClientSession) -> list[dict]:
-    """Fetch latest token launches from Bankr API."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-        "Accept": "application/json",
-        "Referer": "https://bankr.bot/launches",
-        "Origin": "https://bankr.bot",
-    }
+async def fetch_bankr(session: aiohttp.ClientSession) -> list[dict]:
+    """Fetch recent Bankr token launches and normalize them."""
     try:
-        async with session.get(BANKR_API_URL, headers=headers, timeout=15) as resp:
+        async with session.get(BANKR_API_URL, timeout=15) as resp:
             if resp.status != 200:
-                log.warning(f"Bankr API returned {resp.status}")
+                log.error(f"Bankr API error: {resp.status}")
                 return []
             data = await resp.json()
-            launches = data.get("launches", data if isinstance(data, list) else [])
-            return launches
+
+        launches = data if isinstance(data, list) else data.get("launches", data.get("tokens", []))
+        normalized = []
+
+        for launch in launches:
+            address = launch.get("tokenAddress", launch.get("contractAddress", ""))
+            if not address:
+                continue
+
+            deployer = launch.get("deployer", {})
+            x_username = deployer.get("xUsername", "")
+
+            normalized.append({
+                "source": "bankr",
+                "address": address.lower(),
+                "name": launch.get("tokenName", "Unknown"),
+                "symbol": launch.get("tokenSymbol", "?"),
+                "x_username": x_username,
+                "tweet_url": launch.get("tweetUrl", ""),
+                "website": launch.get("websiteUrl", ""),
+                "raw": launch,
+            })
+
+        return normalized
+
     except Exception as e:
-        log.error(f"Bankr API error: {e}")
+        log.error(f"Bankr fetch error: {e}")
         return []
 
 
-# ─── Alert Formatting ─────────────────────────────────────────────────────────
+# ─── Fetch Clanker launches ──────────────────────────────────────────────────
+
+async def fetch_clanker(session: aiohttp.ClientSession) -> list[dict]:
+    """Fetch recent Clanker token launches and normalize them."""
+    try:
+        params = {
+            "sort": "desc",
+            "page": "1",
+            "pageSize": "50",
+        }
+        headers = {
+            "User-Agent": "WhaleAlertBot/1.0",
+            "Accept": "application/json",
+        }
+        async with session.get(CLANKER_API_URL, params=params, headers=headers, timeout=15) as resp:
+            if resp.status != 200:
+                log.error(f"Clanker API error: {resp.status}")
+                return []
+            data = await resp.json()
+
+        # Clanker API returns either a list or {data: [...], ...}
+        tokens = data if isinstance(data, list) else data.get("data", data.get("tokens", []))
+        normalized = []
+
+        for token in tokens:
+            address = token.get("contract_address", token.get("address", token.get("tokenAddress", "")))
+            if not address:
+                continue
+
+            # Extract X username from socialMediaUrls
+            social_urls = token.get("socialMediaUrls", token.get("social_media_urls", []))
+            if isinstance(social_urls, str):
+                try:
+                    social_urls = json.loads(social_urls)
+                except:
+                    social_urls = [social_urls]
+
+            x_username = extract_x_username(social_urls)
+
+            # Also check context field for platform info
+            context = token.get("context", {})
+            if not x_username and context:
+                # If deployed via X/Twitter, context might have user info
+                platform = context.get("platform", "")
+                if platform and "twitter" in platform.lower() or "x.com" in str(platform).lower():
+                    user_id = context.get("id", "")
+                    if user_id:
+                        x_username = str(user_id)
+
+            # Also check if castHash or requestor has X link
+            if not x_username:
+                # Check description for X links
+                desc = token.get("description", "") or ""
+                desc_match = re.search(r'(?:x\.com|twitter\.com)/(@?[\w]+)/?', desc, re.IGNORECASE)
+                if desc_match:
+                    candidate = desc_match.group(1).lstrip("@")
+                    if candidate.lower() not in ("home", "explore", "search"):
+                        x_username = candidate
+
+            # Determine the interface that deployed it
+            deploy_interface = ""
+            if context and isinstance(context, dict):
+                deploy_interface = context.get("interface", "")
+
+            normalized.append({
+                "source": "clanker",
+                "address": address.lower(),
+                "name": token.get("name", "Unknown"),
+                "symbol": token.get("symbol", token.get("ticker", "?")),
+                "x_username": x_username or "",
+                "tweet_url": "",  # Clanker doesn't have tweet URLs directly
+                "website": "",
+                "deploy_interface": deploy_interface,
+                "clanker_url": f"https://clanker.world/clanker/{address}",
+                "raw": token,
+            })
+
+        return normalized
+
+    except Exception as e:
+        log.error(f"Clanker fetch error: {e}")
+        return []
+
+
+# ─── Format Alert ─────────────────────────────────────────────────────────────
 
 def format_alert(launch: dict, follower_count: int) -> tuple[str, str]:
     """Format alert messages for Telegram (HTML) and WhatsApp (plain text)."""
-    name = launch.get("tokenName", "Unknown")
-    symbol = launch.get("tokenSymbol", "Unknown")
-    address = launch.get("tokenAddress", "")
-    deployer = launch.get("deployer", {})
-    x_username = deployer.get("xUsername", "")
-    tweet_url = launch.get("tweetUrl", "")
-    website = launch.get("websiteUrl", "")
+    name = launch["name"]
+    symbol = launch["symbol"]
+    address = launch["address"]
+    x_username = launch["x_username"]
+    source = launch["source"]
+    tweet_url = launch.get("tweet_url", "")
+    website = launch.get("website", "")
+    clanker_url = launch.get("clanker_url", "")
 
     # Format follower count nicely
     if follower_count >= 1_000_000:
@@ -396,12 +367,15 @@ def format_alert(launch: dict, follower_count: int) -> tuple[str, str]:
     else:
         followers_str = str(follower_count)
 
+    source_label = "🏦 Bankr" if source == "bankr" else "⚙️ Clanker"
+
     # ── Telegram (HTML) ──
     tg_lines = [
         f"🐋 <b>WHALE LAUNCH DETECTED</b>",
         f"",
         f"🪙 <b>{name}</b> (${symbol})",
         f"👤 <a href='https://x.com/{x_username}'>@{x_username}</a> — <b>{followers_str} followers</b>",
+        f"🚀 Source: {source_label}",
         f"",
         f"📍 Chain: Base",
         f"📋 CA: <code>{address}</code>",
@@ -409,22 +383,25 @@ def format_alert(launch: dict, follower_count: int) -> tuple[str, str]:
 
     if tweet_url:
         tg_lines.append(f"🐦 <a href='{tweet_url}'>Original Tweet</a>")
-
     if website:
         tg_lines.append(f"🌐 <a href='{website}'>Website</a>")
+    if clanker_url:
+        tg_lines.append(f"🔗 <a href='{clanker_url}'>Clanker Page</a>")
 
     if address:
         tg_lines.append(f"")
         tg_lines.append(f"📊 <a href='https://dexscreener.com/base/{address}'>DexScreener</a> | <a href='https://www.dextools.io/app/en/base/pair-explorer/{address}'>DexTools</a>")
         tg_lines.append(f"💰 <a href='https://app.uniswap.org/swap?outputCurrency={address}&chain=base'>Buy on Uniswap</a>")
 
-    # ── WhatsApp (plain text) ──
+    tg_text = "\n".join(tg_lines)
+
+    # ── WhatsApp (plain text with emojis) ──
     wa_lines = [
         f"🐋 *WHALE LAUNCH DETECTED*",
         f"",
         f"🪙 *{name}* (${symbol})",
         f"👤 @{x_username} — *{followers_str} followers*",
-        f"https://x.com/{x_username}",
+        f"🚀 Source: {source_label}",
         f"",
         f"📍 Chain: Base",
         f"📋 CA: {address}",
@@ -432,117 +409,188 @@ def format_alert(launch: dict, follower_count: int) -> tuple[str, str]:
 
     if tweet_url:
         wa_lines.append(f"🐦 Tweet: {tweet_url}")
+    if clanker_url:
+        wa_lines.append(f"🔗 Clanker: {clanker_url}")
 
-    if website:
-        wa_lines.append(f"🌐 {website}")
+    wa_lines.append(f"")
+    wa_lines.append(f"📊 DexScreener: https://dexscreener.com/base/{address}")
+    wa_lines.append(f"💰 Uniswap: https://app.uniswap.org/swap?outputCurrency={address}&chain=base")
 
-    if address:
-        wa_lines.append(f"")
-        wa_lines.append(f"📊 https://dexscreener.com/base/{address}")
-        wa_lines.append(f"💰 https://app.uniswap.org/swap?outputCurrency={address}&chain=base")
+    wa_text = "\n".join(wa_lines)
 
-    return "\n".join(tg_lines), "\n".join(wa_lines)
+    return tg_text, wa_text
 
 
-# ─── Main Loop ────────────────────────────────────────────────────────────────
+# ─── Telegram Command Handler ────────────────────────────────────────────────
+
+async def handle_telegram_commands(session: aiohttp.ClientSession):
+    """Check for Telegram commands (/block, /unblock, /status, /blocklist)."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    params = {"offset": handle_telegram_commands.last_update_id + 1, "timeout": 0}
+
+    try:
+        async with session.get(url, params=params, timeout=10) as resp:
+            if resp.status != 200:
+                return
+            data = await resp.json()
+
+        for update in data.get("result", []):
+            handle_telegram_commands.last_update_id = update["update_id"]
+            message = update.get("message", {})
+            text = message.get("text", "").strip()
+            chat_id = str(message.get("chat", {}).get("id", ""))
+
+            # Only respond to commands from our configured chat
+            if chat_id != TELEGRAM_CHAT_ID:
+                continue
+
+            if text.startswith("/block "):
+                username = text.replace("/block ", "").strip().lstrip("@").lower()
+                if username:
+                    blocked_accounts.add(username)
+                    save_blocklist()
+                    # Also clear from follower cache
+                    follower_cache.pop(username, None)
+                    await send_telegram(session, f"🚫 Blocked @{username} — no more alerts from this account.")
+
+            elif text.startswith("/unblock "):
+                username = text.replace("/unblock ", "").strip().lstrip("@").lower()
+                if username in blocked_accounts:
+                    blocked_accounts.discard(username)
+                    save_blocklist()
+                    await send_telegram(session, f"✅ Unblocked @{username}")
+                else:
+                    await send_telegram(session, f"@{username} was not in the blocklist.")
+
+            elif text == "/blocklist":
+                if blocked_accounts:
+                    blocked_list = "\n".join(f"  • @{u}" for u in sorted(blocked_accounts))
+                    await send_telegram(session, f"🚫 <b>Blocked accounts ({len(blocked_accounts)}):</b>\n{blocked_list}")
+                else:
+                    await send_telegram(session, "No blocked accounts.")
+
+            elif text == "/status":
+                await send_telegram(
+                    session,
+                    f"🐋 <b>Whale Alert Bot Status</b>\n"
+                    f"Sources: Bankr + Clanker\n"
+                    f"Seen tokens: {len(seen_tokens)}\n"
+                    f"Cached followers: {len(follower_cache)}\n"
+                    f"Blocked accounts: {len(blocked_accounts)}\n"
+                    f"Min followers: {MIN_FOLLOWERS:,}\n"
+                    f"Poll interval: {POLL_INTERVAL}s",
+                )
+
+    except Exception as e:
+        log.debug(f"Command check error: {e}")
+
+handle_telegram_commands.last_update_id = 0
+
+
+# ─── Main Poll Loop ──────────────────────────────────────────────────────────
 
 async def poll_loop():
-    """Main polling loop."""
+    """Main loop: fetch from both sources, check followers, alert."""
+
     log.info("=" * 60)
-    log.info("  🐋 Bankr Whale Alert Bot")
+    log.info("  🐋 Whale Alert Bot (Bankr + Clanker)")
     log.info(f"  Min followers: {MIN_FOLLOWERS:,}")
     log.info(f"  Poll interval: {POLL_INTERVAL}s")
     log.info(f"  Telegram: {'✅ configured' if TELEGRAM_BOT_TOKEN else '❌ not configured'}")
     log.info(f"  WhatsApp: {'✅ configured' if WHAPI_TOKEN else '❌ not configured'}")
     log.info("=" * 60)
 
+    load_blocklist()
+
     async with aiohttp.ClientSession() as session:
-        # Send startup message
-        startup_tg = (
-            f"🐋 <b>Bankr Whale Alert Bot started</b>\n"
-            f"Monitoring for launches by accounts with {MIN_FOLLOWERS:,}+ followers\n"
-            f"Polling every {POLL_INTERVAL}s"
-        )
-        startup_wa = (
-            f"🐋 *Bankr Whale Alert Bot started*\n"
-            f"Monitoring for launches by accounts with {MIN_FOLLOWERS:,}+ followers\n"
-            f"Polling every {POLL_INTERVAL}s"
-        )
-        await send_alert(session, startup_tg, startup_wa)
 
-        # Initial fetch to populate seen_tokens (don't alert on existing ones)
+        # ── Initial seed: fetch existing tokens so we don't alert on old ones ──
         log.info("📋 Initial fetch to seed seen tokens...")
-        initial = await fetch_launches(session)
-        for launch in initial:
-            addr = launch.get("tokenAddress", "")
-            if addr:
-                seen_tokens.add(addr.lower())
-        log.info(f"📋 Seeded {len(seen_tokens)} existing tokens")
+        bankr_launches = await fetch_bankr(session)
+        clanker_launches = await fetch_clanker(session)
 
-        # Poll loop
+        for launch in bankr_launches + clanker_launches:
+            seen_tokens.add(launch["address"])
+
+        log.info(f"📋 Seeded {len(seen_tokens)} existing tokens (Bankr: {len(bankr_launches)}, Clanker: {len(clanker_launches)})")
+
+        # ── Send startup alert ──
+        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            await send_telegram(
+                session,
+                f"🐋 <b>Whale Alert Bot started</b>\n"
+                f"Sources: Bankr + Clanker\n"
+                f"Monitoring for launches by X accounts with {MIN_FOLLOWERS:,}+ followers\n"
+                f"Blocked accounts: {len(blocked_accounts)}\n"
+                f"Polling every {POLL_INTERVAL}s\n\n"
+                f"Commands: /block @user · /unblock @user · /blocklist · /status",
+            )
+
+        # ── Poll loop ──
         while True:
             try:
-                launches = await fetch_launches(session)
+                # Check for Telegram commands
+                await handle_telegram_commands(session)
 
-                if not launches:
-                    log.info("No launches returned, retrying...")
-                    await asyncio.sleep(POLL_INTERVAL)
-                    continue
+                # Fetch from both sources
+                bankr_launches = await fetch_bankr(session)
+                clanker_launches = await fetch_clanker(session)
 
+                all_launches = bankr_launches + clanker_launches
                 new_count = 0
                 whale_count = 0
 
-                for launch in launches:
-                    address = launch.get("tokenAddress", "")
-                    if not address or address.lower() in seen_tokens:
+                for launch in all_launches:
+                    address = launch["address"]
+
+                    # Skip already seen
+                    if address in seen_tokens:
                         continue
 
-                    seen_tokens.add(address.lower())
+                    seen_tokens.add(address)
                     new_count += 1
 
-                    # Check if deployer has X account
-                    deployer = launch.get("deployer", {})
-                    x_username = deployer.get("xUsername")
+                    x_username = launch["x_username"]
+                    source = launch["source"]
 
+                    # Skip if no X username
                     if not x_username:
-                        log.debug(f"  {launch.get('tokenSymbol', '?')} — no X account, skipping")
+                        log.info(f"  [{source}] ${launch['symbol']} — no X account linked, skipping")
                         continue
 
-                    # Check blocklist
+                    # Skip blocked accounts
                     if x_username.lower() in blocked_accounts:
-                        log.info(f"  ${launch.get('tokenSymbol', '?')} by @{x_username} — BLOCKED, skipping")
+                        log.info(f"  [{source}] ${launch['symbol']} by @{x_username} — BLOCKED, skipping")
                         continue
 
                     # Check follower count
                     follower_count = await get_follower_count(session, x_username)
 
                     if follower_count is None:
-                        log.info(f"  ${launch.get('tokenSymbol', '?')} by @{x_username} — followers unknown, skipping")
+                        log.info(f"  [{source}] ${launch['symbol']} by @{x_username} — followers unknown, skipping")
                         continue
 
                     if follower_count < MIN_FOLLOWERS:
-                        log.info(f"  ${launch.get('tokenSymbol', '?')} by @{x_username} — {follower_count:,} followers (below {MIN_FOLLOWERS:,})")
+                        log.info(f"  [{source}] ${launch['symbol']} by @{x_username} — {follower_count:,} followers (below {MIN_FOLLOWERS:,})")
                         continue
 
                     # 🐋 WHALE DETECTED!
                     whale_count += 1
-                    log.info(f"  🐋 ${launch.get('tokenSymbol', '?')} by @{x_username} — {follower_count:,} followers — ALERT!")
+                    log.info(f"  🐋 [{source}] ${launch['symbol']} by @{x_username} — {follower_count:,} followers — ALERT!")
                     tg_text, wa_text = format_alert(launch, follower_count)
                     await send_alert(session, tg_text, wa_text)
 
-                    # Small delay between alerts to avoid Telegram rate limits
+                    # Small delay between alerts to avoid rate limits
                     await asyncio.sleep(1)
 
                 if new_count > 0:
                     log.info(f"🔍 Processed {new_count} new launches, {whale_count} whale alerts sent")
-                else:
-                    log.debug("No new launches this cycle")
 
             except Exception as e:
                 log.error(f"Poll loop error: {e}", exc_info=True)
-
-            # Check for Telegram commands (/block, /unblock, etc.)
-            await check_telegram_commands(session)
 
             await asyncio.sleep(POLL_INTERVAL)
 
@@ -550,16 +598,14 @@ async def poll_loop():
 # ─── Entry Point ──────────────────────────────────────────────────────────────
 
 def main():
-    # Validate config
     if not TELEGRAM_BOT_TOKEN:
         log.error("❌ TELEGRAM_BOT_TOKEN not set!")
-        log.error("   Create a bot via @BotFather on Telegram and set the token")
     if not TELEGRAM_CHAT_ID:
         log.error("❌ TELEGRAM_CHAT_ID not set!")
-        log.error("   Send /start to your bot, then get chat ID via https://api.telegram.org/bot<TOKEN>/getUpdates")
-
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("⚠️  Bot will run but cannot send alerts. Set env vars and restart.")
+        log.warning("⚠️  Bot will run but cannot send Telegram alerts.")
+    if not WHAPI_TOKEN:
+        log.info("ℹ️  WhatsApp not configured (optional)")
 
     asyncio.run(poll_loop())
 
