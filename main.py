@@ -5,7 +5,7 @@ Monitors TWO sources for new token launches on Base:
   1. Bankr API  — https://api.bankr.bot/token-launches
   2. Clanker API — https://www.clanker.world/api/tokens
 
-When a token is launched by an X account with 10K+ followers → alerts to Telegram.
+When a token is launched by an X account with 10K+ followers → alerts to Telegram + WhatsApp.
 Uses SocialData.tools API for reliable follower count lookups.
 Uses DexScreener for market data filtering (MCap, Volume, Liquidity).
 
@@ -25,6 +25,8 @@ from datetime import datetime, timezone
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+WHAPI_TOKEN = os.getenv("WHAPI_TOKEN", "")
+WHATSAPP_GROUP_ID = os.getenv("WHATSAPP_GROUP_ID", "")
 SOCIALDATA_API_KEY = os.getenv("SOCIALDATA_API_KEY", "")
 MIN_FOLLOWERS = int(os.getenv("MIN_FOLLOWERS", "10000"))
 MIN_MCAP = int(os.getenv("MIN_MCAP", "50000"))
@@ -108,6 +110,44 @@ async def send_telegram(session: aiohttp.ClientSession, text: str) -> bool:
         return False
 
 
+# ─── WhatsApp via Whapi ───────────────────────────────────────────────────────
+
+async def send_whatsapp(session: aiohttp.ClientSession, text: str) -> bool:
+    if not WHAPI_TOKEN or not WHATSAPP_GROUP_ID:
+        return False
+    url = "https://gate.whapi.cloud/messages/text"
+    headers = {
+        "Authorization": f"Bearer {WHAPI_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "to": WHATSAPP_GROUP_ID,
+        "body": text,
+    }
+    try:
+        async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status in (200, 201):
+                log.info("✅ WhatsApp alert sent")
+                return True
+            else:
+                body = await resp.text()
+                log.error(f"WhatsApp error {resp.status}: {body[:200]}")
+                return False
+    except Exception as e:
+        log.error(f"WhatsApp send failed: {e}")
+        return False
+
+
+# ─── Send to all channels ────────────────────────────────────────────────────
+
+async def send_alert_all(session: aiohttp.ClientSession, tg_text: str, wa_text: str):
+    """Send alert to both Telegram and WhatsApp."""
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        await send_telegram(session, tg_text)
+    if WHAPI_TOKEN and WHATSAPP_GROUP_ID:
+        await send_whatsapp(session, wa_text)
+
+
 # ─── Telegram Command Handler ─────────────────────────────────────────────────
 
 async def handle_telegram_commands(session: aiohttp.ClientSession):
@@ -140,7 +180,6 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                 username = parts[1].strip().lstrip("@").lower()
                 blocked_accounts.add(username)
                 save_blocklist(blocked_accounts)
-                # Clear from follower cache too
                 follower_cache.pop(username, None)
                 log.info(f"🚫 Blocked @{username}")
                 await send_telegram(session, f"🚫 Blocked <b>@{username}</b> — future launches ignored")
@@ -167,6 +206,7 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
 
             # /status
             elif text.lower().startswith("/status"):
+                wa_status = "✅" if WHAPI_TOKEN and WHATSAPP_GROUP_ID else "❌"
                 await send_telegram(
                     session,
                     f"🐋 <b>Whale Alert Bot</b>\n\n"
@@ -179,6 +219,7 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                     f"• Min MCap: ${MIN_MCAP:,}\n"
                     f"• Min Volume: ${MIN_VOLUME_24H:,}\n"
                     f"• Min Liquidity: ${MIN_LIQUIDITY:,}\n"
+                    f"• WhatsApp: {wa_status}\n"
                     f"• Poll interval: {POLL_INTERVAL}s",
                 )
 
@@ -215,7 +256,6 @@ async def get_follower_count(session: aiohttp.ClientSession, username: str) -> i
                 data = await resp.json()
                 count = data.get("public_metrics", {}).get("followers_count")
                 if count is None:
-                    # Try alternate response structure
                     count = data.get("followers_count")
                 if count is not None:
                     count = int(count)
@@ -226,14 +266,12 @@ async def get_follower_count(session: aiohttp.ClientSession, username: str) -> i
                 log.info(f"@{username} → account not found (404)")
             elif resp.status == 429:
                 log.warning(f"@{username} → rate limited (429), will retry later")
-                # Don't cache rate limits
                 return None
             else:
                 body = await resp.text()
                 log.warning(f"@{username} → SocialData API {resp.status}: {body[:100]}")
     except Exception as e:
         log.warning(f"@{username} → SocialData lookup error: {e}")
-        # Don't cache errors
         return None
 
     follower_cache[username] = count
@@ -255,7 +293,6 @@ async def fetch_dexscreener(session: aiohttp.ClientSession, token_address: str) 
         if not pairs:
             return None
 
-        # Use the highest-liquidity pair
         pair = max(pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
         return {
             "mcap": float(pair.get("marketCap", 0) or pair.get("fdv", 0) or 0),
@@ -356,7 +393,6 @@ async def fetch_clanker(session: aiohttp.ClientSession) -> list[dict]:
             if not address:
                 continue
 
-            # Extract X username from socialMediaUrls
             x_username = ""
             social_urls = token.get("socialMediaUrls", []) or []
             if isinstance(social_urls, list):
@@ -369,7 +405,6 @@ async def fetch_clanker(session: aiohttp.ClientSession) -> list[dict]:
                                 x_username = candidate
                                 break
 
-            # Also check description for @mentions if no social URL found
             if not x_username:
                 desc = token.get("description", "") or ""
                 desc_match = re.search(r'@(\w{1,15})', desc)
@@ -405,8 +440,8 @@ def fmt_usd(val) -> str:
     return f"${val:.0f}"
 
 
-def format_alert(launch: dict, follower_count: int, dex: dict | None) -> str:
-    """Format a Telegram alert message."""
+def format_alert_telegram(launch: dict, follower_count: int, dex: dict | None) -> str:
+    """Format a Telegram alert message (HTML)."""
     source = launch["source"].upper()
     name = launch["name"]
     symbol = launch["symbol"]
@@ -416,7 +451,6 @@ def format_alert(launch: dict, follower_count: int, dex: dict | None) -> str:
 
     source_emoji = "🏦" if launch["source"] == "bankr" else "⚙️"
 
-    # Market data section
     market_lines = ""
     if dex:
         change_1h = dex.get("price_change_1h", 0)
@@ -429,7 +463,6 @@ def format_alert(launch: dict, follower_count: int, dex: dict | None) -> str:
             f"└ {change_emoji} 1h: {change_1h:+.1f}%\n"
         )
 
-    # Links
     links = [
         f"├ <a href='https://dexscreener.com/base/{address}'>DexScreener</a>",
         f"├ <a href='https://www.clanker.world/clanker/{address}'>Clanker</a>",
@@ -453,6 +486,66 @@ def format_alert(launch: dict, follower_count: int, dex: dict | None) -> str:
     )
 
     return msg
+
+
+def format_alert_whatsapp(launch: dict, follower_count: int, dex: dict | None) -> str:
+    """Format a WhatsApp alert message (plain text with emojis)."""
+    source = launch["source"].upper()
+    name = launch["name"]
+    symbol = launch["symbol"]
+    address = launch["address"]
+    x_username = launch["x_username"]
+    tweet_url = launch.get("tweet_url", "")
+
+    source_emoji = "🏦" if launch["source"] == "bankr" else "⚙️"
+
+    # Follower count formatted
+    if follower_count >= 1_000_000:
+        f_str = f"{follower_count / 1_000_000:.1f}M"
+    elif follower_count >= 1_000:
+        f_str = f"{follower_count / 1_000:.1f}K"
+    else:
+        f_str = str(follower_count)
+
+    lines = [
+        f"🐋 *WHALE LAUNCH ALERT*",
+        f"",
+        f"*{name}* (${symbol})",
+        f"{source_emoji} Via: *{source}*",
+        f"👤 @{x_username} — *{f_str} followers*",
+    ]
+
+    if dex:
+        change_1h = dex.get("price_change_1h", 0)
+        change_emoji = "🟢" if change_1h >= 0 else "🔴"
+        lines.extend([
+            f"",
+            f"📊 *Market Data:*",
+            f"├ 💰 MCap: {fmt_usd(dex['mcap'])}",
+            f"├ 💧 Liq: {fmt_usd(dex['liquidity'])}",
+            f"├ 📈 Vol 24h: {fmt_usd(dex['volume_24h'])}",
+            f"└ {change_emoji} 1h: {change_1h:+.1f}%",
+        ])
+
+    lines.extend([
+        f"",
+        f"🔗 *Links:*",
+        f"├ DexScreener: https://dexscreener.com/base/{address}",
+        f"├ Clanker: https://www.clanker.world/clanker/{address}",
+        f"├ GMGN: https://gmgn.ai/base/token/{address}",
+        f"├ X: https://x.com/{x_username}",
+    ])
+
+    if tweet_url:
+        lines.append(f"├ Tweet: {tweet_url}")
+
+    lines.extend([
+        f"└ Uniswap: https://app.uniswap.org/swap?chain=base&outputCurrency={address}",
+        f"",
+        f"{address}",
+    ])
+
+    return "\n".join(lines)
 
 
 # ─── Seeding ──────────────────────────────────────────────────────────────────
@@ -489,8 +582,9 @@ async def main():
     log.info(f"  Min Volume 24h: ${MIN_VOLUME_24H:,}")
     log.info(f"  Min Liquidity : ${MIN_LIQUIDITY:,}")
     log.info(f"  Poll interval : {POLL_INTERVAL}s")
-    log.info(f"  Telegram : {'✅ configured' if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID else '❌ not set'}")
-    log.info(f"  SocialData: {'✅ configured' if SOCIALDATA_API_KEY else '❌ not set'}")
+    log.info(f"  Telegram : {'✅' if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID else '❌'}")
+    log.info(f"  WhatsApp : {'✅' if WHAPI_TOKEN and WHATSAPP_GROUP_ID else '❌'}")
+    log.info(f"  SocialData: {'✅' if SOCIALDATA_API_KEY else '❌'}")
     log.info("=" * 60)
 
     async with aiohttp.ClientSession() as session:
@@ -508,6 +602,7 @@ async def main():
                 f"Min followers: {MIN_FOLLOWERS:,}\n"
                 f"Min MCap: ${MIN_MCAP:,} · Vol: ${MIN_VOLUME_24H:,} · Liq: ${MIN_LIQUIDITY:,}\n"
                 f"Blocked: {len(blocked_accounts)} accounts\n"
+                f"WhatsApp: {'✅' if WHAPI_TOKEN else '❌'}\n"
                 f"Polling every {POLL_INTERVAL}s\n\n"
                 f"Commands: /block @user · /unblock @user · /blocklist · /status",
             )
@@ -572,9 +667,10 @@ async def main():
                     # 🚀 All filters passed — send alert!
                     whale_count += 1
                     alert_count += 1
-                    alert_text = format_alert(launch, followers, dex)
+                    tg_text = format_alert_telegram(launch, followers, dex)
+                    wa_text = format_alert_whatsapp(launch, followers, dex)
                     log.info(f"  🚀 ALERT: [{source}] ${symbol} @{x_username} — {followers:,} followers, MCap {fmt_usd(dex['mcap'])}")
-                    await send_telegram(session, alert_text)
+                    await send_alert_all(session, tg_text, wa_text)
 
                 log.info(f"🔍 {new_count} new launches processed, {whale_count} alerts sent")
 
