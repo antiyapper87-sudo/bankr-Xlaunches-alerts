@@ -37,8 +37,9 @@ MIN_VOLUME         = float(os.getenv("MIN_VOLUME",  "50000"))
 MIN_LIQ            = float(os.getenv("MIN_LIQ",     "30000"))
 POLL_INTERVAL      = int(os.getenv("POLL_INTERVAL", "30"))
 
-BANKR_API_URL   = "https://api.bankr.bot/token-launches"
-CLANKER_API_URL = "https://www.clanker.world/api/tokens"
+BANKR_API_URL      = "https://api.bankr.bot/token-launches"
+CLANKER_API_URL    = "https://www.clanker.world/api/tokens"
+SOCIALDATA_API_KEY = os.getenv("SOCIALDATA_API_KEY", "")
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -141,35 +142,28 @@ async def get_follower_count(session: aiohttp.ClientSession, username: str) -> i
 
     count = None
 
-    # Method 1: Twitter syndication API
-    try:
-        async with session.get(
-            f"https://syndication.twitter.com/srv/timeline-profile/screen-name/{username}",
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=10,
-        ) as resp:
-            if resp.status == 200:
-                text = await resp.text()
-                for pat in [r'"followers_count":(\d+)', r'"followersCount":(\d+)', r'followers_count&quot;:(\d+)']:
-                    m = re.search(pat, text)
-                    if m:
-                        count = int(m.group(1))
-                        break
-    except Exception:
-        pass
-
-    # Method 2: Nitter fallback
-    if count is None:
-        for instance in ["https://nitter.privacydev.net", "https://nitter.poast.org"]:
-            try:
-                async with session.get(f"{instance}/{username}", timeout=8, allow_redirects=True) as resp:
-                    if resp.status == 200:
-                        stats = re.findall(r'class="profile-stat-num"[^>]*>([\d,]+)', await resp.text())
-                        if len(stats) >= 3:
-                            count = int(stats[2].replace(",", ""))
-                            break
-            except Exception:
-                continue
+    # Socialdata.tools API — reliable Twitter data proxy
+    if SOCIALDATA_API_KEY:
+        try:
+            async with session.get(
+                f"https://api.socialdata.tools/twitter/user/{username}",
+                headers={
+                    "Authorization": f"Bearer {SOCIALDATA_API_KEY}",
+                    "Accept": "application/json",
+                },
+                timeout=10,
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    count = data.get("followers_count") or data.get("followersCount")
+                    if count is not None:
+                        count = int(count)
+                elif resp.status == 404:
+                    count = 0  # Account does not exist
+                else:
+                    log.warning(f"Socialdata API {resp.status} for @{username}")
+        except Exception as e:
+            log.warning(f"Socialdata error for @{username}: {e}")
 
     if count is None:
         log.warning(f"@{username} → follower count unknown")
