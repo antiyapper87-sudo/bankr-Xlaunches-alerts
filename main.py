@@ -295,7 +295,7 @@ def passes_market_filters(dex: dict | None) -> tuple[bool, str]:
 async def fetch_bankr(session: aiohttp.ClientSession) -> list[dict]:
     """Fetch & normalize launches from Bankr API."""
     headers = {
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Accept": "application/json",
         "Referer": "https://bankr.bot/launches",
         "Origin": "https://bankr.bot",
