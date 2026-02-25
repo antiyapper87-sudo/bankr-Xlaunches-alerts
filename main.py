@@ -278,14 +278,24 @@ async def fetch_bankr() -> list[dict]:
 
 async def fetch_clanker(session: aiohttp.ClientSession) -> list[dict]:
     """
+    Fetches Clanker token launches using the official API.
+    Uses includeMarket=true to get mcap/volume directly (no DexScreener needed for Clanker).
+    Max page size is 20 per the docs.
+
     X username priority (strict — no description scraping):
-      1. context.platform contains twitter/x/bankr → context.id is the deployer's handle
-      2. socialMediaUrls / social_media_urls → first x.com/twitter.com URL
+      1. social_context.platform contains twitter/x/bankr → social_context.id
+      2. socialLinks — [{"name": "x", "link": "https://x.com/..."}]  (live API format)
+      3. metadata.socialMediaUrls — [{"platform": "twitter", "url": "..."}]  (docs format)
     """
     try:
         async with session.get(
             CLANKER_API_URL,
-            params={"sort": "desc", "page": "1", "pageSize": "50"},
+            params={
+                "sort":          "desc",
+                "limit":         "20",
+                "includeMarket": "true",
+                "chainId":       "8453",
+            },
             headers={"User-Agent": "WhaleAlertBot/1.0", "Accept": "application/json"},
             timeout=15,
         ) as resp:
@@ -299,40 +309,42 @@ async def fetch_clanker(session: aiohttp.ClientSession) -> list[dict]:
 
     tokens = data if isinstance(data, list) else data.get("data", data.get("tokens", []))
 
-    # Log one sample to verify field names in Railway logs
-    if tokens:
-        log.info(f"CLANKER SAMPLE: {json.dumps(tokens[0], default=str)[:800]}")
-
     normalized = []
     for token in tokens:
-        address = (
-            token.get("contract_address") or
-            token.get("contractAddress") or
-            token.get("address") or
-            token.get("tokenAddress") or ""
-        ).strip()
+        address = (token.get("contract_address") or "").strip()
         if not address:
             continue
 
         x_username = None
-        context    = token.get("context") or {}
 
-        # Priority 1: deployed via X/Twitter-based interface
-        platform = str(context.get("platform") or "").lower()
+        # Priority 1: social_context — set when deployed via X/Bankr
+        sc       = token.get("social_context") or {}
+        platform = str(sc.get("platform") or "").lower()
         if any(kw in platform for kw in ("twitter", "x.com", "bankr")):
-            ctx_id = str(context.get("id") or "").strip().lstrip("@")
+            ctx_id = str(sc.get("id") or sc.get("userId") or "").strip().lstrip("@")
             if ctx_id:
                 x_username = ctx_id
 
-        # Priority 2: token's own socialMediaUrls
+        # Priority 2: socialLinks (confirmed live API format from logs)
         if not x_username:
-            social = (
-                token.get("socialMediaUrls") or
-                token.get("social_media_urls") or
-                (token.get("metadata") or {}).get("socialMediaUrls") or
-                []
-            )
-            x_username = extract_x_from_urls(social)
+            for entry in (token.get("socialLinks") or []):
+                if isinstance(entry, dict) and entry.get("name", "").lower() in ("x", "twitter"):
+                    x_username = extract_x_from_urls([entry.get("link", "")])
+                    if x_username:
+                        break
+
+        # Priority 3: metadata.socialMediaUrls (documented format)
+        if not x_username:
+            for entry in ((token.get("metadata") or {}).get("socialMediaUrls") or []):
+                if isinstance(entry, dict) and entry.get("platform", "").lower() in ("twitter", "x"):
+                    x_username = extract_x_from_urls([entry.get("url", "")])
+                    if x_username:
+                        break
+
+        # Market data from includeMarket=true
+        market = (token.get("related") or {}).get("market") or {}
+        mcap   = float(market.get("market_cap") or market.get("marketCap") or 0)
+        volume = float(market.get("volume_24h") or market.get("volume") or 0)
 
         normalized.append({
             "source":      "clanker",
@@ -343,6 +355,8 @@ async def fetch_clanker(session: aiohttp.ClientSession) -> list[dict]:
             "tweet_url":   "",
             "website":     "",
             "clanker_url": f"https://clanker.world/clanker/{address}",
+            "mcap_hint":   mcap,
+            "volume_hint": volume,
         })
 
     log.info(f"Clanker: {len(normalized)} launches fetched")
@@ -542,8 +556,26 @@ async def poll_loop():
                         log.info(f"  [{source}] ${symbol} @{x_username} — {followers:,} followers, skip")
                         continue
 
-                    # ── Filter 4: market stats via DexScreener ──
-                    stats = await get_dexscreener_stats(session, address)
+                    # ── Filter 4: market stats ──
+                    # Use Clanker's built-in market data if available, else DexScreener
+                    mcap_hint   = launch.get("mcap_hint", 0)
+                    volume_hint = launch.get("volume_hint", 0)
+
+                    if mcap_hint > 0 or volume_hint > 0:
+                        # Clanker already returned market data via includeMarket=true
+                        stats = {
+                            "mcap":      mcap_hint,
+                            "volume":    volume_hint,
+                            "liquidity": 0,  # not in Clanker API, check DexScreener only for liq
+                        }
+                        # Still need liquidity from DexScreener
+                        dex = await get_dexscreener_stats(session, address)
+                        stats["liquidity"] = dex["liquidity"]
+                        # If Clanker mcap/volume were 0 (new token), fall back to DexScreener
+                        if stats["mcap"] == 0:   stats["mcap"]   = dex["mcap"]
+                        if stats["volume"] == 0: stats["volume"] = dex["volume"]
+                    else:
+                        stats = await get_dexscreener_stats(session, address)
                     if stats["mcap"] < MIN_MCAP:
                         log.info(f"  [{source}] ${symbol} — MCap {fmt_usd(stats['mcap'])}, skip")
                         continue
