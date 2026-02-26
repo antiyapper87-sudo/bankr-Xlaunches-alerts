@@ -1,9 +1,11 @@
 """
-Whale Alert Bot — Bankr + Clanker
-==================================
-Monitors TWO sources for new token launches on Base:
-  1. Bankr API  — https://api.bankr.bot/token-launches
-  2. Clanker API — https://www.clanker.world/api/tokens
+Whale Alert Bot — Bankr + Clanker + Virtuals + Flaunch
+========================================================
+Monitors FOUR sources for new token launches on Base:
+  1. Bankr API   — https://api.bankr.bot/token-launches
+  2. Clanker API  — https://www.clanker.world/api/tokens
+  3. Virtuals API — https://api2.virtuals.io/api/virtuals  (AI agent launches)
+  4. Flaunch API  — https://flaunch.gg subgraph (memecoin launches)
 
 When a token is launched by an X account with 10K+ followers → alerts to Telegram + WhatsApp.
 Uses SocialData.tools API for reliable follower count lookups.
@@ -28,7 +30,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 WHAPI_TOKEN = os.getenv("WHAPI_TOKEN", "")
 WHATSAPP_GROUP_ID = os.getenv("WHATSAPP_GROUP_ID", "")
 SOCIALDATA_API_KEY = os.getenv("SOCIALDATA_API_KEY", "")
-MIN_FOLLOWERS = int(os.getenv("MIN_FOLLOWERS", "10000"))
+MIN_FOLLOWERS = int(os.getenv("MIN_FOLLOWERS", "5000"))
 MIN_MCAP = int(os.getenv("MIN_MCAP", "50000"))
 MIN_VOLUME_24H = int(os.getenv("MIN_VOLUME_24H", "50000"))
 MIN_LIQUIDITY = int(os.getenv("MIN_LIQUIDITY", "30000"))
@@ -36,6 +38,8 @@ POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
 
 BANKR_API_URL = "https://api.bankr.bot/token-launches"
 CLANKER_API_URL = "https://www.clanker.world/api/tokens"
+VIRTUALS_API_URL = "https://api2.virtuals.io/api/virtuals"
+FLAUNCH_SUBGRAPH_URL = "https://api.goldsky.com/api/public/project_cm5k0msqgbujq01s60io238e5/subgraphs/flaunch-base-mainnet/1.0.0/gn"
 DEXSCREENER_API_URL = "https://api.dexscreener.com/latest/dex/tokens"
 SOCIALDATA_API_URL = "https://api.socialdata.tools/twitter/user"
 
@@ -210,7 +214,7 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                 await send_telegram(
                     session,
                     f"🐋 <b>Whale Alert Bot</b>\n\n"
-                    f"• Sources: Bankr + Clanker\n"
+                    f"• Sources: Bankr + Clanker + Virtuals + Flaunch\n"
                     f"• Tokens seen: {len(seen_tokens)}\n"
                     f"• Alerts sent: {alert_count}\n"
                     f"• Blocked: {len(blocked_accounts)} accounts\n"
@@ -429,6 +433,191 @@ async def fetch_clanker(session: aiohttp.ClientSession) -> list[dict]:
     return normalized
 
 
+# ─── Virtuals API ─────────────────────────────────────────────────────────────
+
+async def fetch_virtuals(session: aiohttp.ClientSession) -> list[dict]:
+    """Fetch & normalize AI agent launches from Virtuals Protocol API."""
+    normalized = []
+    try:
+        # Fetch newest sentient agents (status=5) and prototypes (status=3)
+        for status in [5, 3]:
+            params = {
+                "filters[status]": status,
+                "filters[factory][0]": "VIBES_BONDING_V2",
+                "sort": "createdAt:desc",
+                "populate[0]": "image",
+                "pagination[page]": 1,
+                "pagination[pageSize]": 20,
+            }
+            async with session.get(
+                VIRTUALS_API_URL, params=params,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                if resp.status != 200:
+                    log.warning(f"Virtuals API (status={status}) returned {resp.status}")
+                    continue
+                data = await resp.json()
+
+            agents = data.get("data", [])
+            status_label = "sentient" if status == 5 else "prototype"
+            log.info(f"Virtuals ({status_label}): {len(agents)} agents fetched")
+
+            for agent in agents:
+                address = (agent.get("tokenAddress") or "").lower()
+                if not address:
+                    continue
+
+                # Extract X username — try both agent socials and creator socials
+                x_username = ""
+
+                # 1) Agent's own verified X
+                agent_socials = agent.get("socials", {}) or {}
+                verified_usernames = agent_socials.get("VERIFIED_USERNAMES", {}) or {}
+                x_username = verified_usernames.get("TWITTER", "")
+
+                # 2) Creator's verified X (fallback)
+                creator_x = ""
+                creator = agent.get("creator", {}) or {}
+                creator_socials = creator.get("socials", {}) or {}
+                creator_verified = creator_socials.get("VERIFIED_USERNAMES", {}) or {}
+                creator_x = creator_verified.get("TWITTER", "")
+
+                # Use agent X if available, else creator X
+                if not x_username:
+                    x_username = creator_x
+
+                # Build tweet URL from video pitch if available
+                tweet_url = ""
+                video_pitch = agent_socials.get("VIDEO_PITCH", {}) or {}
+                tweet_url = video_pitch.get("TWEET_URL", "")
+
+                # Get image
+                image = agent.get("image", {}) or {}
+                image_uri = image.get("url", "")
+
+                normalized.append({
+                    "source": "virtuals",
+                    "address": address,
+                    "name": agent.get("name", "Unknown"),
+                    "symbol": agent.get("symbol", "?"),
+                    "x_username": x_username or "",
+                    "creator_x": creator_x or "",
+                    "tweet_url": tweet_url,
+                    "image_uri": image_uri,
+                    "virtuals_id": agent.get("id", ""),
+                    "holder_count": agent.get("holderCount", 0),
+                    "fdv_virtual": agent.get("fdvInVirtual", 0),
+                    "liquidity_usd": agent.get("liquidityUsd", 0),
+                })
+
+    except Exception as e:
+        log.error(f"Virtuals fetch error: {e}")
+
+    return normalized
+
+
+# ─── Flaunch Subgraph ─────────────────────────────────────────────────────────
+
+async def fetch_flaunch(session: aiohttp.ClientSession) -> list[dict]:
+    """Fetch & normalize token launches from Flaunch.gg via their subgraph."""
+    normalized = []
+    try:
+        query = """
+        {
+          pools(
+            first: 20,
+            orderBy: createdAt,
+            orderDirection: desc,
+            where: { closed: false }
+          ) {
+            id
+            memecoin {
+              id
+              name
+              symbol
+            }
+            creator
+            createdAt
+            initialTokenFairLaunch
+            tokenUri
+          }
+        }
+        """
+        async with session.post(
+            FLAUNCH_SUBGRAPH_URL,
+            json={"query": query},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status != 200:
+                log.warning(f"Flaunch subgraph returned {resp.status}")
+                return []
+            data = await resp.json()
+
+        pools = data.get("data", {}).get("pools", [])
+        log.info(f"Flaunch: {len(pools)} launches fetched")
+
+        for pool in pools:
+            memecoin = pool.get("memecoin", {}) or {}
+            address = (memecoin.get("id") or "").lower()
+            if not address:
+                continue
+
+            # Flaunch tokens store socials in tokenUri (IPFS metadata)
+            # We'll try to extract X handle from the metadata if available
+            x_username = ""
+            token_uri = pool.get("tokenUri", "") or ""
+
+            # If tokenUri is IPFS, we could fetch it, but for speed we'll
+            # rely on DexScreener social links or skip if no X handle
+            # For now, we log it and check DexScreener for social info
+
+            normalized.append({
+                "source": "flaunch",
+                "address": address,
+                "name": memecoin.get("name", "Unknown"),
+                "symbol": memecoin.get("symbol", "?"),
+                "x_username": x_username,
+                "tweet_url": "",
+                "image_uri": "",
+                "creator_wallet": pool.get("creator", ""),
+                "token_uri": token_uri,
+            })
+
+    except Exception as e:
+        log.error(f"Flaunch fetch error: {e}")
+
+    return normalized
+
+
+async def enrich_flaunch_x_handle(session: aiohttp.ClientSession, launch: dict) -> str:
+    """Try to get X handle for Flaunch token from its IPFS metadata."""
+    token_uri = launch.get("token_uri", "")
+    if not token_uri:
+        return ""
+
+    try:
+        # Convert IPFS URI to HTTP gateway
+        if token_uri.startswith("ipfs://"):
+            token_uri = token_uri.replace("ipfs://", "https://ipfs.io/ipfs/")
+
+        async with session.get(token_uri, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            if resp.status != 200:
+                return ""
+            metadata = await resp.json()
+
+        # Look for twitterUrl in metadata
+        twitter_url = metadata.get("twitterUrl", "") or metadata.get("twitter", "")
+        if twitter_url:
+            match = re.search(r'(?:twitter\.com|x\.com)/(@?\w+)', twitter_url)
+            if match:
+                return match.group(1).lstrip("@")
+
+    except Exception:
+        pass
+
+    return ""
+
+
 # ─── Alert Formatting ─────────────────────────────────────────────────────────
 
 def fmt_usd(val) -> str:
@@ -440,6 +629,14 @@ def fmt_usd(val) -> str:
     return f"${val:.0f}"
 
 
+SOURCE_EMOJIS = {
+    "bankr": "🏦",
+    "clanker": "⚙️",
+    "virtuals": "🤖",
+    "flaunch": "🚀",
+}
+
+
 def format_alert_telegram(launch: dict, follower_count: int, dex: dict | None) -> str:
     """Format a Telegram alert message (HTML)."""
     source = launch["source"].upper()
@@ -449,7 +646,17 @@ def format_alert_telegram(launch: dict, follower_count: int, dex: dict | None) -
     x_username = launch["x_username"]
     tweet_url = launch.get("tweet_url", "")
 
-    source_emoji = "🏦" if launch["source"] == "bankr" else "⚙️"
+    source_emoji = SOURCE_EMOJIS.get(launch["source"], "📡")
+
+    # Extra info for Virtuals
+    virtuals_line = ""
+    if launch["source"] == "virtuals":
+        creator_x = launch.get("creator_x", "")
+        if creator_x and creator_x != x_username:
+            virtuals_line = f"👷 Creator: <a href='https://x.com/{creator_x}'>@{creator_x}</a>\n"
+        holders = launch.get("holder_count", 0)
+        if holders:
+            virtuals_line += f"👥 Holders: {holders:,}\n"
 
     market_lines = ""
     if dex:
@@ -465,10 +672,20 @@ def format_alert_telegram(launch: dict, follower_count: int, dex: dict | None) -
 
     links = [
         f"├ <a href='https://dexscreener.com/base/{address}'>DexScreener</a>",
-        f"├ <a href='https://www.clanker.world/clanker/{address}'>Clanker</a>",
         f"├ <a href='https://basescan.org/token/{address}'>BaseScan</a>",
         f"├ <a href='https://gmgn.ai/base/token/{address}'>GMGN</a>",
     ]
+
+    # Source-specific links
+    if launch["source"] == "virtuals":
+        vid = launch.get("virtuals_id", "")
+        if vid:
+            links.append(f"├ <a href='https://app.virtuals.io/virtuals/{vid}'>Virtuals</a>")
+    elif launch["source"] == "flaunch":
+        links.append(f"├ <a href='https://flaunch.gg/token/{address}'>Flaunch</a>")
+    elif launch["source"] == "clanker":
+        links.append(f"├ <a href='https://www.clanker.world/clanker/{address}'>Clanker</a>")
+
     if x_username:
         links.append(f"├ <a href='https://x.com/{x_username}'>𝕏 @{x_username}</a>")
     if tweet_url:
@@ -480,6 +697,7 @@ def format_alert_telegram(launch: dict, follower_count: int, dex: dict | None) -
         f"<b>{name}</b> (${symbol})\n"
         f"{source_emoji} Via: <b>{source}</b>\n"
         f"👤 <a href='https://x.com/{x_username}'>@{x_username}</a> — <b>{follower_count:,}</b> followers\n"
+        f"{virtuals_line}"
         f"{market_lines}\n"
         f"🔗 <b>Links:</b>\n" + "\n".join(links) +
         f"\n\n<code>{address}</code>"
@@ -497,9 +715,8 @@ def format_alert_whatsapp(launch: dict, follower_count: int, dex: dict | None) -
     x_username = launch["x_username"]
     tweet_url = launch.get("tweet_url", "")
 
-    source_emoji = "🏦" if launch["source"] == "bankr" else "⚙️"
+    source_emoji = SOURCE_EMOJIS.get(launch["source"], "📡")
 
-    # Follower count formatted
     if follower_count >= 1_000_000:
         f_str = f"{follower_count / 1_000_000:.1f}M"
     elif follower_count >= 1_000:
@@ -514,6 +731,15 @@ def format_alert_whatsapp(launch: dict, follower_count: int, dex: dict | None) -
         f"{source_emoji} Via: *{source}*",
         f"👤 @{x_username} — *{f_str} followers*",
     ]
+
+    # Extra info for Virtuals
+    if launch["source"] == "virtuals":
+        creator_x = launch.get("creator_x", "")
+        if creator_x and creator_x != x_username:
+            lines.append(f"👷 Creator: @{creator_x}")
+        holders = launch.get("holder_count", 0)
+        if holders:
+            lines.append(f"👥 Holders: {holders:,}")
 
     if dex:
         change_1h = dex.get("price_change_1h", 0)
@@ -531,10 +757,19 @@ def format_alert_whatsapp(launch: dict, follower_count: int, dex: dict | None) -
         f"",
         f"🔗 *Links:*",
         f"├ DexScreener: https://dexscreener.com/base/{address}",
-        f"├ Clanker: https://www.clanker.world/clanker/{address}",
         f"├ GMGN: https://gmgn.ai/base/token/{address}",
-        f"├ X: https://x.com/{x_username}",
     ])
+
+    if launch["source"] == "virtuals":
+        vid = launch.get("virtuals_id", "")
+        if vid:
+            lines.append(f"├ Virtuals: https://app.virtuals.io/virtuals/{vid}")
+    elif launch["source"] == "flaunch":
+        lines.append(f"├ Flaunch: https://flaunch.gg/token/{address}")
+    elif launch["source"] == "clanker":
+        lines.append(f"├ Clanker: https://www.clanker.world/clanker/{address}")
+
+    lines.append(f"├ X: https://x.com/{x_username}")
 
     if tweet_url:
         lines.append(f"├ Tweet: {tweet_url}")
@@ -555,11 +790,17 @@ async def seed_existing(session: aiohttp.ClientSession):
     log.info("📋 Seeding existing tokens...")
     bankr = await fetch_bankr(session)
     clanker = await fetch_clanker(session)
+    virtuals = await fetch_virtuals(session)
+    flaunch = await fetch_flaunch(session)
 
-    for launch in bankr + clanker:
+    for launch in bankr + clanker + virtuals + flaunch:
         seen_tokens.add(launch["address"])
 
-    log.info(f"📋 Seeded {len(seen_tokens)} tokens (Bankr: {len(bankr)}, Clanker: {len(clanker)})")
+    log.info(
+        f"📋 Seeded {len(seen_tokens)} tokens "
+        f"(Bankr: {len(bankr)}, Clanker: {len(clanker)}, "
+        f"Virtuals: {len(virtuals)}, Flaunch: {len(flaunch)})"
+    )
 
 
 # ─── Main Loop ────────────────────────────────────────────────────────────────
@@ -576,7 +817,7 @@ async def main():
         log.error("❌ SOCIALDATA_API_KEY not set!")
 
     log.info("=" * 60)
-    log.info("  🐋 Whale Alert Bot (Bankr + Clanker)")
+    log.info("  🐋 Whale Alert Bot (Bankr + Clanker + Virtuals + Flaunch)")
     log.info(f"  Min followers : {MIN_FOLLOWERS:,}")
     log.info(f"  Min MCap      : ${MIN_MCAP:,}")
     log.info(f"  Min Volume 24h: ${MIN_VOLUME_24H:,}")
@@ -597,7 +838,7 @@ async def main():
             await send_telegram(
                 session,
                 f"🐋 <b>Whale Alert Bot started</b>\n\n"
-                f"Sources: Bankr + Clanker\n"
+                f"Sources: Bankr + Clanker + Virtuals + Flaunch\n"
                 f"Follower lookup: SocialData.tools\n"
                 f"Min followers: {MIN_FOLLOWERS:,}\n"
                 f"Min MCap: ${MIN_MCAP:,} · Vol: ${MIN_VOLUME_24H:,} · Liq: ${MIN_LIQUIDITY:,}\n"
@@ -613,11 +854,13 @@ async def main():
                 # Check for Telegram commands
                 await handle_telegram_commands(session)
 
-                # Fetch from both sources
+                # Fetch from ALL sources
                 bankr_launches = await fetch_bankr(session)
                 clanker_launches = await fetch_clanker(session)
+                virtuals_launches = await fetch_virtuals(session)
+                flaunch_launches = await fetch_flaunch(session)
 
-                all_launches = bankr_launches + clanker_launches
+                all_launches = bankr_launches + clanker_launches + virtuals_launches + flaunch_launches
                 new_count = 0
                 whale_count = 0
 
@@ -629,47 +872,58 @@ async def main():
                     seen_tokens.add(address)
                     new_count += 1
 
-                    x_username = launch.get("x_username", "")
                     symbol = launch.get("symbol", "?")
                     source = launch.get("source", "?")
 
-                    # No X account → skip
-                    if not x_username:
+                    # ── STEP 1: Does the DEPLOYER have an X account? ──
+                    # For Virtuals: use creator X only (not the agent/project X)
+                    # For Bankr/Clanker: use deployer X as before
+                    # For Flaunch: try to enrich from IPFS metadata
+
+                    if source == "virtuals":
+                        deployer_x = launch.get("creator_x", "")
+                    elif source == "flaunch":
+                        deployer_x = launch.get("x_username", "")
+                        if not deployer_x:
+                            deployer_x = await enrich_flaunch_x_handle(session, launch)
+                    else:
+                        deployer_x = launch.get("x_username", "")
+
+                    if not deployer_x:
                         log.info(f"  [{source}] ${symbol} — no deployer X, skip")
                         continue
 
                     # Blocked → skip
-                    if x_username.lower() in blocked_accounts:
-                        log.info(f"  [{source}] ${symbol} @{x_username} — BLOCKED, skip")
+                    if deployer_x.lower() in blocked_accounts:
+                        log.info(f"  [{source}] ${symbol} @{deployer_x} — BLOCKED, skip")
                         continue
 
-                    # Check follower count via SocialData
-                    followers = await get_follower_count(session, x_username)
-
-                    if followers is None:
-                        log.info(f"  [{source}] ${symbol} @{x_username} — followers unknown, skip")
-                        continue
-
-                    if followers < MIN_FOLLOWERS:
-                        log.info(f"  [{source}] ${symbol} @{x_username} — {followers:,} followers < {MIN_FOLLOWERS:,}, skip")
-                        continue
-
-                    # 🐋 Whale detected! Now check market data
-                    log.info(f"  🐋 [{source}] ${symbol} @{x_username} — {followers:,} followers! Checking market data...")
-
+                    # ── STEP 2: Market data filter (MCap/Volume/Liquidity) ──
                     dex = await fetch_dexscreener(session, address)
                     passes, reason = passes_market_filters(dex)
 
                     if not passes:
-                        log.info(f"  [{source}] ${symbol} — whale but {reason}, skip")
+                        log.info(f"  [{source}] ${symbol} @{deployer_x} — {reason}, skip")
                         continue
 
-                    # 🚀 All filters passed — send alert!
+                    # ── STEP 3: Deployer follower count ──
+                    followers = await get_follower_count(session, deployer_x)
+
+                    if followers is None:
+                        log.info(f"  [{source}] ${symbol} @{deployer_x} — followers unknown, skip")
+                        continue
+
+                    if followers < MIN_FOLLOWERS:
+                        log.info(f"  [{source}] ${symbol} @{deployer_x} — {followers:,} followers < {MIN_FOLLOWERS:,}, skip")
+                        continue
+
+                    # ── STEP 4: All passed → send alert! ──
+                    launch["x_username"] = deployer_x
                     whale_count += 1
                     alert_count += 1
                     tg_text = format_alert_telegram(launch, followers, dex)
                     wa_text = format_alert_whatsapp(launch, followers, dex)
-                    log.info(f"  🚀 ALERT: [{source}] ${symbol} @{x_username} — {followers:,} followers, MCap {fmt_usd(dex['mcap'])}")
+                    log.info(f"  🚀 ALERT: [{source}] ${symbol} @{deployer_x} — {followers:,} followers, MCap {fmt_usd(dex['mcap'])}")
                     await send_alert_all(session, tg_text, wa_text)
 
                 log.info(f"🔍 {new_count} new launches processed, {whale_count} alerts sent")
