@@ -90,12 +90,14 @@ blocked_accounts: set[str] = load_blocklist()
 
 # ─── Telegram ─────────────────────────────────────────────────────────────────
 
-async def send_telegram(session: aiohttp.ClientSession, text: str) -> bool:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+async def send_telegram(session: aiohttp.ClientSession, text: str, chat_id: str = "") -> bool:
+    """Send a Telegram message. Uses TELEGRAM_CHAT_ID by default, or a specific chat_id."""
+    target = chat_id or TELEGRAM_CHAT_ID
+    if not TELEGRAM_BOT_TOKEN or not target:
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": target,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
@@ -106,7 +108,7 @@ async def send_telegram(session: aiohttp.ClientSession, text: str) -> bool:
                 return True
             else:
                 body = await resp.text()
-                log.error(f"Telegram error {resp.status}: {body[:200]}")
+                log.error(f"Telegram error {resp.status} (chat {target}): {body[:200]}")
                 return False
     except Exception as e:
         log.error(f"Telegram send failed: {e}")
@@ -171,41 +173,46 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
             last_update_id = update["update_id"]
             msg = update.get("message", {})
             text = msg.get("text", "").strip()
+            chat_id = str(msg.get("chat", {}).get("id", ""))
+
             if not text.startswith("/"):
                 continue
+
+            # Log the chat ID for debugging
+            log.info(f"📩 Command from chat {chat_id}: {text[:50]}")
 
             # /block @username
             if text.lower().startswith("/block") and not text.lower().startswith("/blocklist"):
                 parts = text.split(maxsplit=1)
                 if len(parts) < 2:
-                    await send_telegram(session, "Usage: /block @username")
+                    await send_telegram(session, "Usage: /block @username", chat_id)
                     continue
                 username = parts[1].strip().lstrip("@").lower()
                 blocked_accounts.add(username)
                 save_blocklist(blocked_accounts)
                 follower_cache.pop(username, None)
                 log.info(f"🚫 Blocked @{username}")
-                await send_telegram(session, f"🚫 Blocked <b>@{username}</b> — future launches ignored")
+                await send_telegram(session, f"🚫 Blocked <b>@{username}</b> — future launches ignored", chat_id)
 
             # /unblock @username
             elif text.lower().startswith("/unblock"):
                 parts = text.split(maxsplit=1)
                 if len(parts) < 2:
-                    await send_telegram(session, "Usage: /unblock @username")
+                    await send_telegram(session, "Usage: /unblock @username", chat_id)
                     continue
                 username = parts[1].strip().lstrip("@").lower()
                 blocked_accounts.discard(username)
                 save_blocklist(blocked_accounts)
                 log.info(f"✅ Unblocked @{username}")
-                await send_telegram(session, f"✅ Unblocked <b>@{username}</b>")
+                await send_telegram(session, f"✅ Unblocked <b>@{username}</b>", chat_id)
 
             # /blocklist
             elif text.lower().startswith("/blocklist"):
                 if blocked_accounts:
                     names = "\n".join(f"• @{u}" for u in sorted(blocked_accounts))
-                    await send_telegram(session, f"🚫 <b>Blocked ({len(blocked_accounts)}):</b>\n{names}")
+                    await send_telegram(session, f"🚫 <b>Blocked ({len(blocked_accounts)}):</b>\n{names}", chat_id)
                 else:
-                    await send_telegram(session, "No accounts blocked.")
+                    await send_telegram(session, "No accounts blocked.", chat_id)
 
             # /status
             elif text.lower().startswith("/status"):
@@ -223,19 +230,21 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                     f"• Min Volume: ${MIN_VOLUME_24H:,}\n"
                     f"• Min Liquidity: ${MIN_LIQUIDITY:,}\n"
                     f"• WhatsApp: {wa_status}\n"
-                    f"• Poll interval: {POLL_INTERVAL}s",
+                    f"• Poll interval: {POLL_INTERVAL}s\n"
+                    f"• Your chat ID: <code>{chat_id}</code>",
+                    chat_id,
                 )
 
             # /research $TICKER or /r $TICKER — token intelligence brief
             elif text.lower().startswith("/research") or text.lower().startswith("/r "):
                 parts = text.split(maxsplit=1)
                 if len(parts) < 2:
-                    await send_telegram(session, "Usage: /research $TICKER or /research 0x...")
+                    await send_telegram(session, "Usage: /research $TICKER or /research 0x...", chat_id)
                     continue
                 ticker_query = parts[1].strip()
-                await send_telegram(session, f"🔍 Researching <b>{ticker_query}</b>...")
+                await send_telegram(session, f"🔍 Researching <b>{ticker_query}</b>...", chat_id)
                 report = await research_token(session, ticker_query)
-                await send_telegram(session, report)
+                await send_telegram(session, report, chat_id)
 
     except Exception as e:
         log.debug(f"Telegram command check error: {e}")
