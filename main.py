@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import json
+import time
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -55,6 +56,11 @@ log = logging.getLogger("whale-alert")
 
 seen_tokens: set[str] = set()
 follower_cache: dict[str, int | None] = {}
+gecko_cache: dict[str, tuple[float, dict | None]] = {}  # address → (timestamp, result)
+GECKO_CACHE_TTL_HIT = 120    # cache valid market data for 2 min
+GECKO_CACHE_TTL_MISS = 300   # cache "no data" for 5 min (don't re-check too soon)
+gecko_last_call: float = 0   # rate limiter: track last API call time
+GECKO_MIN_INTERVAL = 2.5     # minimum seconds between GeckoTerminal calls
 last_update_id: int = 0
 alert_count: int = 0
 
@@ -309,18 +315,36 @@ async def get_follower_count(session: aiohttp.ClientSession, username: str) -> i
 # ─── GeckoTerminal Market Data ────────────────────────────────────────────────
 
 async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str) -> dict | None:
-    """Fetch market data from GeckoTerminal for a Base token. Much faster indexing than DexScreener."""
+    """Fetch market data from GeckoTerminal for a Base token. Cached + rate limited."""
+    global gecko_last_call
+    token_address = token_address.lower()
+
+    # Check cache first
+    if token_address in gecko_cache:
+        cached_time, cached_result = gecko_cache[token_address]
+        ttl = GECKO_CACHE_TTL_HIT if cached_result else GECKO_CACHE_TTL_MISS
+        if time.time() - cached_time < ttl:
+            return cached_result
+
+    # Rate limiter: wait if we called too recently
+    now = time.time()
+    elapsed = now - gecko_last_call
+    if elapsed < GECKO_MIN_INTERVAL:
+        await asyncio.sleep(GECKO_MIN_INTERVAL - elapsed)
+    gecko_last_call = time.time()
+
     try:
         # Include top_pools to get liquidity (reserve_in_usd) in the included array
         url = f"{GECKOTERMINAL_API_URL}/networks/base/tokens/{token_address}?include=top_pools"
         headers = {"Accept": "application/json;version=20230302"}
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status == 404:
+                gecko_cache[token_address] = (time.time(), None)
                 return None
             if resp.status == 429:
                 log.warning("GeckoTerminal rate limited, backing off...")
                 await asyncio.sleep(5)
-                return None
+                return None  # don't cache rate limits
             if resp.status != 200:
                 log.debug(f"GeckoTerminal {resp.status} for {token_address[:10]}...")
                 return None
@@ -328,6 +352,7 @@ async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str
 
         attrs = data.get("data", {}).get("attributes", {})
         if not attrs:
+            gecko_cache[token_address] = (time.time(), None)
             return None
 
         fdv = float(attrs.get("fdv_usd") or 0)
@@ -347,7 +372,7 @@ async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str
         price_change_1h = float(attrs.get("price_change_percentage", {}).get("h1") or 0)
         price_change_24h = float(attrs.get("price_change_percentage", {}).get("h24") or 0)
 
-        return {
+        result = {
             "mcap": mcap,
             "volume_24h": vol_24h,
             "liquidity": liquidity,
@@ -356,8 +381,11 @@ async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str
             "price_change_24h": price_change_24h,
             "pair_url": f"https://www.geckoterminal.com/base/tokens/{token_address}",
         }
+        gecko_cache[token_address] = (time.time(), result)
+        return result
     except Exception as e:
         log.debug(f"GeckoTerminal error for {token_address[:10]}...: {e}")
+        gecko_cache[token_address] = (time.time(), None)
         return None
 
 
@@ -473,17 +501,42 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
                 if resp.status == 200:
                     data = await resp.json()
                     pools = data.get("data", [])
+
+                    # Score each pool: exact ticker match + highest volume
+                    best_pool = None
+                    best_score = -1
+
                     for pool in pools:
                         pool_attrs = pool.get("attributes", {})
-                        pool_name = pool_attrs.get("name", "")
-                        # Find a pool where our ticker matches base token
+                        pool_name = pool_attrs.get("name", "")  # e.g. "VIRTUAL / WETH"
+                        vol_24h = float(pool_attrs.get("volume_usd", {}).get("h24", 0) or 0)
+
                         base_addr = pool.get("relationships", {}).get("base_token", {}).get("data", {}).get("id", "")
                         if base_addr:
                             base_addr = base_addr.replace("base_", "")
-                        if base_addr and ticker.lower() in pool_name.lower():
-                            address = base_addr
-                            token_name = pool_name.split(" / ")[0] if " / " in pool_name else pool_name
-                            break
+                        if not base_addr:
+                            continue
+
+                        # Extract base token symbol from pool name (before " / ")
+                        base_symbol = pool_name.split(" / ")[0].strip().upper() if " / " in pool_name else ""
+
+                        # Exact ticker match gets a huge bonus
+                        score = vol_24h
+                        if base_symbol == ticker:
+                            score += 1_000_000_000  # exact match priority
+
+                        if score > best_score:
+                            best_score = score
+                            best_pool = pool
+
+                    if best_pool:
+                        pool_attrs = best_pool.get("attributes", {})
+                        pool_name = pool_attrs.get("name", "")
+                        base_addr = best_pool.get("relationships", {}).get("base_token", {}).get("data", {}).get("id", "")
+                        if base_addr:
+                            address = base_addr.replace("base_", "")
+                        token_name = pool_name.split(" / ")[0].strip() if " / " in pool_name else pool_name
+
         except Exception as e:
             log.debug(f"GeckoTerminal search error: {e}")
 
@@ -551,17 +604,17 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
             else:
                 f_str = str(f_count)
 
-            # Truncate tweet text
-            text_preview = m['text'].replace('\n', ' ')[:100]
-            if len(m['text']) > 100:
-                text_preview += "..."
+            # Clean up tweet text — remove t.co links, expand preview
+            text_clean = re.sub(r'https?://t\.co/\S+', '', m['text']).strip()
+            text_clean = text_clean.replace('\n', ' ').replace('  ', ' ')
+            if len(text_clean) > 280:
+                text_clean = text_clean[:277] + "..."
 
             lines.extend([
                 f"",
-                f"├ <a href='https://x.com/{m['username']}'>@{m['username']}</a> ({f_str} followers)",
-                f"│ ❤️ {m['likes']} 🔁 {m['retweets']} · {m['date']}",
-                f"│ <i>{text_preview}</i>",
-                f"│ <a href='{m['url']}'>View tweet</a>",
+                f"├ <a href='{m['url']}'>@{m['username']}</a> ({f_str} followers) · {m['date']}",
+                f"│ ❤️ {m['likes']} 🔁 {m['retweets']}",
+                f"│ <i>{text_clean}</i>" if text_clean else f"│ <i>[media only]</i>",
             ])
         lines.append("")
     else:
