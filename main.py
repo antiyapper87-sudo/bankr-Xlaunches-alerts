@@ -166,10 +166,15 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
     try:
         async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=5)) as resp:
             if resp.status != 200:
+                log.warning(f"getUpdates returned {resp.status}")
                 return
             data = await resp.json()
 
-        for update in data.get("result", []):
+        updates = data.get("result", [])
+        if updates:
+            log.info(f"📬 Received {len(updates)} Telegram updates")
+
+        for update in updates:
             last_update_id = update["update_id"]
             msg = update.get("message", {})
             text = msg.get("text", "").strip()
@@ -247,7 +252,7 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                 await send_telegram(session, report, chat_id)
 
     except Exception as e:
-        log.debug(f"Telegram command check error: {e}")
+        log.warning(f"Telegram command check error: {e}")
 
 
 # ─── SocialData.tools Follower Lookup ─────────────────────────────────────────
