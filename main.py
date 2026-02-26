@@ -254,8 +254,12 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                     continue
                 ticker_query = parts[1].strip()
                 await send_telegram(session, f"🔍 Researching <b>{ticker_query}</b>...", chat_id)
-                report = await research_token(session, ticker_query)
-                await send_telegram(session, report, chat_id)
+                try:
+                    report = await research_token(session, ticker_query)
+                    await send_telegram(session, report, chat_id)
+                except Exception as re:
+                    log.error(f"Research error for {ticker_query}: {re}")
+                    await send_telegram(session, f"❌ Research failed for {ticker_query}: {str(re)[:100]}", chat_id)
 
     except Exception as e:
         log.warning(f"Telegram command check error: {e}")
@@ -556,11 +560,13 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
     if not dex and not x_mentions:
         return (
             f"🔍 <b>No data found for ${ticker}</b>\n\n"
-            f"Could not find market data on Base chain or notable X mentions.\n"
-            f"Try using the contract address: /research 0x..."
+            f"No market data on Base or notable X mentions.\n"
+            f"Token might be on another chain (Solana, ETH, etc).\n"
+            f"Try the contract address: /research 0x..."
         )
 
-    lines = [f"🔍 <b>Research: {token_name or ticker}</b> (${ticker})\n"]
+    safe_name = (token_name or ticker).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    lines = [f"🔍 <b>Research: {safe_name}</b> (${ticker})\n"]
 
     if address:
         lines.append(f"📋 <code>{address}</code>\n")
@@ -610,6 +616,8 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
             # Clean up tweet text — remove t.co links, expand preview
             text_clean = re.sub(r'https?://t\.co/\S+', '', m['text']).strip()
             text_clean = text_clean.replace('\n', ' ').replace('  ', ' ')
+            # Escape HTML entities to prevent Telegram parse errors
+            text_clean = text_clean.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
             if len(text_clean) > 280:
                 text_clean = text_clean[:277] + "..."
 
@@ -1058,6 +1066,13 @@ async def main():
                 virtuals_launches = await fetch_virtuals(session)
 
                 all_launches = bankr_launches + clanker_launches + virtuals_launches
+
+                # Log per-source new vs seen
+                for src_name, src_list in [("bankr", bankr_launches), ("clanker", clanker_launches), ("virtuals", virtuals_launches)]:
+                    src_new = sum(1 for l in src_list if l["address"] not in seen_tokens)
+                    if src_new == 0 and len(src_list) > 0:
+                        log.debug(f"  [{src_name}] {len(src_list)} fetched, all already seen")
+
                 new_count = 0
                 whale_count = 0
 
