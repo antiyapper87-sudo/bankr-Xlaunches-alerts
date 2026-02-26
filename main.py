@@ -357,7 +357,8 @@ async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str
 
         fdv = float(attrs.get("fdv_usd") or 0)
         mcap = float(attrs.get("market_cap_usd") or 0) or fdv
-        vol_24h = float(attrs.get("volume_usd", {}).get("h24") or 0)
+        vol_raw = attrs.get("volume_usd") or {}
+        vol_24h = float(vol_raw.get("h24") or 0)
 
         # Get liquidity from included top pool data (saves a 2nd API call)
         liquidity = 0.0
@@ -369,8 +370,9 @@ async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str
                 if reserve > liquidity:
                     liquidity = reserve
 
-        price_change_1h = float(attrs.get("price_change_percentage", {}).get("h1") or 0)
-        price_change_24h = float(attrs.get("price_change_percentage", {}).get("h24") or 0)
+        pct_raw = attrs.get("price_change_percentage") or {}
+        price_change_1h = float(pct_raw.get("h1") or 0)
+        price_change_24h = float(pct_raw.get("h24") or 0)
 
         result = {
             "mcap": mcap,
@@ -575,7 +577,7 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
             f"├ 💰 MCap: {fmt_usd(dex['mcap'])}",
             f"├ 💧 Liquidity: {fmt_usd(dex['liquidity'])}",
             f"├ 📈 Volume 24h: {fmt_usd(dex['volume_24h'])}",
-            f"├ 💵 Price: ${float(dex.get('price_usd', 0)):.6f}",
+            f"├ 💵 Price: ${float(dex.get('price_usd') or 0):.6f}",
             f"├ {change_1h_emoji} 1h: {change_1h:+.1f}%",
             f"└ {change_24h_emoji} 24h: {change_24h:+.1f}%",
             "",
