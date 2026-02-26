@@ -226,6 +226,17 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                     f"• Poll interval: {POLL_INTERVAL}s",
                 )
 
+            # /research $TICKER or /r $TICKER — token intelligence brief
+            elif text.lower().startswith("/research") or text.lower().startswith("/r "):
+                parts = text.split(maxsplit=1)
+                if len(parts) < 2:
+                    await send_telegram(session, "Usage: /research $TICKER or /research 0x...")
+                    continue
+                ticker_query = parts[1].strip()
+                await send_telegram(session, f"🔍 Researching <b>{ticker_query}</b>...")
+                report = await research_token(session, ticker_query)
+                await send_telegram(session, report)
+
     except Exception as e:
         log.debug(f"Telegram command check error: {e}")
 
@@ -353,6 +364,206 @@ def passes_market_filters(dex: dict | None) -> tuple[bool, str]:
         return False, f"liq ${liq:,.0f} < ${MIN_LIQUIDITY:,}"
 
     return True, ""
+
+
+# ─── Token Research ───────────────────────────────────────────────────────────
+
+async def search_x_mentions(session: aiohttp.ClientSession, ticker: str, token_name: str = "") -> list[dict]:
+    """Search X for $TICKER mentions by notable accounts using SocialData search API."""
+    if not SOCIALDATA_API_KEY:
+        return []
+
+    mentions = []
+    try:
+        # Search for $TICKER mentions with engagement, sorted by top/popular
+        query = f"${ticker} min_faves:10"
+        url = "https://api.socialdata.tools/twitter/search"
+        headers = {
+            "Authorization": f"Bearer {SOCIALDATA_API_KEY}",
+            "Accept": "application/json",
+        }
+        params = {"query": query, "type": "Top"}
+
+        async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                log.debug(f"X search for ${ticker}: status {resp.status}")
+                return []
+            data = await resp.json()
+
+        tweets = data.get("tweets", [])
+        for tweet in tweets[:10]:
+            user = tweet.get("user", {})
+            followers = user.get("followers_count", 0)
+            # Only include tweets from accounts with 10K+ followers
+            if followers < 10000:
+                continue
+            mentions.append({
+                "username": user.get("screen_name", ""),
+                "name": user.get("name", ""),
+                "followers": followers,
+                "text": (tweet.get("full_text") or tweet.get("text") or "")[:200],
+                "likes": tweet.get("favorite_count", 0),
+                "retweets": tweet.get("retweet_count", 0),
+                "date": tweet.get("tweet_created_at", "")[:10],
+                "url": f"https://x.com/{user.get('screen_name', '')}/status/{tweet.get('id_str', '')}",
+            })
+
+        # Sort by followers descending
+        mentions.sort(key=lambda m: m["followers"], reverse=True)
+
+    except Exception as e:
+        log.debug(f"X search error for ${ticker}: {e}")
+
+    return mentions[:5]
+
+
+async def research_token(session: aiohttp.ClientSession, query: str) -> str:
+    """
+    Research a token by ticker or address.
+    Returns a formatted Telegram HTML report.
+    """
+    query = query.strip().lstrip("$").upper()
+    if not query:
+        return "Usage: /research $TICKER or /research 0x..."
+
+    is_address = query.lower().startswith("0x") and len(query) == 42
+    ticker = query
+
+    # ── Step 1: Find the token on GeckoTerminal ──
+    dex = None
+    address = ""
+    token_name = ""
+
+    if is_address:
+        address = query.lower()
+        dex = await fetch_geckoterminal(session, address)
+        if dex:
+            # Try to get name/symbol from GeckoTerminal
+            try:
+                url = f"{GECKOTERMINAL_API_URL}/networks/base/tokens/{address}"
+                headers = {"Accept": "application/json;version=20230302"}
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        attrs = data.get("data", {}).get("attributes", {})
+                        token_name = attrs.get("name", "")
+                        ticker = attrs.get("symbol", query).upper()
+            except Exception:
+                pass
+    else:
+        # Search GeckoTerminal by ticker
+        try:
+            url = f"{GECKOTERMINAL_API_URL}/search/pools?query={ticker}&network=base&page=1"
+            headers = {"Accept": "application/json;version=20230302"}
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    pools = data.get("data", [])
+                    for pool in pools:
+                        pool_attrs = pool.get("attributes", {})
+                        pool_name = pool_attrs.get("name", "")
+                        # Find a pool where our ticker matches base token
+                        base_addr = pool.get("relationships", {}).get("base_token", {}).get("data", {}).get("id", "")
+                        if base_addr:
+                            base_addr = base_addr.replace("base_", "")
+                        if base_addr and ticker.lower() in pool_name.lower():
+                            address = base_addr
+                            token_name = pool_name.split(" / ")[0] if " / " in pool_name else pool_name
+                            break
+        except Exception as e:
+            log.debug(f"GeckoTerminal search error: {e}")
+
+        if address:
+            dex = await fetch_geckoterminal(session, address)
+
+    # ── Step 2: Search X for $TICKER mentions ──
+    x_mentions = await search_x_mentions(session, ticker, token_name)
+
+    # ── Step 3: Check if token was seen by our bot ──
+    was_alerted = address.lower() in seen_tokens if address else False
+
+    # ── Build the report ──
+    if not dex and not x_mentions:
+        return (
+            f"🔍 <b>No data found for ${ticker}</b>\n\n"
+            f"Could not find market data on Base chain or notable X mentions.\n"
+            f"Try using the contract address: /research 0x..."
+        )
+
+    lines = [f"🔍 <b>Research: {token_name or ticker}</b> (${ticker})\n"]
+
+    if address:
+        lines.append(f"📋 <code>{address}</code>\n")
+
+    # Market data
+    if dex:
+        change_1h = dex.get("price_change_1h", 0)
+        change_24h = dex.get("price_change_24h", 0)
+        change_1h_emoji = "🟢" if change_1h >= 0 else "🔴"
+        change_24h_emoji = "🟢" if change_24h >= 0 else "🔴"
+
+        lines.extend([
+            f"📊 <b>Market Data:</b>",
+            f"├ 💰 MCap: {fmt_usd(dex['mcap'])}",
+            f"├ 💧 Liquidity: {fmt_usd(dex['liquidity'])}",
+            f"├ 📈 Volume 24h: {fmt_usd(dex['volume_24h'])}",
+            f"├ 💵 Price: ${float(dex.get('price_usd', 0)):.6f}",
+            f"├ {change_1h_emoji} 1h: {change_1h:+.1f}%",
+            f"└ {change_24h_emoji} 24h: {change_24h:+.1f}%",
+            "",
+        ])
+
+        # Quick filter check
+        passes, reason = passes_market_filters(dex)
+        if passes:
+            lines.append("✅ Passes market filters (MCap/Vol/Liq)\n")
+        else:
+            lines.append(f"❌ Fails filter: {reason}\n")
+    else:
+        lines.append("⚠️ No market data found on GeckoTerminal\n")
+
+    if was_alerted:
+        lines.append("👀 Token seen by bot\n")
+
+    # X mentions
+    if x_mentions:
+        lines.append(f"🐦 <b>Notable X mentions (${ticker}):</b>")
+        for m in x_mentions:
+            f_count = m['followers']
+            if f_count >= 1_000_000:
+                f_str = f"{f_count/1_000_000:.1f}M"
+            elif f_count >= 1_000:
+                f_str = f"{f_count/1_000:.0f}K"
+            else:
+                f_str = str(f_count)
+
+            # Truncate tweet text
+            text_preview = m['text'].replace('\n', ' ')[:100]
+            if len(m['text']) > 100:
+                text_preview += "..."
+
+            lines.extend([
+                f"",
+                f"├ <a href='https://x.com/{m['username']}'>@{m['username']}</a> ({f_str} followers)",
+                f"│ ❤️ {m['likes']} 🔁 {m['retweets']} · {m['date']}",
+                f"│ <i>{text_preview}</i>",
+                f"│ <a href='{m['url']}'>View tweet</a>",
+            ])
+        lines.append("")
+    else:
+        lines.append(f"\n🐦 No notable X mentions found for ${ticker}\n")
+
+    # Links
+    if address:
+        lines.extend([
+            f"🔗 <b>Links:</b>",
+            f"├ <a href='https://www.geckoterminal.com/base/tokens/{address}'>GeckoTerminal</a>",
+            f"├ <a href='https://basescan.org/token/{address}'>BaseScan</a>",
+            f"├ <a href='https://gmgn.ai/base/token/{address}'>GMGN</a>",
+            f"└ <a href='https://app.uniswap.org/swap?chain=base&outputCurrency={address}'>Uniswap</a>",
+        ])
+
+    return "\n".join(lines)
 
 
 # ─── Bankr API ────────────────────────────────────────────────────────────────
@@ -762,7 +973,7 @@ async def main():
                 f"Blocked: {len(blocked_accounts)} accounts\n"
                 f"WhatsApp: {'✅' if WHAPI_TOKEN else '❌'}\n"
                 f"Polling every {POLL_INTERVAL}s\n\n"
-                f"Commands: /block @user · /unblock @user · /blocklist · /status",
+                f"Commands: /block @user · /unblock @user · /blocklist · /status · /research $TICKER",
             )
 
         # Poll loop
