@@ -1,15 +1,15 @@
 """
-Whale Alert Bot — Bankr + Clanker + Virtuals + Flaunch
+Whale Alert Bot — Bankr + Clanker + Virtuals
 ========================================================
 Monitors FOUR sources for new token launches on Base:
   1. Bankr API   — https://api.bankr.bot/token-launches
   2. Clanker API  — https://www.clanker.world/api/tokens
   3. Virtuals API — https://api2.virtuals.io/api/virtuals  (AI agent launches)
-  4. Flaunch API  — https://flaunch.gg subgraph (memecoin launches)
+  4. GeckoTerminal — market data (MCap, Volume, Liquidity) — faster than DexScreener
 
 When a token is launched by an X account with 10K+ followers → alerts to Telegram + WhatsApp.
 Uses SocialData.tools API for reliable follower count lookups.
-Uses DexScreener for market data filtering (MCap, Volume, Liquidity).
+Uses GeckoTerminal for market data filtering (MCap, Volume, Liquidity).
 
 Deploy: GitHub + Railway
 """
@@ -39,8 +39,7 @@ POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
 BANKR_API_URL = "https://api.bankr.bot/token-launches"
 CLANKER_API_URL = "https://www.clanker.world/api/tokens"
 VIRTUALS_API_URL = "https://api2.virtuals.io/api/virtuals"
-FLAUNCH_SUBGRAPH_URL = "https://api.goldsky.com/api/public/project_cm5k0msqgbujq01s60io238e5/subgraphs/flaunch-base-mainnet/1.0.0/gn"
-DEXSCREENER_API_URL = "https://api.dexscreener.com/latest/dex/tokens"
+GECKOTERMINAL_API_URL = "https://api.geckoterminal.com/api/v2"
 SOCIALDATA_API_URL = "https://api.socialdata.tools/twitter/user"
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
@@ -214,7 +213,7 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                 await send_telegram(
                     session,
                     f"🐋 <b>Whale Alert Bot</b>\n\n"
-                    f"• Sources: Bankr + Clanker + Virtuals + Flaunch\n"
+                    f"• Sources: Bankr + Clanker + Virtuals\n"
                     f"• Tokens seen: {len(seen_tokens)}\n"
                     f"• Alerts sent: {alert_count}\n"
                     f"• Blocked: {len(blocked_accounts)} accounts\n"
@@ -282,40 +281,65 @@ async def get_follower_count(session: aiohttp.ClientSession, username: str) -> i
     return count
 
 
-# ─── DexScreener Market Data ─────────────────────────────────────────────────
+# ─── GeckoTerminal Market Data ────────────────────────────────────────────────
 
-async def fetch_dexscreener(session: aiohttp.ClientSession, token_address: str) -> dict | None:
-    """Fetch market data from DexScreener for a Base token."""
+async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str) -> dict | None:
+    """Fetch market data from GeckoTerminal for a Base token. Much faster indexing than DexScreener."""
     try:
-        url = f"{DEXSCREENER_API_URL}/{token_address}"
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        # Include top_pools to get liquidity (reserve_in_usd) in the included array
+        url = f"{GECKOTERMINAL_API_URL}/networks/base/tokens/{token_address}?include=top_pools"
+        headers = {"Accept": "application/json;version=20230302"}
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status == 404:
+                return None
+            if resp.status == 429:
+                log.warning("GeckoTerminal rate limited, backing off...")
+                await asyncio.sleep(5)
+                return None
             if resp.status != 200:
+                log.debug(f"GeckoTerminal {resp.status} for {token_address[:10]}...")
                 return None
             data = await resp.json()
 
-        pairs = data.get("pairs", [])
-        if not pairs:
+        attrs = data.get("data", {}).get("attributes", {})
+        if not attrs:
             return None
 
-        pair = max(pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0) or 0))
+        fdv = float(attrs.get("fdv_usd") or 0)
+        mcap = float(attrs.get("market_cap_usd") or 0) or fdv
+        vol_24h = float(attrs.get("volume_usd", {}).get("h24") or 0)
+
+        # Get liquidity from included top pool data (saves a 2nd API call)
+        liquidity = 0.0
+        included = data.get("included", [])
+        for item in included:
+            if item.get("type") == "pool":
+                pool_attrs = item.get("attributes", {})
+                reserve = float(pool_attrs.get("reserve_in_usd") or 0)
+                if reserve > liquidity:
+                    liquidity = reserve
+
+        price_change_1h = float(attrs.get("price_change_percentage", {}).get("h1") or 0)
+        price_change_24h = float(attrs.get("price_change_percentage", {}).get("h24") or 0)
+
         return {
-            "mcap": float(pair.get("marketCap", 0) or pair.get("fdv", 0) or 0),
-            "volume_24h": float(pair.get("volume", {}).get("h24", 0) or 0),
-            "liquidity": float(pair.get("liquidity", {}).get("usd", 0) or 0),
-            "price_usd": pair.get("priceUsd", "0"),
-            "price_change_1h": float(pair.get("priceChange", {}).get("h1", 0) or 0),
-            "price_change_24h": float(pair.get("priceChange", {}).get("h24", 0) or 0),
-            "pair_url": pair.get("url", ""),
+            "mcap": mcap,
+            "volume_24h": vol_24h,
+            "liquidity": liquidity,
+            "price_usd": attrs.get("price_usd", "0"),
+            "price_change_1h": price_change_1h,
+            "price_change_24h": price_change_24h,
+            "pair_url": f"https://www.geckoterminal.com/base/tokens/{token_address}",
         }
     except Exception as e:
-        log.debug(f"DexScreener error for {token_address[:10]}...: {e}")
+        log.debug(f"GeckoTerminal error for {token_address[:10]}...: {e}")
         return None
 
 
 def passes_market_filters(dex: dict | None) -> tuple[bool, str]:
     """Check if token passes MCap/Volume/Liquidity filters."""
     if dex is None:
-        return False, "no DexScreener data"
+        return False, "no market data"
 
     mcap = dex.get("mcap", 0)
     vol = dex.get("volume_24h", 0)
@@ -516,108 +540,6 @@ async def fetch_virtuals(session: aiohttp.ClientSession) -> list[dict]:
     return normalized
 
 
-# ─── Flaunch Subgraph ─────────────────────────────────────────────────────────
-
-async def fetch_flaunch(session: aiohttp.ClientSession) -> list[dict]:
-    """Fetch & normalize token launches from Flaunch.gg via their subgraph."""
-    normalized = []
-    try:
-        query = """
-        {
-          pools(
-            first: 20,
-            orderBy: createdAt,
-            orderDirection: desc,
-            where: { closed: false }
-          ) {
-            id
-            memecoin {
-              id
-              name
-              symbol
-            }
-            creator
-            createdAt
-            initialTokenFairLaunch
-            tokenUri
-          }
-        }
-        """
-        async with session.post(
-            FLAUNCH_SUBGRAPH_URL,
-            json={"query": query},
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as resp:
-            if resp.status != 200:
-                log.warning(f"Flaunch subgraph returned {resp.status}")
-                return []
-            data = await resp.json()
-
-        pools = data.get("data", {}).get("pools", [])
-        log.info(f"Flaunch: {len(pools)} launches fetched")
-
-        for pool in pools:
-            memecoin = pool.get("memecoin", {}) or {}
-            address = (memecoin.get("id") or "").lower()
-            if not address:
-                continue
-
-            # Flaunch tokens store socials in tokenUri (IPFS metadata)
-            # We'll try to extract X handle from the metadata if available
-            x_username = ""
-            token_uri = pool.get("tokenUri", "") or ""
-
-            # If tokenUri is IPFS, we could fetch it, but for speed we'll
-            # rely on DexScreener social links or skip if no X handle
-            # For now, we log it and check DexScreener for social info
-
-            normalized.append({
-                "source": "flaunch",
-                "address": address,
-                "name": memecoin.get("name", "Unknown"),
-                "symbol": memecoin.get("symbol", "?"),
-                "x_username": x_username,
-                "tweet_url": "",
-                "image_uri": "",
-                "creator_wallet": pool.get("creator", ""),
-                "token_uri": token_uri,
-            })
-
-    except Exception as e:
-        log.error(f"Flaunch fetch error: {e}")
-
-    return normalized
-
-
-async def enrich_flaunch_x_handle(session: aiohttp.ClientSession, launch: dict) -> str:
-    """Try to get X handle for Flaunch token from its IPFS metadata."""
-    token_uri = launch.get("token_uri", "")
-    if not token_uri:
-        return ""
-
-    try:
-        # Convert IPFS URI to HTTP gateway
-        if token_uri.startswith("ipfs://"):
-            token_uri = token_uri.replace("ipfs://", "https://ipfs.io/ipfs/")
-
-        async with session.get(token_uri, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-            if resp.status != 200:
-                return ""
-            metadata = await resp.json()
-
-        # Look for twitterUrl in metadata
-        twitter_url = metadata.get("twitterUrl", "") or metadata.get("twitter", "")
-        if twitter_url:
-            match = re.search(r'(?:twitter\.com|x\.com)/(@?\w+)', twitter_url)
-            if match:
-                return match.group(1).lstrip("@")
-
-    except Exception:
-        pass
-
-    return ""
-
-
 # ─── Alert Formatting ─────────────────────────────────────────────────────────
 
 def fmt_usd(val) -> str:
@@ -633,7 +555,6 @@ SOURCE_EMOJIS = {
     "bankr": "🏦",
     "clanker": "⚙️",
     "virtuals": "🤖",
-    "flaunch": "🚀",
 }
 
 
@@ -671,7 +592,7 @@ def format_alert_telegram(launch: dict, follower_count: int, dex: dict | None) -
         )
 
     links = [
-        f"├ <a href='https://dexscreener.com/base/{address}'>DexScreener</a>",
+        f"├ <a href='https://www.geckoterminal.com/base/tokens/{address}'>GeckoTerminal</a>",
         f"├ <a href='https://basescan.org/token/{address}'>BaseScan</a>",
         f"├ <a href='https://gmgn.ai/base/token/{address}'>GMGN</a>",
     ]
@@ -681,8 +602,6 @@ def format_alert_telegram(launch: dict, follower_count: int, dex: dict | None) -
         vid = launch.get("virtuals_id", "")
         if vid:
             links.append(f"├ <a href='https://app.virtuals.io/virtuals/{vid}'>Virtuals</a>")
-    elif launch["source"] == "flaunch":
-        links.append(f"├ <a href='https://flaunch.gg/token/{address}'>Flaunch</a>")
     elif launch["source"] == "clanker":
         links.append(f"├ <a href='https://www.clanker.world/clanker/{address}'>Clanker</a>")
 
@@ -756,7 +675,7 @@ def format_alert_whatsapp(launch: dict, follower_count: int, dex: dict | None) -
     lines.extend([
         f"",
         f"🔗 *Links:*",
-        f"├ DexScreener: https://dexscreener.com/base/{address}",
+        f"├ GeckoTerminal: https://www.geckoterminal.com/base/tokens/{address}",
         f"├ GMGN: https://gmgn.ai/base/token/{address}",
     ])
 
@@ -764,8 +683,6 @@ def format_alert_whatsapp(launch: dict, follower_count: int, dex: dict | None) -
         vid = launch.get("virtuals_id", "")
         if vid:
             lines.append(f"├ Virtuals: https://app.virtuals.io/virtuals/{vid}")
-    elif launch["source"] == "flaunch":
-        lines.append(f"├ Flaunch: https://flaunch.gg/token/{address}")
     elif launch["source"] == "clanker":
         lines.append(f"├ Clanker: https://www.clanker.world/clanker/{address}")
 
@@ -791,15 +708,14 @@ async def seed_existing(session: aiohttp.ClientSession):
     bankr = await fetch_bankr(session)
     clanker = await fetch_clanker(session)
     virtuals = await fetch_virtuals(session)
-    flaunch = await fetch_flaunch(session)
 
-    for launch in bankr + clanker + virtuals + flaunch:
+    for launch in bankr + clanker + virtuals:
         seen_tokens.add(launch["address"])
 
     log.info(
         f"📋 Seeded {len(seen_tokens)} tokens "
         f"(Bankr: {len(bankr)}, Clanker: {len(clanker)}, "
-        f"Virtuals: {len(virtuals)}, Flaunch: {len(flaunch)})"
+        f"Virtuals: {len(virtuals)})"
     )
 
 
@@ -817,7 +733,7 @@ async def main():
         log.error("❌ SOCIALDATA_API_KEY not set!")
 
     log.info("=" * 60)
-    log.info("  🐋 Whale Alert Bot (Bankr + Clanker + Virtuals + Flaunch)")
+    log.info("  🐋 Whale Alert Bot (Bankr + Clanker + Virtuals)")
     log.info(f"  Min followers : {MIN_FOLLOWERS:,}")
     log.info(f"  Min MCap      : ${MIN_MCAP:,}")
     log.info(f"  Min Volume 24h: ${MIN_VOLUME_24H:,}")
@@ -838,7 +754,8 @@ async def main():
             await send_telegram(
                 session,
                 f"🐋 <b>Whale Alert Bot started</b>\n\n"
-                f"Sources: Bankr + Clanker + Virtuals + Flaunch\n"
+                f"Sources: Bankr + Clanker + Virtuals\n"
+                f"Market data: GeckoTerminal\n"
                 f"Follower lookup: SocialData.tools\n"
                 f"Min followers: {MIN_FOLLOWERS:,}\n"
                 f"Min MCap: ${MIN_MCAP:,} · Vol: ${MIN_VOLUME_24H:,} · Liq: ${MIN_LIQUIDITY:,}\n"
@@ -858,9 +775,8 @@ async def main():
                 bankr_launches = await fetch_bankr(session)
                 clanker_launches = await fetch_clanker(session)
                 virtuals_launches = await fetch_virtuals(session)
-                flaunch_launches = await fetch_flaunch(session)
 
-                all_launches = bankr_launches + clanker_launches + virtuals_launches + flaunch_launches
+                all_launches = bankr_launches + clanker_launches + virtuals_launches
                 new_count = 0
                 whale_count = 0
 
@@ -878,14 +794,9 @@ async def main():
                     # ── STEP 1: Does the DEPLOYER have an X account? ──
                     # For Virtuals: use creator X only (not the agent/project X)
                     # For Bankr/Clanker: use deployer X as before
-                    # For Flaunch: try to enrich from IPFS metadata
 
                     if source == "virtuals":
                         deployer_x = launch.get("creator_x", "")
-                    elif source == "flaunch":
-                        deployer_x = launch.get("x_username", "")
-                        if not deployer_x:
-                            deployer_x = await enrich_flaunch_x_handle(session, launch)
                     else:
                         deployer_x = launch.get("x_username", "")
 
@@ -899,7 +810,7 @@ async def main():
                         continue
 
                     # ── STEP 2: Market data filter (MCap/Volume/Liquidity) ──
-                    dex = await fetch_dexscreener(session, address)
+                    dex = await fetch_geckoterminal(session, address)
                     passes, reason = passes_market_filters(dex)
 
                     if not passes:
