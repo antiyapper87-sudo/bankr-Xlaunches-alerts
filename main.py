@@ -426,7 +426,7 @@ async def search_x_mentions(session: aiohttp.ClientSession, ticker: str, token_n
         }
         params = {"query": query, "type": "Top"}
 
-        async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=8)) as resp:
             if resp.status != 200:
                 log.debug(f"X search for ${ticker}: status {resp.status}")
                 return []
@@ -443,7 +443,7 @@ async def search_x_mentions(session: aiohttp.ClientSession, ticker: str, token_n
                 "username": user.get("screen_name", ""),
                 "name": user.get("name", ""),
                 "followers": followers,
-                "text": (tweet.get("full_text") or tweet.get("text") or "")[:200],
+                "text": (tweet.get("full_text") or tweet.get("text") or "")[:300],
                 "likes": tweet.get("favorite_count", 0),
                 "retweets": tweet.get("retweet_count", 0),
                 "date": tweet.get("tweet_created_at", "")[:10],
@@ -497,7 +497,7 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
         try:
             url = f"{GECKOTERMINAL_API_URL}/search/pools?query={ticker}&network=base&page=1"
             headers = {"Accept": "application/json;version=20230302"}
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     pools = data.get("data", [])
@@ -509,7 +509,8 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
                     for pool in pools:
                         pool_attrs = pool.get("attributes", {})
                         pool_name = pool_attrs.get("name", "")  # e.g. "VIRTUAL / WETH"
-                        vol_24h = float(pool_attrs.get("volume_usd", {}).get("h24", 0) or 0)
+                        vol_raw = pool_attrs.get("volume_usd") or {}
+                        vol_24h = float(vol_raw.get("h24") or 0)
 
                         base_addr = pool.get("relationships", {}).get("base_token", {}).get("data", {}).get("id", "")
                         if base_addr:
