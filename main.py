@@ -673,6 +673,13 @@ async def fetch_bankr(session: aiohttp.ClientSession) -> list[dict]:
             deployer = launch.get("deployer", {}) or {}
             x_username = deployer.get("xUsername", "")
 
+            # Debug: log deployer keys when X is missing but deployer exists
+            if not x_username and deployer:
+                dep_keys = {k: v for k, v in deployer.items() if v}
+                if dep_keys:
+                    sym = launch.get("tokenSymbol", "?")
+                    log.info(f"  [bankr] ${sym} deployer fields (no xUsername): {dep_keys}")
+
             normalized.append({
                 "source": "bankr",
                 "address": address,
@@ -1071,7 +1078,7 @@ async def main():
                 for src_name, src_list in [("bankr", bankr_launches), ("clanker", clanker_launches), ("virtuals", virtuals_launches)]:
                     src_new = sum(1 for l in src_list if l["address"] not in seen_tokens)
                     if src_new == 0 and len(src_list) > 0:
-                        log.debug(f"  [{src_name}] {len(src_list)} fetched, all already seen")
+                        log.info(f"  [{src_name}] {len(src_list)} fetched, all already seen")
 
                 new_count = 0
                 whale_count = 0
