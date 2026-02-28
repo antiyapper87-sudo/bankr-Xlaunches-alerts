@@ -59,8 +59,6 @@ follower_cache: dict[str, int | None] = {}
 gecko_cache: dict[str, tuple[float, dict | None]] = {}  # address → (timestamp, result)
 GECKO_CACHE_TTL_HIT = 120    # cache valid market data for 2 min
 GECKO_CACHE_TTL_MISS = 60    # cache "no data" for 1 min (recheck soon for new tokens)
-gecko_last_call: float = 0   # rate limiter: track last API call time
-GECKO_MIN_INTERVAL = 3.0     # minimum seconds between GeckoTerminal calls
 last_update_id: int = 0
 alert_count: int = 0
 
@@ -320,11 +318,12 @@ async def get_follower_count(session: aiohttp.ClientSession, username: str) -> i
     return count
 
 
-# ─── GeckoTerminal Market Data ────────────────────────────────────────────────
+# ─── DexScreener Market Data ─────────────────────────────────────────────────
+
+DEXSCREENER_API_URL = "https://api.dexscreener.com"
 
 async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str) -> dict | None:
-    """Fetch market data from GeckoTerminal for a Base token. Cached + rate limited."""
-    global gecko_last_call
+    """Fetch market data from DexScreener for a Base token. Cached."""
     token_address = token_address.lower()
 
     # Check cache first
@@ -334,68 +333,59 @@ async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str
         if time.time() - cached_time < ttl:
             return cached_result
 
-    # Rate limiter: wait if we called too recently
-    now = time.time()
-    elapsed = now - gecko_last_call
-    if elapsed < GECKO_MIN_INTERVAL:
-        await asyncio.sleep(GECKO_MIN_INTERVAL - elapsed)
-    gecko_last_call = time.time()
-
     try:
-        # Include top_pools to get liquidity (reserve_in_usd) in the included array
-        url = f"{GECKOTERMINAL_API_URL}/networks/base/tokens/{token_address}?include=top_pools"
-        headers = {"Accept": "application/json;version=20230302"}
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        url = f"{DEXSCREENER_API_URL}/tokens/v1/base/{token_address}"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status == 404:
                 gecko_cache[token_address] = (time.time(), None)
                 return None
             if resp.status == 429:
-                log.warning("GeckoTerminal rate limited, backing off...")
-                await asyncio.sleep(5)
-                gecko_cache[token_address] = (time.time(), None)  # cache as miss to avoid immediate retry
+                log.warning("DexScreener rate limited, backing off...")
+                await asyncio.sleep(2)
+                gecko_cache[token_address] = (time.time(), None)
                 return None
             if resp.status != 200:
-                log.debug(f"GeckoTerminal {resp.status} for {token_address[:10]}...")
+                log.debug(f"DexScreener {resp.status} for {token_address[:10]}...")
                 return None
-            data = await resp.json()
+            pairs = await resp.json()
 
-        attrs = data.get("data", {}).get("attributes", {})
-        if not attrs:
+        if not pairs or not isinstance(pairs, list) or len(pairs) == 0:
             gecko_cache[token_address] = (time.time(), None)
             return None
 
-        fdv = float(attrs.get("fdv_usd") or 0)
-        mcap = float(attrs.get("market_cap_usd") or 0) or fdv
-        vol_raw = attrs.get("volume_usd") or {}
-        vol_24h = float(vol_raw.get("h24") or 0)
+        # Pick the pair with highest liquidity
+        best = None
+        best_liq = -1
+        for pair in pairs:
+            liq = float((pair.get("liquidity") or {}).get("usd") or 0)
+            if liq > best_liq:
+                best_liq = liq
+                best = pair
 
-        # Get liquidity from included top pool data (saves a 2nd API call)
-        liquidity = 0.0
-        included = data.get("included", [])
-        for item in included:
-            if item.get("type") == "pool":
-                pool_attrs = item.get("attributes", {})
-                reserve = float(pool_attrs.get("reserve_in_usd") or 0)
-                if reserve > liquidity:
-                    liquidity = reserve
+        if not best:
+            gecko_cache[token_address] = (time.time(), None)
+            return None
 
-        pct_raw = attrs.get("price_change_percentage") or {}
-        price_change_1h = float(pct_raw.get("h1") or 0)
-        price_change_24h = float(pct_raw.get("h24") or 0)
+        mcap = float(best.get("marketCap") or best.get("fdv") or 0)
+        vol_24h = float((best.get("volume") or {}).get("h24") or 0)
+        liquidity = float((best.get("liquidity") or {}).get("usd") or 0)
+        price_change = best.get("priceChange") or {}
+        price_change_1h = float(price_change.get("h1") or 0)
+        price_change_24h = float(price_change.get("h24") or 0)
 
         result = {
             "mcap": mcap,
             "volume_24h": vol_24h,
             "liquidity": liquidity,
-            "price_usd": attrs.get("price_usd", "0"),
+            "price_usd": best.get("priceUsd", "0"),
             "price_change_1h": price_change_1h,
             "price_change_24h": price_change_24h,
-            "pair_url": f"https://www.geckoterminal.com/base/tokens/{token_address}",
+            "pair_url": best.get("url", f"https://dexscreener.com/base/{token_address}"),
         }
         gecko_cache[token_address] = (time.time(), result)
         return result
     except Exception as e:
-        log.debug(f"GeckoTerminal error for {token_address[:10]}...: {e}")
+        log.debug(f"DexScreener error for {token_address[:10]}...: {e}")
         gecko_cache[token_address] = (time.time(), None)
         return None
 
@@ -1270,7 +1260,7 @@ async def main():
                 session,
                 f"🐋 <b>Whale Alert Bot started</b>\n\n"
                 f"Sources: Bankr + Clanker + Virtuals\n"
-                f"Market data: GeckoTerminal\n"
+                f"Market data: DexScreener\n"
                 f"Min MCap: ${MIN_MCAP:,} · Vol: ${MIN_VOLUME_24H:,} · Liq: ${MIN_LIQUIDITY:,}\n"
                 f"Blocked: {len(blocked_accounts)} accounts\n"
                 f"Polling every {POLL_INTERVAL}s\n\n"
