@@ -759,15 +759,14 @@ async def fetch_virtuals(session: aiohttp.ClientSession) -> list[dict]:
     """Fetch & normalize AI agent launches from Virtuals Protocol API."""
     normalized = []
     try:
-        # Fetch newest sentient agents (status=5) and prototypes (status=3)
-        for status in [5, 3]:
+        # Fetch newest sentient agents (status=5), prototypes (status=3), and all others
+        for status in [5, 3, 1, 2, 4]:
             params = {
                 "filters[status]": status,
-                "filters[factory][0]": "VIBES_BONDING_V2",
                 "sort": "createdAt:desc",
                 "populate[0]": "image",
                 "pagination[page]": 1,
-                "pagination[pageSize]": 20,
+                "pagination[pageSize]": 50,
             }
             async with session.get(
                 VIRTUALS_API_URL, params=params,
@@ -779,7 +778,8 @@ async def fetch_virtuals(session: aiohttp.ClientSession) -> list[dict]:
                 data = await resp.json()
 
             agents = data.get("data", [])
-            status_label = "sentient" if status == 5 else "prototype"
+            status_labels = {5: "sentient", 3: "prototype", 1: "init", 2: "pending", 4: "bonding"}
+            status_label = status_labels.get(status, f"status-{status}")
             log.info(f"Virtuals ({status_label}): {len(agents)} agents fetched")
 
             for agent in agents:
