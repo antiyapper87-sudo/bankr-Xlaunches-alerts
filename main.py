@@ -678,7 +678,7 @@ async def fetch_bankr(session: aiohttp.ClientSession) -> list[dict]:
                 dep_keys = {k: v for k, v in deployer.items() if v}
                 if dep_keys:
                     sym = launch.get("tokenSymbol", "?")
-                    log.info(f"  [bankr] ${sym} deployer fields (no xUsername): {dep_keys}")
+                    log.debug(f"  [bankr] ${sym} deployer fields (no xUsername): {dep_keys}")
 
             normalized.append({
                 "source": "bankr",
