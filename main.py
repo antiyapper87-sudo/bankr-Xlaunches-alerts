@@ -58,9 +58,9 @@ seen_tokens: set[str] = set()
 follower_cache: dict[str, int | None] = {}
 gecko_cache: dict[str, tuple[float, dict | None]] = {}  # address → (timestamp, result)
 GECKO_CACHE_TTL_HIT = 120    # cache valid market data for 2 min
-GECKO_CACHE_TTL_MISS = 300   # cache "no data" for 5 min (don't re-check too soon)
+GECKO_CACHE_TTL_MISS = 180   # cache "no data" for 3 min (don't re-check too soon)
 gecko_last_call: float = 0   # rate limiter: track last API call time
-GECKO_MIN_INTERVAL = 2.5     # minimum seconds between GeckoTerminal calls
+GECKO_MIN_INTERVAL = 3.0     # minimum seconds between GeckoTerminal calls
 last_update_id: int = 0
 alert_count: int = 0
 
@@ -348,7 +348,8 @@ async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str
             if resp.status == 429:
                 log.warning("GeckoTerminal rate limited, backing off...")
                 await asyncio.sleep(5)
-                return None  # don't cache rate limits
+                gecko_cache[token_address] = (time.time(), None)  # cache as miss to avoid immediate retry
+                return None
             if resp.status != 200:
                 log.debug(f"GeckoTerminal {resp.status} for {token_address[:10]}...")
                 return None
@@ -1270,8 +1271,8 @@ async def main():
                 f"Blocked: {len(blocked_accounts)} accounts\n"
                 f"Polling every {POLL_INTERVAL}s\n\n"
                 f"📡 Mode: Signal all tokens passing market filters\n"
-                f"🔍 /research <address> for deep deployer + X analysis\n\n"
-                f"Commands: /research $TICKER · /block @user · /unblock @user · /blocklist · /status",
+                f"🔍 /research 0x... for deep deployer + X analysis\n\n"
+                f"Commands: /research · /block · /unblock · /blocklist · /status",
             )
 
         # Poll loop
