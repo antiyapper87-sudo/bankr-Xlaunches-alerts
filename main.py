@@ -465,6 +465,107 @@ async def search_x_mentions(session: aiohttp.ClientSession, ticker: str, token_n
     return mentions[:5]
 
 
+async def resolve_deployer_x(session: aiohttp.ClientSession, address: str) -> dict:
+    """
+    Try to resolve the deployer's X account for a token.
+    Returns dict with: x_username, farcaster_username, source_method, follower_count
+    """
+    result = {
+        "x_username": "",
+        "farcaster_username": "",
+        "farcaster_display": "",
+        "source_method": "",
+        "follower_count": None,
+    }
+
+    # ── Method 1: Check Clanker /search-creator by token address ──
+    # Clanker tokens have msg_sender wallet — look up via search-creator
+    try:
+        # First get the token's page to find the msg_sender
+        url = f"https://www.clanker.world/api/tokens?sort=desc&page=1&pageSize=50"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                tokens = data.get("data", data if isinstance(data, list) else [])
+                for token in tokens:
+                    token_addr = (token.get("contract_address") or token.get("address") or "").lower()
+                    if token_addr == address.lower():
+                        msg_sender = token.get("msg_sender", "")
+                        social_ctx = token.get("social_context", {}) or {}
+
+                        # Extract X from socialMediaUrls
+                        social_urls = token.get("socialMediaUrls", []) or []
+                        if isinstance(social_urls, list):
+                            for surl in social_urls:
+                                if isinstance(surl, str) and ("twitter.com/" in surl or "x.com/" in surl):
+                                    match = re.search(r'(?:twitter\.com|x\.com)/(@?\w+)', surl)
+                                    if match:
+                                        candidate = match.group(1).lstrip("@")
+                                        if candidate.lower() not in ("home", "explore", "search", "settings"):
+                                            result["x_username"] = candidate
+                                            result["source_method"] = "clanker socialMediaUrls"
+                                            break
+
+                        # If no X from metadata, try wallet lookup via search-creator
+                        if not result["x_username"] and msg_sender:
+                            try:
+                                creator_url = f"https://clanker.world/api/search-creator?q={msg_sender}&limit=1"
+                                async with session.get(creator_url, timeout=aiohttp.ClientTimeout(total=10)) as cr:
+                                    if cr.status == 200:
+                                        creator_data = await cr.json()
+                                        user = creator_data.get("user", {})
+                                        if user:
+                                            result["farcaster_username"] = user.get("username", "")
+                                            result["farcaster_display"] = user.get("displayName", "")
+                                            # Farcaster verified addresses may include X
+                                            verified = user.get("verifiedAddresses", [])
+                                            result["source_method"] = f"clanker search-creator (wallet {msg_sender[:10]}...)"
+                            except Exception as e:
+                                log.debug(f"Clanker search-creator error: {e}")
+
+                        # Extract from description
+                        if not result["x_username"]:
+                            desc = token.get("description", "") or ""
+                            # Check for "automated by @X" / "requested by @X" / "launched by @X"
+                            auto_match = re.search(r'(?:automated|requested|launched|created|deployed)\s+by\s+@(\w{1,15})', desc, re.IGNORECASE)
+                            if auto_match:
+                                result["x_username"] = auto_match.group(1)
+                                result["source_method"] = "clanker description (automated by)"
+                            else:
+                                # Generic @username in description
+                                desc_match = re.search(r'@(\w{1,15})', desc)
+                                if desc_match:
+                                    candidate = desc_match.group(1)
+                                    if candidate.lower() not in ("clanker", "bankr", "bankrbot", "base", "everyone"):
+                                        result["x_username"] = candidate
+                                        result["source_method"] = "clanker description"
+                        break
+    except Exception as e:
+        log.debug(f"Clanker deployer lookup error: {e}")
+
+    # ── Method 2: Check if Farcaster user has X via SocialData ──
+    if not result["x_username"] and result["farcaster_username"]:
+        # Try searching SocialData for the Farcaster username as an X handle
+        try:
+            fc_user = result["farcaster_username"]
+            followers = await get_follower_count(session, fc_user)
+            if followers and followers > 100:
+                result["x_username"] = fc_user
+                result["follower_count"] = followers
+                result["source_method"] += " → X match via farcaster username"
+        except Exception:
+            pass
+
+    # ── Method 3: Check Bankr tweetUrl for requester X account ──
+    # (This runs during research if we stored the launch data)
+
+    # ── Get follower count if we found an X username ──
+    if result["x_username"] and result["follower_count"] is None:
+        result["follower_count"] = await get_follower_count(session, result["x_username"])
+
+    return result
+
+
 async def research_token(session: aiohttp.ClientSession, query: str) -> str:
     """
     Research a token by ticker or address.
@@ -550,10 +651,15 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
         if address:
             dex = await fetch_geckoterminal(session, address)
 
-    # ── Step 2: Search X for $TICKER mentions ──
+    # ── Step 2: Resolve deployer identity ──
+    deployer_info = None
+    if address:
+        deployer_info = await resolve_deployer_x(session, address)
+
+    # ── Step 3: Search X for $TICKER mentions ──
     x_mentions = await search_x_mentions(session, ticker, token_name)
 
-    # ── Step 3: Check if token was seen by our bot ──
+    # ── Step 4: Check if token was seen by our bot ──
     was_alerted = address.lower() in seen_tokens if address else False
 
     # ── Build the report ──
@@ -600,6 +706,49 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
 
     if was_alerted:
         lines.append("👀 Token seen by bot\n")
+
+    # ── Deployer identity section ──
+    if deployer_info:
+        x_user = deployer_info.get("x_username", "")
+        fc_user = deployer_info.get("farcaster_username", "")
+        fc_display = deployer_info.get("farcaster_display", "")
+        method = deployer_info.get("source_method", "")
+        d_followers = deployer_info.get("follower_count")
+
+        lines.append("👤 <b>Deployer Identity:</b>")
+
+        if x_user:
+            f_str = ""
+            if d_followers is not None:
+                if d_followers >= 1_000_000:
+                    f_str = f" — <b>{d_followers/1_000_000:.1f}M followers</b>"
+                elif d_followers >= 1_000:
+                    f_str = f" — <b>{d_followers/1_000:.0f}K followers</b>"
+                else:
+                    f_str = f" — {d_followers:,} followers"
+
+                # Flag whales
+                if d_followers >= 10_000:
+                    f_str += " 🐋"
+                elif d_followers >= 5_000:
+                    f_str += " 🔥"
+
+            lines.append(f"├ 𝕏 <a href='https://x.com/{x_user}'>@{x_user}</a>{f_str}")
+        else:
+            lines.append("├ 𝕏 No X account found")
+
+        if fc_user:
+            display = f" ({fc_display})" if fc_display and fc_display != fc_user else ""
+            lines.append(f"├ 🟣 Farcaster: @{fc_user}{display}")
+
+        if method:
+            lines.append(f"└ 🔎 Found via: {method}")
+        else:
+            lines.append(f"└ 🔎 No deployer info in API metadata")
+
+        lines.append("")
+    else:
+        lines.append("👤 <b>Deployer:</b> Could not resolve\n")
 
     # X mentions
     if x_mentions:
@@ -854,7 +1003,72 @@ SOURCE_EMOJIS = {
 }
 
 
-def format_alert_telegram(launch: dict, follower_count: int, dex: dict | None) -> str:
+def format_signal_telegram(launch: dict, dex: dict | None) -> str:
+    """Format a compact signal message for Telegram (HTML)."""
+    source = launch["source"].upper()
+    name = launch["name"]
+    symbol = launch["symbol"]
+    address = launch["address"]
+    x_username = launch.get("x_username", "")
+    tweet_url = launch.get("tweet_url", "")
+
+    source_emoji = SOURCE_EMOJIS.get(launch["source"], "📡")
+
+    # Market data
+    market_lines = ""
+    if dex:
+        change_1h = dex.get("price_change_1h", 0)
+        change_emoji = "🟢" if change_1h >= 0 else "🔴"
+        market_lines = (
+            f"├ 💰 MCap: {fmt_usd(dex['mcap'])}\n"
+            f"├ 📈 Vol: {fmt_usd(dex['volume_24h'])}\n"
+            f"├ 💧 Liq: {fmt_usd(dex['liquidity'])}\n"
+            f"└ {change_emoji} 1h: {change_1h:+.1f}%"
+        )
+
+    # Deployer line (if known)
+    deployer_line = ""
+    if x_username:
+        deployer_line = f"👤 Deployer: <a href='https://x.com/{x_username}'>@{x_username}</a>\n"
+
+    # Virtuals extra info
+    if launch["source"] == "virtuals":
+        creator_x = launch.get("creator_x", "")
+        if creator_x and creator_x != x_username:
+            deployer_line += f"👷 Creator: <a href='https://x.com/{creator_x}'>@{creator_x}</a>\n"
+        holders = launch.get("holder_count", 0)
+        if holders:
+            deployer_line += f"👥 Holders: {holders:,}\n"
+
+    # Links
+    links = [
+        f"├ <a href='https://www.geckoterminal.com/base/tokens/{address}'>Gecko</a>",
+        f"├ <a href='https://gmgn.ai/base/token/{address}'>GMGN</a>",
+    ]
+    if launch["source"] == "clanker":
+        links.append(f"├ <a href='https://www.clanker.world/clanker/{address}'>Clanker</a>")
+    elif launch["source"] == "virtuals":
+        vid = launch.get("virtuals_id", "")
+        if vid:
+            links.append(f"├ <a href='https://app.virtuals.io/virtuals/{vid}'>Virtuals</a>")
+    if tweet_url:
+        links.append(f"├ <a href='{tweet_url}'>📝 Tweet</a>")
+    links.append(f"└ <a href='https://app.uniswap.org/swap?chain=base&amp;outputCurrency={address}'>Uniswap</a>")
+
+    msg = (
+        f"📡 <b>SIGNAL</b> {source_emoji} {source}\n\n"
+        f"<b>{name}</b> (${symbol})\n"
+        f"{deployer_line}"
+        f"{market_lines}\n\n"
+        f"🔗 " + " · ".join(links) + "\n\n"
+        f"<code>{address}</code>\n"
+        f"💡 /research {address}"
+    )
+
+    return msg
+
+
+
     """Format a Telegram alert message (HTML)."""
     source = launch["source"].upper()
     name = launch["name"]
@@ -1052,13 +1266,12 @@ async def main():
                 f"🐋 <b>Whale Alert Bot started</b>\n\n"
                 f"Sources: Bankr + Clanker + Virtuals\n"
                 f"Market data: GeckoTerminal\n"
-                f"Follower lookup: SocialData.tools\n"
-                f"Min followers: {MIN_FOLLOWERS:,}\n"
                 f"Min MCap: ${MIN_MCAP:,} · Vol: ${MIN_VOLUME_24H:,} · Liq: ${MIN_LIQUIDITY:,}\n"
                 f"Blocked: {len(blocked_accounts)} accounts\n"
-                f"WhatsApp: {'✅' if WHAPI_TOKEN else '❌'}\n"
                 f"Polling every {POLL_INTERVAL}s\n\n"
-                f"Commands: /block @user · /unblock @user · /blocklist · /status · /research $TICKER",
+                f"📡 Mode: Signal all tokens passing market filters\n"
+                f"🔍 /research <address> for deep deployer + X analysis\n\n"
+                f"Commands: /research $TICKER · /block @user · /unblock @user · /blocklist · /status",
             )
 
         # Poll loop
@@ -1081,7 +1294,7 @@ async def main():
                         log.info(f"  [{src_name}] {len(src_list)} fetched, all already seen")
 
                 new_count = 0
-                whale_count = 0
+                signal_count = 0
 
                 for launch in all_launches:
                     address = launch["address"]
@@ -1094,53 +1307,32 @@ async def main():
                     symbol = launch.get("symbol", "?")
                     source = launch.get("source", "?")
 
-                    # ── STEP 1: Does the DEPLOYER have an X account? ──
-                    # For Virtuals: use creator X only (not the agent/project X)
-                    # For Bankr/Clanker: use deployer X as before
-
-                    if source == "virtuals":
-                        deployer_x = launch.get("creator_x", "")
-                    else:
-                        deployer_x = launch.get("x_username", "")
-
-                    if not deployer_x:
-                        log.info(f"  [{source}] ${symbol} — no deployer X, skip")
-                        continue
-
-                    # Blocked → skip
-                    if deployer_x.lower() in blocked_accounts:
-                        log.info(f"  [{source}] ${symbol} @{deployer_x} — BLOCKED, skip")
-                        continue
-
-                    # ── STEP 2: Market data filter (MCap/Volume/Liquidity) ──
+                    # ── STEP 1: Market data filter (MCap/Volume/Liquidity) ──
                     dex = await fetch_geckoterminal(session, address)
                     passes, reason = passes_market_filters(dex)
 
                     if not passes:
-                        log.info(f"  [{source}] ${symbol} @{deployer_x} — {reason}, skip")
+                        log.info(f"  [{source}] ${symbol} — {reason}, skip")
                         continue
 
-                    # ── STEP 3: Deployer follower count ──
-                    followers = await get_follower_count(session, deployer_x)
+                    # ── STEP 2: Grab deployer X if available (bonus, not required) ──
+                    deployer_x = ""
+                    if source == "virtuals":
+                        deployer_x = launch.get("creator_x", "") or launch.get("x_username", "")
+                    else:
+                        deployer_x = launch.get("x_username", "")
 
-                    if followers is None:
-                        log.info(f"  [{source}] ${symbol} @{deployer_x} — followers unknown, skip")
-                        continue
-
-                    if followers < MIN_FOLLOWERS:
-                        log.info(f"  [{source}] ${symbol} @{deployer_x} — {followers:,} followers < {MIN_FOLLOWERS:,}, skip")
-                        continue
-
-                    # ── STEP 4: All passed → send alert! ──
+                    # Store for signal display
                     launch["x_username"] = deployer_x
-                    whale_count += 1
-                    alert_count += 1
-                    tg_text = format_alert_telegram(launch, followers, dex)
-                    wa_text = format_alert_whatsapp(launch, followers, dex)
-                    log.info(f"  🚀 ALERT: [{source}] ${symbol} @{deployer_x} — {followers:,} followers, MCap {fmt_usd(dex['mcap'])}")
-                    await send_alert_all(session, tg_text, wa_text)
 
-                log.info(f"🔍 {new_count} new launches processed, {whale_count} alerts sent")
+                    # ── STEP 3: Signal to Telegram ──
+                    signal_count += 1
+                    alert_count += 1
+                    tg_text = format_signal_telegram(launch, dex)
+                    log.info(f"  📡 SIGNAL: [{source}] ${symbol} MCap {fmt_usd(dex['mcap'])} Vol {fmt_usd(dex['volume_24h'])}{f' @{deployer_x}' if deployer_x else ''}")
+                    await send_telegram(session, tg_text)
+
+                log.info(f"🔍 {new_count} new launches processed, {signal_count} signals sent")
 
             except Exception as e:
                 log.error(f"Poll loop error: {e}", exc_info=True)
