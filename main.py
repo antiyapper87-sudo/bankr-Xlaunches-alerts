@@ -58,11 +58,18 @@ seen_tokens: set[str] = set()
 follower_cache: dict[str, int | None] = {}
 gecko_cache: dict[str, tuple[float, dict | None]] = {}  # address → (timestamp, result)
 GECKO_CACHE_TTL_HIT = 120    # cache valid market data for 2 min
-GECKO_CACHE_TTL_MISS = 180   # cache "no data" for 3 min (don't re-check too soon)
+GECKO_CACHE_TTL_MISS = 60    # cache "no data" for 1 min (recheck soon for new tokens)
 gecko_last_call: float = 0   # rate limiter: track last API call time
 GECKO_MIN_INTERVAL = 3.0     # minimum seconds between GeckoTerminal calls
 last_update_id: int = 0
 alert_count: int = 0
+
+# ─── Recheck queue: tokens that failed market filters on first pass ───────────
+# {address: {"launch": launch_dict, "first_seen": timestamp, "checks": count}}
+RECHECK_MAX_AGE = 1800       # recheck for up to 30 min after first seen
+RECHECK_INTERVAL = 300       # recheck every 5 min
+RECHECK_MAX_CHECKS = 6       # max 6 rechecks (30 min / 5 min)
+recheck_queue: dict[str, dict] = {}
 
 # ─── Blocklist (persists to file) ─────────────────────────────────────────────
 
@@ -227,22 +234,19 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
 
             # /status
             elif text.lower().startswith("/status"):
-                wa_status = "✅" if WHAPI_TOKEN and WHATSAPP_GROUP_ID else "❌"
                 await send_telegram(
                     session,
-                    f"🐋 <b>Whale Alert Bot</b>\n\n"
+                    f"📡 <b>Signal Bot</b>\n\n"
                     f"• Sources: Bankr + Clanker + Virtuals\n"
                     f"• Tokens seen: {len(seen_tokens)}\n"
-                    f"• Alerts sent: {alert_count}\n"
+                    f"• Signals sent: {alert_count}\n"
+                    f"• Recheck queue: {len(recheck_queue)}\n"
                     f"• Blocked: {len(blocked_accounts)} accounts\n"
-                    f"• Cached followers: {len(follower_cache)}\n"
-                    f"• Min followers: {MIN_FOLLOWERS:,}\n"
                     f"• Min MCap: ${MIN_MCAP:,}\n"
                     f"• Min Volume: ${MIN_VOLUME_24H:,}\n"
                     f"• Min Liquidity: ${MIN_LIQUIDITY:,}\n"
-                    f"• WhatsApp: {wa_status}\n"
                     f"• Poll interval: {POLL_INTERVAL}s\n"
-                    f"• Your chat ID: <code>{chat_id}</code>",
+                    f"• Recheck: every {RECHECK_INTERVAL}s for {RECHECK_MAX_AGE//60}min",
                     chat_id,
                 )
 
@@ -1309,11 +1313,20 @@ async def main():
                     source = launch.get("source", "?")
 
                     # ── STEP 1: Market data filter (MCap/Volume/Liquidity) ──
+                    # Clear gecko cache for this address so we get fresh data
+                    gecko_cache.pop(address, None)
                     dex = await fetch_geckoterminal(session, address)
                     passes, reason = passes_market_filters(dex)
 
                     if not passes:
-                        log.info(f"  [{source}] ${symbol} — {reason}, skip")
+                        log.info(f"  [{source}] ${symbol} — {reason}, skip → recheck queue")
+                        # Add to recheck queue instead of forgetting forever
+                        recheck_queue[address] = {
+                            "launch": launch,
+                            "first_seen": time.time(),
+                            "last_check": time.time(),
+                            "checks": 1,
+                        }
                         continue
 
                     # ── STEP 2: Grab deployer X if available (bonus, not required) ──
@@ -1333,7 +1346,57 @@ async def main():
                     log.info(f"  📡 SIGNAL: [{source}] ${symbol} MCap {fmt_usd(dex['mcap'])} Vol {fmt_usd(dex['volume_24h'])}{f' @{deployer_x}' if deployer_x else ''}")
                     await send_telegram(session, tg_text)
 
-                log.info(f"🔍 {new_count} new launches processed, {signal_count} signals sent")
+                # ── RECHECK QUEUE: re-evaluate tokens that failed earlier ──
+                now = time.time()
+                expired = []
+                for addr, entry in recheck_queue.items():
+                    age = now - entry["first_seen"]
+                    since_last = now - entry["last_check"]
+
+                    # Too old → remove
+                    if age > RECHECK_MAX_AGE or entry["checks"] >= RECHECK_MAX_CHECKS:
+                        expired.append(addr)
+                        continue
+
+                    # Not time yet → skip
+                    if since_last < RECHECK_INTERVAL:
+                        continue
+
+                    launch = entry["launch"]
+                    symbol = launch.get("symbol", "?")
+                    source = launch.get("source", "?")
+
+                    # Clear cache and re-fetch
+                    gecko_cache.pop(addr, None)
+                    dex = await fetch_geckoterminal(session, addr)
+                    entry["last_check"] = time.time()
+                    entry["checks"] += 1
+
+                    passes, reason = passes_market_filters(dex)
+                    if not passes:
+                        log.info(f"  ♻️ [{source}] ${symbol} recheck #{entry['checks']} — {reason}, still waiting")
+                        continue
+
+                    # Passed! Signal it
+                    deployer_x = ""
+                    if source == "virtuals":
+                        deployer_x = launch.get("creator_x", "") or launch.get("x_username", "")
+                    else:
+                        deployer_x = launch.get("x_username", "")
+                    launch["x_username"] = deployer_x
+
+                    signal_count += 1
+                    alert_count += 1
+                    tg_text = format_signal_telegram(launch, dex)
+                    log.info(f"  📡 RECHECK SIGNAL: [{source}] ${symbol} MCap {fmt_usd(dex['mcap'])} Vol {fmt_usd(dex['volume_24h'])}{f' @{deployer_x}' if deployer_x else ''}")
+                    await send_telegram(session, tg_text)
+                    expired.append(addr)  # remove from queue after signaling
+
+                for addr in expired:
+                    recheck_queue.pop(addr, None)
+
+                recheck_log = f", {len(recheck_queue)} in recheck queue" if recheck_queue else ""
+                log.info(f"🔍 {new_count} new launches processed, {signal_count} signals sent{recheck_log}")
 
             except Exception as e:
                 log.error(f"Poll loop error: {e}", exc_info=True)
