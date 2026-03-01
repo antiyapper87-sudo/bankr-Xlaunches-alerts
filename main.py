@@ -394,6 +394,7 @@ async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str
             "price_change_1h": price_change_1h,
             "price_change_24h": price_change_24h,
             "pair_url": best.get("url", f"https://dexscreener.com/base/{token_address}"),
+            "pair_created_at": best.get("pairCreatedAt", 0),  # ms timestamp
         }
         gecko_cache[token_address] = (time.time(), result)
         return result
@@ -403,10 +404,22 @@ async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str
         return None
 
 
+MAX_TOKEN_AGE = int(os.getenv("MAX_TOKEN_AGE", str(4 * 3600)))  # 4 hours default
+
+
 def passes_market_filters(dex: dict | None) -> tuple[bool, str]:
-    """Check if token passes MCap/Volume/Liquidity filters."""
+    """Check if token passes MCap/Volume/Liquidity/Age filters."""
     if dex is None:
         return False, "no market data"
+
+    # Age filter: skip tokens older than MAX_TOKEN_AGE
+    pair_created = dex.get("pair_created_at", 0)
+    if pair_created:
+        # pairCreatedAt is in milliseconds
+        age_seconds = time.time() - (pair_created / 1000)
+        if age_seconds > MAX_TOKEN_AGE:
+            age_hours = age_seconds / 3600
+            return False, f"too old ({age_hours:.1f}h > {MAX_TOKEN_AGE//3600}h)"
 
     mcap = dex.get("mcap", 0)
     vol = dex.get("volume_24h", 0)
