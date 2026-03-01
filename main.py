@@ -67,6 +67,7 @@ alert_count: int = 0
 RECHECK_MAX_AGE = 1800       # recheck for up to 30 min after first seen
 RECHECK_INTERVAL = 300       # recheck every 5 min
 RECHECK_MAX_CHECKS = 6       # max 6 rechecks (30 min / 5 min)
+RECHECK_MAX_QUEUE = 50       # max tokens in recheck queue (drop oldest if full)
 recheck_queue: dict[str, dict] = {}
 
 # ─── Blocklist (persists to file) ─────────────────────────────────────────────
@@ -334,7 +335,7 @@ async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str
             return cached_result
 
     try:
-        url = f"{DEXSCREENER_API_URL}/tokens/v1/base/{token_address}"
+        url = f"{DEXSCREENER_API_URL}/token-pairs/v1/base/{token_address}"
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status == 404:
                 gecko_cache[token_address] = (time.time(), None)
@@ -347,9 +348,20 @@ async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str
             if resp.status != 200:
                 log.debug(f"DexScreener {resp.status} for {token_address[:10]}...")
                 return None
-            pairs = await resp.json()
+            raw = await resp.json()
 
-        if not pairs or not isinstance(pairs, list) or len(pairs) == 0:
+        # DexScreener can return a list of pairs directly, or a dict with "pairs" key
+        if isinstance(raw, list):
+            pairs = raw
+        elif isinstance(raw, dict):
+            pairs = raw.get("pairs") or raw.get("data") or []
+            if not pairs and raw.get("schemaVersion"):
+                pairs = raw.get("pairs", [])
+        else:
+            pairs = []
+
+        if not pairs:
+            log.debug(f"DexScreener no pairs for {token_address[:10]}... (raw type={type(raw).__name__})")
             gecko_cache[token_address] = (time.time(), None)
             return None
 
@@ -1251,6 +1263,22 @@ async def main():
 
     async with aiohttp.ClientSession() as session:
 
+        # ── DexScreener health check ──
+        try:
+            test_addr = "0x532f27101965dd16442e59d40670faf5ebb142e4"  # BRETT on Base
+            test_url = f"{DEXSCREENER_API_URL}/token-pairs/v1/base/{test_addr}"
+            async with session.get(test_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                test_data = await resp.json()
+                if isinstance(test_data, list) and len(test_data) > 0:
+                    p = test_data[0]
+                    log.info(f"✅ DexScreener OK — BRETT: ${float(p.get('priceUsd') or 0):.4f}, mcap ${float(p.get('marketCap') or 0):,.0f}")
+                else:
+                    log.warning(f"⚠️ DexScreener returned unexpected format: {type(test_data).__name__}, status {resp.status}")
+                    if isinstance(test_data, dict):
+                        log.warning(f"   Keys: {list(test_data.keys())[:10]}")
+        except Exception as e:
+            log.error(f"❌ DexScreener health check failed: {e}")
+
         # Seed existing tokens
         await seed_existing(session)
 
@@ -1311,12 +1339,13 @@ async def main():
                     if not passes:
                         log.info(f"  [{source}] ${symbol} — {reason}, skip → recheck queue")
                         # Add to recheck queue instead of forgetting forever
-                        recheck_queue[address] = {
-                            "launch": launch,
-                            "first_seen": time.time(),
-                            "last_check": time.time(),
-                            "checks": 1,
-                        }
+                        if len(recheck_queue) < RECHECK_MAX_QUEUE:
+                            recheck_queue[address] = {
+                                "launch": launch,
+                                "first_seen": time.time(),
+                                "last_check": time.time(),
+                                "checks": 1,
+                            }
                         continue
 
                     # ── STEP 2: Grab deployer X if available (bonus, not required) ──
