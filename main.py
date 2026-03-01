@@ -33,7 +33,7 @@ WHATSAPP_GROUP_ID = os.getenv("WHATSAPP_GROUP_ID", "")
 SOCIALDATA_API_KEY = os.getenv("SOCIALDATA_API_KEY", "")
 MIN_FOLLOWERS = int(os.getenv("MIN_FOLLOWERS", "5000"))
 MIN_MCAP = int(os.getenv("MIN_MCAP", "50000"))
-MIN_VOLUME_24H = int(os.getenv("MIN_VOLUME_24H", "50000"))
+MIN_VOLUME_24H = int(os.getenv("MIN_VOLUME_24H", "30000"))
 MIN_LIQUIDITY = int(os.getenv("MIN_LIQUIDITY", "30000"))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
 
@@ -64,10 +64,10 @@ alert_count: int = 0
 
 # ─── Recheck queue: tokens that failed market filters on first pass ───────────
 # {address: {"launch": launch_dict, "first_seen": timestamp, "checks": count}}
-RECHECK_MAX_AGE = 1800       # recheck for up to 30 min after first seen
+RECHECK_MAX_AGE = 3600       # recheck for up to 60 min after first seen
 RECHECK_INTERVAL = 300       # recheck every 5 min
-RECHECK_MAX_CHECKS = 6       # max 6 rechecks (30 min / 5 min)
-RECHECK_MAX_QUEUE = 50       # max tokens in recheck queue (drop oldest if full)
+RECHECK_MAX_CHECKS = 12      # max 12 rechecks (60 min / 5 min)
+RECHECK_MAX_QUEUE = 100      # max tokens in recheck queue (drop oldest if full)
 recheck_queue: dict[str, dict] = {}
 
 # ─── Blocklist (persists to file) ─────────────────────────────────────────────
@@ -844,6 +844,7 @@ async def fetch_bankr(session: aiohttp.ClientSession) -> list[dict]:
                 "x_username": x_username or "",
                 "tweet_url": launch.get("tweetUrl", ""),
                 "image_uri": launch.get("imageUri", ""),
+                "created_at": launch.get("createdAt") or launch.get("launchedAt") or launch.get("created_at") or "",
             })
 
     except Exception as e:
@@ -858,17 +859,24 @@ async def fetch_clanker(session: aiohttp.ClientSession) -> list[dict]:
     """Fetch & normalize launches from Clanker API."""
     normalized = []
     try:
-        params = {"sort": "desc", "page": 1, "pageSize": 20}
-        async with session.get(CLANKER_API_URL, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            if resp.status != 200:
-                log.warning(f"Clanker API returned {resp.status}")
-                return []
-            data = await resp.json()
+        # Fetch 2 pages to catch more tokens (API may cap results)
+        all_tokens = []
+        for page in [1, 2]:
+            params = {"sort": "desc", "page": page, "pageSize": 50}
+            async with session.get(CLANKER_API_URL, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    log.warning(f"Clanker API returned {resp.status}")
+                    break
+                data = await resp.json()
 
-        tokens = data.get("data", data if isinstance(data, list) else [])
-        log.info(f"Clanker: {len(tokens)} launches fetched")
+            tokens = data.get("data", data if isinstance(data, list) else [])
+            all_tokens.extend(tokens)
+            if len(tokens) < 10:  # no more pages
+                break
 
-        for token in tokens:
+        log.info(f"Clanker: {len(all_tokens)} launches fetched")
+
+        for token in all_tokens:
             address = (token.get("contract_address") or token.get("address") or "").lower()
             if not address:
                 continue
@@ -901,6 +909,7 @@ async def fetch_clanker(session: aiohttp.ClientSession) -> list[dict]:
                 "x_username": x_username or "",
                 "tweet_url": "",
                 "image_uri": "",
+                "created_at": token.get("created_at") or token.get("createdAt") or token.get("deployedAt") or "",
             })
 
     except Exception as e:
@@ -1220,19 +1229,51 @@ def format_alert_whatsapp(launch: dict, follower_count: int, dex: dict | None) -
 # ─── Seeding ──────────────────────────────────────────────────────────────────
 
 async def seed_existing(session: aiohttp.ClientSession):
-    """Fetch existing tokens on startup so we don't alert on old ones."""
+    """Fetch existing tokens on startup. Check recent ones for missed signals."""
     log.info("📋 Seeding existing tokens...")
     bankr = await fetch_bankr(session)
     clanker = await fetch_clanker(session)
     virtuals = await fetch_virtuals(session)
 
-    for launch in bankr + clanker + virtuals:
-        seen_tokens.add(launch["address"])
+    all_launches = bankr + clanker + virtuals
+    signal_count = 0
+    now = time.time()
+
+    for launch in all_launches:
+        addr = launch["address"]
+        seen_tokens.add(addr)
+
+        # Only check market data for tokens created in the last 30 min
+        # Older ones were likely already signaled before restart
+        created = launch.get("created_at", 0)
+        if isinstance(created, str):
+            try:
+                from datetime import datetime, timezone
+                dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                created = dt.timestamp()
+            except Exception:
+                created = 0
+
+        age_min = (now - created) / 60 if created > 0 else 999
+        if age_min > 30:
+            continue
+
+        symbol = launch.get("symbol", "?")
+        source = launch.get("source", "?")
+        dex = await fetch_geckoterminal(session, addr)
+        passes, reason = passes_market_filters(dex)
+        if passes:
+            deployer_x = launch.get("x_username", "") or launch.get("creator_x", "")
+            launch["x_username"] = deployer_x
+            tg_text = format_signal_telegram(launch, dex)
+            log.info(f"  📡 SEED SIGNAL: [{source}] ${symbol} MCap {fmt_usd(dex['mcap'])} Vol {fmt_usd(dex['volume_24h'])}")
+            await send_telegram(session, tg_text)
+            signal_count += 1
 
     log.info(
         f"📋 Seeded {len(seen_tokens)} tokens "
         f"(Bankr: {len(bankr)}, Clanker: {len(clanker)}, "
-        f"Virtuals: {len(virtuals)})"
+        f"Virtuals: {len(virtuals)}) — {signal_count} seed signals sent"
     )
 
 
