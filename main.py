@@ -1385,36 +1385,36 @@ async def main():
 
                     if address in seen_tokens:
                         continue
-                    seen_tokens.add(address)
-                    new_count += 1
 
                     symbol = launch.get("symbol", "?")
                     source = launch.get("source", "?")
 
                     # ── STEP 1: Market data filter (MCap/Volume/Liquidity) ──
-                    # Clear gecko cache for this address so we get fresh data
-                    gecko_cache.pop(address, None)
                     dex = await fetch_geckoterminal(session, address)
                     passes, reason = passes_market_filters(dex)
 
                     if not passes:
                         # Don't recheck tokens that are permanently disqualified
                         if "too old" in reason or "likely old" in reason:
+                            seen_tokens.add(address)
                             log.debug(f"  [{source}] ${symbol} — {reason}, skip (permanent)")
                         elif reason == "no market data":
-                            # No pool exists yet — only recheck if not already queued
-                            # These get fewer rechecks (max 3) since most will never get a pool
+                            # No pool yet — mark seen so we don't re-fetch every cycle
+                            # Add to recheck queue with short window (3 checks / 15 min)
+                            seen_tokens.add(address)
                             if address not in recheck_queue and len(recheck_queue) < RECHECK_MAX_QUEUE:
                                 recheck_queue[address] = {
                                     "launch": launch,
                                     "first_seen": time.time(),
                                     "last_check": time.time(),
                                     "checks": 1,
-                                    "no_data": True,  # flag for shorter recheck window
+                                    "no_data": True,
                                 }
-                            log.debug(f"  [{source}] ${symbol} — no market data, skip → recheck queue")
+                            log.debug(f"  [{source}] ${symbol} — no market data, recheck queue (short)")
                         else:
-                            # Has data but below thresholds — worth rechecking
+                            # Has data but below thresholds — full recheck window
+                            seen_tokens.add(address)
+                            new_count += 1
                             log.info(f"  [{source}] ${symbol} — {reason}, skip → recheck queue")
                             if address not in recheck_queue and len(recheck_queue) < RECHECK_MAX_QUEUE:
                                 recheck_queue[address] = {
@@ -1425,6 +1425,9 @@ async def main():
                                     "no_data": False,
                                 }
                         continue
+
+                    seen_tokens.add(address)
+                    new_count += 1
 
                     # ── STEP 2: Grab deployer X if available (bonus, not required) ──
                     deployer_x = ""
@@ -1448,24 +1451,25 @@ async def main():
                 # ── RECHECK QUEUE: re-evaluate tokens that failed earlier ──
                 now = time.time()
                 expired = []
+                eligible = []
+
+                # Quick pass: find expired and eligible entries without API calls
                 for addr, entry in recheck_queue.items():
                     age = now - entry["first_seen"]
                     since_last = now - entry["last_check"]
 
-                    # Shorter limits for tokens that never had market data
                     is_no_data = entry.get("no_data", False)
                     max_checks = 3 if is_no_data else RECHECK_MAX_CHECKS
-                    max_age = 900 if is_no_data else RECHECK_MAX_AGE  # 15 min vs 60 min
+                    max_age = 900 if is_no_data else RECHECK_MAX_AGE
 
-                    # Too old or too many checks → remove
                     if age > max_age or entry["checks"] >= max_checks:
                         expired.append(addr)
-                        continue
+                    elif since_last >= RECHECK_INTERVAL:
+                        eligible.append(addr)
 
-                    # Not time yet → skip
-                    if since_last < RECHECK_INTERVAL:
-                        continue
-
+                # Only make API calls for eligible entries
+                for addr in eligible:
+                    entry = recheck_queue[addr]
                     launch = entry["launch"]
                     symbol = launch.get("symbol", "?")
                     source = launch.get("source", "?")
