@@ -1279,12 +1279,14 @@ async def seed_existing(session: aiohttp.ClientSession):
         # Add ALL fetched tokens to recheck queue (covers ~last 4 hours)
         # The recheck cycle will check market data and signal any that pass.
         # This avoids duplicate signals on restart since we don't signal here.
+        # Start as no_data=True — will be upgraded to full tracking if data found
         if addr not in recheck_queue and len(recheck_queue) < RECHECK_MAX_QUEUE:
             recheck_queue[addr] = {
                 "launch": launch,
                 "first_seen": time.time(),
                 "last_check": 0,  # force immediate check on first recheck cycle
                 "checks": 0,
+                "no_data": True,  # assume no data until proven otherwise
             }
             queued += 1
 
@@ -1399,7 +1401,20 @@ async def main():
                         # Don't recheck tokens that are permanently disqualified
                         if "too old" in reason or "likely old" in reason:
                             log.debug(f"  [{source}] ${symbol} — {reason}, skip (permanent)")
+                        elif reason == "no market data":
+                            # No pool exists yet — only recheck if not already queued
+                            # These get fewer rechecks (max 3) since most will never get a pool
+                            if address not in recheck_queue and len(recheck_queue) < RECHECK_MAX_QUEUE:
+                                recheck_queue[address] = {
+                                    "launch": launch,
+                                    "first_seen": time.time(),
+                                    "last_check": time.time(),
+                                    "checks": 1,
+                                    "no_data": True,  # flag for shorter recheck window
+                                }
+                            log.debug(f"  [{source}] ${symbol} — no market data, skip → recheck queue")
                         else:
+                            # Has data but below thresholds — worth rechecking
                             log.info(f"  [{source}] ${symbol} — {reason}, skip → recheck queue")
                             if address not in recheck_queue and len(recheck_queue) < RECHECK_MAX_QUEUE:
                                 recheck_queue[address] = {
@@ -1407,6 +1422,7 @@ async def main():
                                     "first_seen": time.time(),
                                     "last_check": time.time(),
                                     "checks": 1,
+                                    "no_data": False,
                                 }
                         continue
 
@@ -1436,8 +1452,13 @@ async def main():
                     age = now - entry["first_seen"]
                     since_last = now - entry["last_check"]
 
-                    # Too old → remove
-                    if age > RECHECK_MAX_AGE or entry["checks"] >= RECHECK_MAX_CHECKS:
+                    # Shorter limits for tokens that never had market data
+                    is_no_data = entry.get("no_data", False)
+                    max_checks = 3 if is_no_data else RECHECK_MAX_CHECKS
+                    max_age = 900 if is_no_data else RECHECK_MAX_AGE  # 15 min vs 60 min
+
+                    # Too old or too many checks → remove
+                    if age > max_age or entry["checks"] >= max_checks:
                         expired.append(addr)
                         continue
 
@@ -1455,6 +1476,12 @@ async def main():
                     entry["last_check"] = time.time()
                     entry["checks"] += 1
 
+                    # If token was "no data" but now has data, upgrade to full tracking
+                    if entry.get("no_data") and dex is not None:
+                        entry["no_data"] = False
+                        entry["first_seen"] = time.time()  # reset age for full window
+                        entry["checks"] = 1
+
                     passes, reason = passes_market_filters(dex)
                     if not passes:
                         # If token is permanently disqualified (too old), drop it immediately
@@ -1462,7 +1489,9 @@ async def main():
                             log.debug(f"  ♻️ [{source}] ${symbol} — {reason}, dropping from queue")
                             expired.append(addr)
                             continue
-                        log.info(f"  ♻️ [{source}] ${symbol} recheck #{entry['checks']} — {reason}, still waiting")
+                        # Only log tokens that have data (reduce noise from no-data spam)
+                        if reason != "no market data":
+                            log.info(f"  ♻️ [{source}] ${symbol} recheck #{entry['checks']} — {reason}, still waiting")
                         continue
 
                     # Passed! Signal it (if not already signaled)
