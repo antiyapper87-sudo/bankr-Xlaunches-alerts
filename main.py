@@ -420,6 +420,12 @@ def passes_market_filters(dex: dict | None) -> tuple[bool, str]:
         if age_seconds > MAX_TOKEN_AGE:
             age_hours = age_seconds / 3600
             return False, f"too old ({age_hours:.1f}h > {MAX_TOKEN_AGE//3600}h)"
+    else:
+        # No creation time available — skip if MCap is suspiciously high
+        # (new tokens rarely launch above $200K, so this is likely an old token)
+        mcap_check = float(dex.get("mcap", 0))
+        if mcap_check > 200_000:
+            return False, f"no creation time + high mcap ${mcap_check:,.0f}, likely old"
 
     mcap = dex.get("mcap", 0)
     vol = dex.get("volume_24h", 0)
@@ -1046,10 +1052,24 @@ def format_signal_telegram(launch: dict, dex: dict | None) -> str:
 
     # Market data
     market_lines = ""
+    age_line = ""
     if dex:
         change_1h = dex.get("price_change_1h", 0)
         change_emoji = "🟢" if change_1h >= 0 else "🔴"
+
+        # Token age from pair creation
+        pair_created = dex.get("pair_created_at", 0)
+        if pair_created:
+            age_seconds = time.time() - (pair_created / 1000)
+            if age_seconds < 3600:
+                age_line = f"🕐 Launched: {int(age_seconds / 60)}m ago\n"
+            elif age_seconds < 86400:
+                age_line = f"🕐 Launched: {age_seconds / 3600:.1f}h ago\n"
+            else:
+                age_line = f"🕐 Launched: {age_seconds / 86400:.1f}d ago\n"
+
         market_lines = (
+            f"{age_line}"
             f"├ 💰 MCap: {fmt_usd(dex['mcap'])}\n"
             f"├ 📈 Vol: {fmt_usd(dex['volume_24h'])}\n"
             f"├ 💧 Liq: {fmt_usd(dex['liquidity'])}\n"
