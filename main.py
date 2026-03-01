@@ -1396,15 +1396,18 @@ async def main():
                     passes, reason = passes_market_filters(dex)
 
                     if not passes:
-                        log.info(f"  [{source}] ${symbol} — {reason}, skip → recheck queue")
-                        # Add to recheck queue instead of forgetting forever
-                        if len(recheck_queue) < RECHECK_MAX_QUEUE:
-                            recheck_queue[address] = {
-                                "launch": launch,
-                                "first_seen": time.time(),
-                                "last_check": time.time(),
-                                "checks": 1,
-                            }
+                        # Don't recheck tokens that are permanently disqualified
+                        if "too old" in reason or "likely old" in reason:
+                            log.debug(f"  [{source}] ${symbol} — {reason}, skip (permanent)")
+                        else:
+                            log.info(f"  [{source}] ${symbol} — {reason}, skip → recheck queue")
+                            if address not in recheck_queue and len(recheck_queue) < RECHECK_MAX_QUEUE:
+                                recheck_queue[address] = {
+                                    "launch": launch,
+                                    "first_seen": time.time(),
+                                    "last_check": time.time(),
+                                    "checks": 1,
+                                }
                         continue
 
                     # ── STEP 2: Grab deployer X if available (bonus, not required) ──
@@ -1454,6 +1457,11 @@ async def main():
 
                     passes, reason = passes_market_filters(dex)
                     if not passes:
+                        # If token is permanently disqualified (too old), drop it immediately
+                        if "too old" in reason or "likely old" in reason:
+                            log.debug(f"  ♻️ [{source}] ${symbol} — {reason}, dropping from queue")
+                            expired.append(addr)
+                            continue
                         log.info(f"  ♻️ [{source}] ${symbol} recheck #{entry['checks']} — {reason}, still waiting")
                         continue
 
