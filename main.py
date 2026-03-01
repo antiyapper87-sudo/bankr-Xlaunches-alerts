@@ -55,6 +55,7 @@ log = logging.getLogger("whale-alert")
 # ─── State ────────────────────────────────────────────────────────────────────
 
 seen_tokens: set[str] = set()
+signaled_tokens: set[str] = set()  # addresses we've already sent a signal for
 follower_cache: dict[str, int | None] = {}
 gecko_cache: dict[str, tuple[float, dict | None]] = {}  # address → (timestamp, result)
 GECKO_CACHE_TTL_HIT = 120    # cache valid market data for 2 min
@@ -67,7 +68,7 @@ alert_count: int = 0
 RECHECK_MAX_AGE = 3600       # recheck for up to 60 min after first seen
 RECHECK_INTERVAL = 300       # recheck every 5 min
 RECHECK_MAX_CHECKS = 12      # max 12 rechecks (60 min / 5 min)
-RECHECK_MAX_QUEUE = 100      # max tokens in recheck queue (drop oldest if full)
+RECHECK_MAX_QUEUE = 200      # max tokens in recheck queue (seeds + new)
 recheck_queue: dict[str, dict] = {}
 
 # ─── Blocklist (persists to file) ─────────────────────────────────────────────
@@ -1229,51 +1230,35 @@ def format_alert_whatsapp(launch: dict, follower_count: int, dex: dict | None) -
 # ─── Seeding ──────────────────────────────────────────────────────────────────
 
 async def seed_existing(session: aiohttp.ClientSession):
-    """Fetch existing tokens on startup. Check recent ones for missed signals."""
+    """Fetch existing tokens on startup. Add all to seen, queue recent ones for recheck."""
     log.info("📋 Seeding existing tokens...")
     bankr = await fetch_bankr(session)
     clanker = await fetch_clanker(session)
     virtuals = await fetch_virtuals(session)
 
     all_launches = bankr + clanker + virtuals
-    signal_count = 0
-    now = time.time()
+    queued = 0
 
     for launch in all_launches:
         addr = launch["address"]
         seen_tokens.add(addr)
 
-        # Only check market data for tokens created in the last 30 min
-        # Older ones were likely already signaled before restart
-        created = launch.get("created_at", 0)
-        if isinstance(created, str):
-            try:
-                from datetime import datetime, timezone
-                dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
-                created = dt.timestamp()
-            except Exception:
-                created = 0
-
-        age_min = (now - created) / 60 if created > 0 else 999
-        if age_min > 30:
-            continue
-
-        symbol = launch.get("symbol", "?")
-        source = launch.get("source", "?")
-        dex = await fetch_geckoterminal(session, addr)
-        passes, reason = passes_market_filters(dex)
-        if passes:
-            deployer_x = launch.get("x_username", "") or launch.get("creator_x", "")
-            launch["x_username"] = deployer_x
-            tg_text = format_signal_telegram(launch, dex)
-            log.info(f"  📡 SEED SIGNAL: [{source}] ${symbol} MCap {fmt_usd(dex['mcap'])} Vol {fmt_usd(dex['volume_24h'])}")
-            await send_telegram(session, tg_text)
-            signal_count += 1
+        # Add ALL fetched tokens to recheck queue (covers ~last 4 hours)
+        # The recheck cycle will check market data and signal any that pass.
+        # This avoids duplicate signals on restart since we don't signal here.
+        if addr not in recheck_queue and len(recheck_queue) < RECHECK_MAX_QUEUE:
+            recheck_queue[addr] = {
+                "launch": launch,
+                "first_seen": time.time(),
+                "last_check": 0,  # force immediate check on first recheck cycle
+                "checks": 0,
+            }
+            queued += 1
 
     log.info(
         f"📋 Seeded {len(seen_tokens)} tokens "
         f"(Bankr: {len(bankr)}, Clanker: {len(clanker)}, "
-        f"Virtuals: {len(virtuals)}) — {signal_count} seed signals sent"
+        f"Virtuals: {len(virtuals)}) — {queued} queued for recheck"
     )
 
 
@@ -1400,11 +1385,13 @@ async def main():
                     launch["x_username"] = deployer_x
 
                     # ── STEP 3: Signal to Telegram ──
-                    signal_count += 1
-                    alert_count += 1
-                    tg_text = format_signal_telegram(launch, dex)
-                    log.info(f"  📡 SIGNAL: [{source}] ${symbol} MCap {fmt_usd(dex['mcap'])} Vol {fmt_usd(dex['volume_24h'])}{f' @{deployer_x}' if deployer_x else ''}")
-                    await send_telegram(session, tg_text)
+                    if address not in signaled_tokens:
+                        signaled_tokens.add(address)
+                        signal_count += 1
+                        alert_count += 1
+                        tg_text = format_signal_telegram(launch, dex)
+                        log.info(f"  📡 SIGNAL: [{source}] ${symbol} MCap {fmt_usd(dex['mcap'])} Vol {fmt_usd(dex['volume_24h'])}{f' @{deployer_x}' if deployer_x else ''}")
+                        await send_telegram(session, tg_text)
 
                 # ── RECHECK QUEUE: re-evaluate tokens that failed earlier ──
                 now = time.time()
@@ -1437,7 +1424,12 @@ async def main():
                         log.info(f"  ♻️ [{source}] ${symbol} recheck #{entry['checks']} — {reason}, still waiting")
                         continue
 
-                    # Passed! Signal it
+                    # Passed! Signal it (if not already signaled)
+                    if addr in signaled_tokens:
+                        log.info(f"  ♻️ [{source}] ${symbol} passed but already signaled, skipping")
+                        expired.append(addr)
+                        continue
+
                     deployer_x = ""
                     if source == "virtuals":
                         deployer_x = launch.get("creator_x", "") or launch.get("x_username", "")
@@ -1445,6 +1437,7 @@ async def main():
                         deployer_x = launch.get("x_username", "")
                     launch["x_username"] = deployer_x
 
+                    signaled_tokens.add(addr)
                     signal_count += 1
                     alert_count += 1
                     tg_text = format_signal_telegram(launch, dex)
