@@ -5,11 +5,10 @@ Monitors FOUR sources for new token launches on Base:
   1. Bankr API   — https://api.bankr.bot/token-launches
   2. Clanker API  — https://www.clanker.world/api/tokens
   3. Virtuals API — https://api2.virtuals.io/api/virtuals  (AI agent launches)
-  4. GeckoTerminal — market data (MCap, Volume, Liquidity) — faster than DexScreener
+  4. DexScreener — market data (MCap, Volume, Liquidity)
 
-When a token is launched by an X account with 10K+ followers → alerts to Telegram + WhatsApp.
-Uses SocialData.tools API for reliable follower count lookups.
-Uses GeckoTerminal for market data filtering (MCap, Volume, Liquidity).
+When a token passes market filters → alerts to Telegram + WhatsApp.
+Auto-execution via Bankr Agent API when AUTO_EXECUTE=true.
 
 Deploy: GitHub + Railway
 """
@@ -37,11 +36,18 @@ MIN_VOLUME_24H = int(os.getenv("MIN_VOLUME_24H", "30000"))
 MIN_LIQUIDITY = int(os.getenv("MIN_LIQUIDITY", "30000"))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
 
+# ─── Bankr Execution Config ───────────────────────────────────────────────────
+BANKR_EXECUTION_API_KEY = os.getenv("BANKR_EXECUTION_API_KEY", "")  # separate from monitoring API
+BANKR_BUY_AMOUNT = int(os.getenv("BANKR_BUY_AMOUNT", "100"))        # USD amount per trade
+AUTO_EXECUTE = os.getenv("AUTO_EXECUTE", "false").lower() == "true"  # safety kill switch
+
 BANKR_API_URL = "https://api.bankr.bot/token-launches"
+BANKR_AGENT_API_URL = "https://api.bankr.bot/agent/prompt"
 CLANKER_API_URL = "https://www.clanker.world/api/tokens"
 VIRTUALS_API_URL = "https://api2.virtuals.io/api/virtuals"
 GECKOTERMINAL_API_URL = "https://api.geckoterminal.com/api/v2"
 SOCIALDATA_API_URL = "https://api.socialdata.tools/twitter/user"
+DEXSCREENER_API_URL = "https://api.dexscreener.com"
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -55,23 +61,23 @@ log = logging.getLogger("whale-alert")
 # ─── State ────────────────────────────────────────────────────────────────────
 
 seen_tokens: set[str] = set()
-signaled_tokens: set[str] = set()  # addresses we've already sent a signal for
+signaled_tokens: set[str] = set()
 follower_cache: dict[str, int | None] = {}
-gecko_cache: dict[str, tuple[float, dict | None]] = {}  # address → (timestamp, result)
-GECKO_CACHE_TTL_HIT = 120    # cache valid market data for 2 min
-GECKO_CACHE_TTL_MISS = 60    # cache "no data" for 1 min (recheck soon for new tokens)
+gecko_cache: dict[str, tuple[float, dict | None]] = {}
+GECKO_CACHE_TTL_HIT = 120
+GECKO_CACHE_TTL_MISS = 60
 last_update_id: int = 0
 alert_count: int = 0
+execution_count: int = 0
 
-# ─── Recheck queue: tokens that failed market filters on first pass ───────────
-# {address: {"launch": launch_dict, "first_seen": timestamp, "checks": count}}
-RECHECK_MAX_AGE = 3600       # recheck for up to 60 min after first seen
-RECHECK_INTERVAL = 300       # recheck every 5 min
-RECHECK_MAX_CHECKS = 12      # max 12 rechecks (60 min / 5 min)
-RECHECK_MAX_QUEUE = 200      # max tokens in recheck queue (seeds + new)
+# ─── Recheck queue ────────────────────────────────────────────────────────────
+RECHECK_MAX_AGE = 3600
+RECHECK_INTERVAL = 300
+RECHECK_MAX_CHECKS = 12
+RECHECK_MAX_QUEUE = 200
 recheck_queue: dict[str, dict] = {}
 
-# ─── Blocklist (persists to file) ─────────────────────────────────────────────
+# ─── Blocklist ────────────────────────────────────────────────────────────────
 
 BLOCKLIST_FILE = Path("/data/blocklist.json") if Path("/data").exists() else Path("blocklist.json")
 
@@ -101,10 +107,61 @@ def save_blocklist(blocked: set[str]):
 blocked_accounts: set[str] = load_blocklist()
 
 
+# ─── Bankr Auto-Execution ─────────────────────────────────────────────────────
+
+async def execute_bankr_buy(session: aiohttp.ClientSession, token_address: str, symbol: str, source: str) -> bool:
+    """
+    Submit a buy order to Bankr Agent API.
+    Only runs when AUTO_EXECUTE=true and BANKR_EXECUTION_API_KEY is set.
+    Returns True if submitted successfully.
+    """
+    global execution_count
+
+    if not AUTO_EXECUTE:
+        return False
+
+    if not BANKR_EXECUTION_API_KEY:
+        log.warning("⚠️ AUTO_EXECUTE=true but BANKR_EXECUTION_API_KEY not set — skipping execution")
+        return False
+
+    try:
+        prompt = f"buy ${BANKR_BUY_AMOUNT} of {token_address} on base"
+        async with session.post(
+            BANKR_AGENT_API_URL,
+            headers={
+                "Content-Type": "application/json",
+                "X-API-Key": BANKR_EXECUTION_API_KEY,
+            },
+            json={"prompt": prompt},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            data = await resp.json()
+
+            if resp.status == 202 and data.get("success"):
+                job_id = data.get("jobId", "?")
+                thread_id = data.get("threadId", "?")
+                execution_count += 1
+                log.info(f"  💸 EXECUTED: [{source}] ${symbol} — ${BANKR_BUY_AMOUNT} buy submitted | jobId: {job_id} | threadId: {thread_id}")
+                return True
+            elif resp.status == 403:
+                log.error(f"  ❌ Bankr execution forbidden (403) — check API key permissions at bankr.bot/api")
+                return False
+            elif resp.status == 429:
+                reset_at = data.get("resetAt", "")
+                log.warning(f"  ⚠️ Bankr rate limit hit — resets at {reset_at}")
+                return False
+            else:
+                log.error(f"  ❌ Bankr execution failed {resp.status}: {data}")
+                return False
+
+    except Exception as e:
+        log.error(f"  ❌ Bankr execution error for ${symbol}: {e}")
+        return False
+
+
 # ─── Telegram ─────────────────────────────────────────────────────────────────
 
 async def send_telegram(session: aiohttp.ClientSession, text: str, chat_id: str = "") -> bool:
-    """Send a Telegram message. Uses TELEGRAM_CHAT_ID by default, or a specific chat_id."""
     target = chat_id or TELEGRAM_CHAT_ID
     if not TELEGRAM_BOT_TOKEN or not target:
         return False
@@ -138,10 +195,7 @@ async def send_whatsapp(session: aiohttp.ClientSession, text: str) -> bool:
         "Authorization": f"Bearer {WHAPI_TOKEN}",
         "Content-Type": "application/json",
     }
-    payload = {
-        "to": WHATSAPP_GROUP_ID,
-        "body": text,
-    }
+    payload = {"to": WHATSAPP_GROUP_ID, "body": text}
     try:
         async with session.post(url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status in (200, 201):
@@ -156,10 +210,7 @@ async def send_whatsapp(session: aiohttp.ClientSession, text: str) -> bool:
         return False
 
 
-# ─── Send to all channels ────────────────────────────────────────────────────
-
 async def send_alert_all(session: aiohttp.ClientSession, tg_text: str, wa_text: str):
-    """Send alert to both Telegram and WhatsApp."""
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         await send_telegram(session, tg_text)
     if WHAPI_TOKEN and WHATSAPP_GROUP_ID:
@@ -196,10 +247,8 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
             if not text.startswith("/"):
                 continue
 
-            # Log the chat ID for debugging
             log.info(f"📩 Command from chat {chat_id}: {text[:50]}")
 
-            # /block @username
             if text.lower().startswith("/block") and not text.lower().startswith("/blocklist"):
                 parts = text.split(maxsplit=1)
                 if len(parts) < 2:
@@ -212,7 +261,6 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                 log.info(f"🚫 Blocked @{username}")
                 await send_telegram(session, f"🚫 Blocked <b>@{username}</b> — future launches ignored", chat_id)
 
-            # /unblock @username
             elif text.lower().startswith("/unblock"):
                 parts = text.split(maxsplit=1)
                 if len(parts) < 2:
@@ -224,7 +272,6 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                 log.info(f"✅ Unblocked @{username}")
                 await send_telegram(session, f"✅ Unblocked <b>@{username}</b>", chat_id)
 
-            # /blocklist
             elif text.lower().startswith("/blocklist"):
                 if blocked_accounts:
                     names = "\n".join(f"• @{u}" for u in sorted(blocked_accounts))
@@ -232,8 +279,8 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                 else:
                     await send_telegram(session, "No accounts blocked.", chat_id)
 
-            # /status
             elif text.lower().startswith("/status"):
+                exec_status = f"✅ ON (${BANKR_BUY_AMOUNT}/trade)" if AUTO_EXECUTE else "❌ OFF"
                 await send_telegram(
                     session,
                     f"📡 <b>Signal Bot</b>\n\n"
@@ -246,11 +293,11 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                     f"• Min Volume: ${MIN_VOLUME_24H:,}\n"
                     f"• Min Liquidity: ${MIN_LIQUIDITY:,}\n"
                     f"• Poll interval: {POLL_INTERVAL}s\n"
-                    f"• Recheck: every {RECHECK_INTERVAL}s for {RECHECK_MAX_AGE//60}min",
+                    f"• Auto-execute: {exec_status}\n"
+                    f"• Executions: {execution_count}",
                     chat_id,
                 )
 
-            # /research $TICKER or /r $TICKER — token intelligence brief
             elif text.lower().startswith("/research") or text.lower().startswith("/r "):
                 parts = text.split(maxsplit=1)
                 if len(parts) < 2:
@@ -272,7 +319,6 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
 # ─── SocialData.tools Follower Lookup ─────────────────────────────────────────
 
 async def get_follower_count(session: aiohttp.ClientSession, username: str) -> int | None:
-    """Look up X follower count via SocialData.tools API. Uses cache."""
     username = username.lstrip("@").strip().lower()
     if not username:
         return None
@@ -286,7 +332,6 @@ async def get_follower_count(session: aiohttp.ClientSession, username: str) -> i
         return None
 
     count = None
-
     try:
         url = f"{SOCIALDATA_API_URL}/{username}"
         headers = {
@@ -320,15 +365,11 @@ async def get_follower_count(session: aiohttp.ClientSession, username: str) -> i
     return count
 
 
-# ─── DexScreener Market Data ─────────────────────────────────────────────────
-
-DEXSCREENER_API_URL = "https://api.dexscreener.com"
+# ─── DexScreener Market Data ──────────────────────────────────────────────────
 
 async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str) -> dict | None:
-    """Fetch market data from DexScreener for a Base token. Cached."""
     token_address = token_address.lower()
 
-    # Check cache first
     if token_address in gecko_cache:
         cached_time, cached_result = gecko_cache[token_address]
         ttl = GECKO_CACHE_TTL_HIT if cached_result else GECKO_CACHE_TTL_MISS
@@ -351,22 +392,17 @@ async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str
                 return None
             raw = await resp.json()
 
-        # DexScreener can return a list of pairs directly, or a dict with "pairs" key
         if isinstance(raw, list):
             pairs = raw
         elif isinstance(raw, dict):
             pairs = raw.get("pairs") or raw.get("data") or []
-            if not pairs and raw.get("schemaVersion"):
-                pairs = raw.get("pairs", [])
         else:
             pairs = []
 
         if not pairs:
-            log.debug(f"DexScreener no pairs for {token_address[:10]}... (raw type={type(raw).__name__})")
             gecko_cache[token_address] = (time.time(), None)
             return None
 
-        # Pick the pair with highest liquidity
         best = None
         best_liq = -1
         for pair in pairs:
@@ -383,18 +419,16 @@ async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str
         vol_24h = float((best.get("volume") or {}).get("h24") or 0)
         liquidity = float((best.get("liquidity") or {}).get("usd") or 0)
         price_change = best.get("priceChange") or {}
-        price_change_1h = float(price_change.get("h1") or 0)
-        price_change_24h = float(price_change.get("h24") or 0)
 
         result = {
             "mcap": mcap,
             "volume_24h": vol_24h,
             "liquidity": liquidity,
             "price_usd": best.get("priceUsd", "0"),
-            "price_change_1h": price_change_1h,
-            "price_change_24h": price_change_24h,
+            "price_change_1h": float(price_change.get("h1") or 0),
+            "price_change_24h": float(price_change.get("h24") or 0),
             "pair_url": best.get("url", f"https://dexscreener.com/base/{token_address}"),
-            "pair_created_at": best.get("pairCreatedAt", 0),  # ms timestamp
+            "pair_created_at": best.get("pairCreatedAt", 0),
         }
         gecko_cache[token_address] = (time.time(), result)
         return result
@@ -404,25 +438,20 @@ async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str
         return None
 
 
-MAX_TOKEN_AGE = int(os.getenv("MAX_TOKEN_AGE", str(4 * 3600)))  # 4 hours default
+MAX_TOKEN_AGE = int(os.getenv("MAX_TOKEN_AGE", str(4 * 3600)))
 
 
 def passes_market_filters(dex: dict | None) -> tuple[bool, str]:
-    """Check if token passes MCap/Volume/Liquidity/Age filters."""
     if dex is None:
         return False, "no market data"
 
-    # Age filter: skip tokens older than MAX_TOKEN_AGE
     pair_created = dex.get("pair_created_at", 0)
     if pair_created:
-        # pairCreatedAt is in milliseconds
         age_seconds = time.time() - (pair_created / 1000)
         if age_seconds > MAX_TOKEN_AGE:
             age_hours = age_seconds / 3600
             return False, f"too old ({age_hours:.1f}h > {MAX_TOKEN_AGE//3600}h)"
     else:
-        # No creation time available — skip if MCap is suspiciously high
-        # (new tokens rarely launch above $200K, so this is likely an old token)
         mcap_check = float(dex.get("mcap", 0))
         if mcap_check > 200_000:
             return False, f"no creation time + high mcap ${mcap_check:,.0f}, likely old"
@@ -431,12 +460,17 @@ def passes_market_filters(dex: dict | None) -> tuple[bool, str]:
     vol = dex.get("volume_24h", 0)
     liq = dex.get("liquidity", 0)
 
+    # Collect ALL failures, not just the first one
+    failures = []
     if mcap < MIN_MCAP:
-        return False, f"mcap ${mcap:,.0f} < ${MIN_MCAP:,}"
+        failures.append(f"mcap ${mcap:,.0f} < ${MIN_MCAP:,}")
     if vol < MIN_VOLUME_24H:
-        return False, f"vol ${vol:,.0f} < ${MIN_VOLUME_24H:,}"
+        failures.append(f"vol ${vol:,.0f} < ${MIN_VOLUME_24H:,}")
     if liq < MIN_LIQUIDITY:
-        return False, f"liq ${liq:,.0f} < ${MIN_LIQUIDITY:,}"
+        failures.append(f"liq ${liq:,.0f} < ${MIN_LIQUIDITY:,}")
+
+    if failures:
+        return False, ", ".join(failures)
 
     return True, ""
 
@@ -444,13 +478,11 @@ def passes_market_filters(dex: dict | None) -> tuple[bool, str]:
 # ─── Token Research ───────────────────────────────────────────────────────────
 
 async def search_x_mentions(session: aiohttp.ClientSession, ticker: str, token_name: str = "") -> list[dict]:
-    """Search X for $TICKER mentions by notable accounts using SocialData search API."""
     if not SOCIALDATA_API_KEY:
         return []
 
     mentions = []
     try:
-        # Search for $TICKER mentions with engagement, sorted by top/popular
         query = f"${ticker} min_faves:10"
         url = "https://api.socialdata.tools/twitter/search"
         headers = {
@@ -461,15 +493,12 @@ async def search_x_mentions(session: aiohttp.ClientSession, ticker: str, token_n
 
         async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=8)) as resp:
             if resp.status != 200:
-                log.debug(f"X search for ${ticker}: status {resp.status}")
                 return []
             data = await resp.json()
 
-        tweets = data.get("tweets", [])
-        for tweet in tweets[:10]:
+        for tweet in data.get("tweets", [])[:10]:
             user = tweet.get("user", {})
             followers = user.get("followers_count", 0)
-            # Only include tweets from accounts with 10K+ followers
             if followers < 10000:
                 continue
             mentions.append({
@@ -483,9 +512,7 @@ async def search_x_mentions(session: aiohttp.ClientSession, ticker: str, token_n
                 "url": f"https://x.com/{user.get('screen_name', '')}/status/{tweet.get('id_str', '')}",
             })
 
-        # Sort by followers descending
         mentions.sort(key=lambda m: m["followers"], reverse=True)
-
     except Exception as e:
         log.debug(f"X search error for ${ticker}: {e}")
 
@@ -493,10 +520,6 @@ async def search_x_mentions(session: aiohttp.ClientSession, ticker: str, token_n
 
 
 async def resolve_deployer_x(session: aiohttp.ClientSession, address: str) -> dict:
-    """
-    Try to resolve the deployer's X account for a token.
-    Returns dict with: x_username, farcaster_username, source_method, follower_count
-    """
     result = {
         "x_username": "",
         "farcaster_username": "",
@@ -505,10 +528,7 @@ async def resolve_deployer_x(session: aiohttp.ClientSession, address: str) -> di
         "follower_count": None,
     }
 
-    # ── Method 1: Check Clanker /search-creator by token address ──
-    # Clanker tokens have msg_sender wallet — look up via search-creator
     try:
-        # First get the token's page to find the msg_sender
         url = f"https://www.clanker.world/api/tokens?sort=desc&page=1&pageSize=50"
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status == 200:
@@ -518,9 +538,6 @@ async def resolve_deployer_x(session: aiohttp.ClientSession, address: str) -> di
                     token_addr = (token.get("contract_address") or token.get("address") or "").lower()
                     if token_addr == address.lower():
                         msg_sender = token.get("msg_sender", "")
-                        social_ctx = token.get("social_context", {}) or {}
-
-                        # Extract X from socialMediaUrls
                         social_urls = token.get("socialMediaUrls", []) or []
                         if isinstance(social_urls, list):
                             for surl in social_urls:
@@ -533,7 +550,6 @@ async def resolve_deployer_x(session: aiohttp.ClientSession, address: str) -> di
                                             result["source_method"] = "clanker socialMediaUrls"
                                             break
 
-                        # If no X from metadata, try wallet lookup via search-creator
                         if not result["x_username"] and msg_sender:
                             try:
                                 creator_url = f"https://clanker.world/api/search-creator?q={msg_sender}&limit=1"
@@ -544,22 +560,17 @@ async def resolve_deployer_x(session: aiohttp.ClientSession, address: str) -> di
                                         if user:
                                             result["farcaster_username"] = user.get("username", "")
                                             result["farcaster_display"] = user.get("displayName", "")
-                                            # Farcaster verified addresses may include X
-                                            verified = user.get("verifiedAddresses", [])
                                             result["source_method"] = f"clanker search-creator (wallet {msg_sender[:10]}...)"
                             except Exception as e:
                                 log.debug(f"Clanker search-creator error: {e}")
 
-                        # Extract from description
                         if not result["x_username"]:
                             desc = token.get("description", "") or ""
-                            # Check for "automated by @X" / "requested by @X" / "launched by @X"
                             auto_match = re.search(r'(?:automated|requested|launched|created|deployed)\s+by\s+@(\w{1,15})', desc, re.IGNORECASE)
                             if auto_match:
                                 result["x_username"] = auto_match.group(1)
                                 result["source_method"] = "clanker description (automated by)"
                             else:
-                                # Generic @username in description
                                 desc_match = re.search(r'@(\w{1,15})', desc)
                                 if desc_match:
                                     candidate = desc_match.group(1)
@@ -570,9 +581,7 @@ async def resolve_deployer_x(session: aiohttp.ClientSession, address: str) -> di
     except Exception as e:
         log.debug(f"Clanker deployer lookup error: {e}")
 
-    # ── Method 2: Check if Farcaster user has X via SocialData ──
     if not result["x_username"] and result["farcaster_username"]:
-        # Try searching SocialData for the Farcaster username as an X handle
         try:
             fc_user = result["farcaster_username"]
             followers = await get_follower_count(session, fc_user)
@@ -583,10 +592,6 @@ async def resolve_deployer_x(session: aiohttp.ClientSession, address: str) -> di
         except Exception:
             pass
 
-    # ── Method 3: Check Bankr tweetUrl for requester X account ──
-    # (This runs during research if we stored the launch data)
-
-    # ── Get follower count if we found an X username ──
     if result["x_username"] and result["follower_count"] is None:
         result["follower_count"] = await get_follower_count(session, result["x_username"])
 
@@ -594,18 +599,12 @@ async def resolve_deployer_x(session: aiohttp.ClientSession, address: str) -> di
 
 
 async def research_token(session: aiohttp.ClientSession, query: str) -> str:
-    """
-    Research a token by ticker or address.
-    Returns a formatted Telegram HTML report.
-    """
     query = query.strip().lstrip("$").upper()
     if not query:
         return "Usage: /research $TICKER or /research 0x..."
 
     is_address = query.lower().startswith("0x") and len(query) == 42
     ticker = query
-
-    # ── Step 1: Find the token on GeckoTerminal ──
     dex = None
     address = ""
     token_name = ""
@@ -614,7 +613,6 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
         address = query.lower()
         dex = await fetch_geckoterminal(session, address)
         if dex:
-            # Try to get name/symbol from GeckoTerminal
             try:
                 url = f"{GECKOTERMINAL_API_URL}/networks/base/tokens/{address}"
                 headers = {"Accept": "application/json;version=20230302"}
@@ -627,7 +625,6 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
             except Exception:
                 pass
     else:
-        # Search GeckoTerminal by ticker
         try:
             url = f"{GECKOTERMINAL_API_URL}/search/pools?query={ticker}&network=base&page=1"
             headers = {"Accept": "application/json;version=20230302"}
@@ -635,31 +632,21 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
                 if resp.status == 200:
                     data = await resp.json()
                     pools = data.get("data", [])
-
-                    # Score each pool: exact ticker match + highest volume
                     best_pool = None
                     best_score = -1
 
                     for pool in pools:
                         pool_attrs = pool.get("attributes", {})
-                        pool_name = pool_attrs.get("name", "")  # e.g. "VIRTUAL / WETH"
+                        pool_name = pool_attrs.get("name", "")
                         vol_raw = pool_attrs.get("volume_usd") or {}
                         vol_24h = float(vol_raw.get("h24") or 0)
-
                         base_addr = pool.get("relationships", {}).get("base_token", {}).get("data", {}).get("id", "")
                         if base_addr:
                             base_addr = base_addr.replace("base_", "")
                         if not base_addr:
                             continue
-
-                        # Extract base token symbol from pool name (before " / ")
                         base_symbol = pool_name.split(" / ")[0].strip().upper() if " / " in pool_name else ""
-
-                        # Exact ticker match gets a huge bonus
-                        score = vol_24h
-                        if base_symbol == ticker:
-                            score += 1_000_000_000  # exact match priority
-
+                        score = vol_24h + (1_000_000_000 if base_symbol == ticker else 0)
                         if score > best_score:
                             best_score = score
                             best_pool = pool
@@ -671,31 +658,25 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
                         if base_addr:
                             address = base_addr.replace("base_", "")
                         token_name = pool_name.split(" / ")[0].strip() if " / " in pool_name else pool_name
-
         except Exception as e:
             log.debug(f"GeckoTerminal search error: {e}")
 
         if address:
             dex = await fetch_geckoterminal(session, address)
 
-    # ── Step 2: Resolve deployer identity ──
     deployer_info = None
     if address:
         deployer_info = await resolve_deployer_x(session, address)
 
-    # ── Step 3: Search X for $TICKER mentions ──
     x_mentions = await search_x_mentions(session, ticker, token_name)
-
-    # ── Step 4: Check if token was seen by our bot ──
     was_alerted = address.lower() in seen_tokens if address else False
 
-    # ── Build the report ──
     if not dex and not x_mentions:
         return (
             f"🔍 <b>No data found for ${ticker}</b>\n\n"
             f"No market data on Base or notable X mentions.\n"
-            f"Token might be on another chain (Solana, ETH, etc).\n"
-            f"Try the contract address: /research 0x..."
+            f"Token might be on another chain.\n"
+            f"Try: /research 0x..."
         )
 
     safe_name = (token_name or ticker).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
@@ -704,37 +685,27 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
     if address:
         lines.append(f"📋 <code>{address}</code>\n")
 
-    # Market data
     if dex:
         change_1h = dex.get("price_change_1h", 0)
         change_24h = dex.get("price_change_24h", 0)
-        change_1h_emoji = "🟢" if change_1h >= 0 else "🔴"
-        change_24h_emoji = "🟢" if change_24h >= 0 else "🔴"
-
         lines.extend([
             f"📊 <b>Market Data:</b>",
             f"├ 💰 MCap: {fmt_usd(dex['mcap'])}",
             f"├ 💧 Liquidity: {fmt_usd(dex['liquidity'])}",
             f"├ 📈 Volume 24h: {fmt_usd(dex['volume_24h'])}",
             f"├ 💵 Price: ${float(dex.get('price_usd') or 0):.6f}",
-            f"├ {change_1h_emoji} 1h: {change_1h:+.1f}%",
-            f"└ {change_24h_emoji} 24h: {change_24h:+.1f}%",
+            f"├ {'🟢' if change_1h >= 0 else '🔴'} 1h: {change_1h:+.1f}%",
+            f"└ {'🟢' if change_24h >= 0 else '🔴'} 24h: {change_24h:+.1f}%",
             "",
         ])
-
-        # Quick filter check
         passes, reason = passes_market_filters(dex)
-        if passes:
-            lines.append("✅ Passes market filters (MCap/Vol/Liq)\n")
-        else:
-            lines.append(f"❌ Fails filter: {reason}\n")
+        lines.append(("✅ Passes market filters\n") if passes else (f"❌ Fails filter: {reason}\n"))
     else:
-        lines.append("⚠️ No market data found on GeckoTerminal\n")
+        lines.append("⚠️ No market data found\n")
 
     if was_alerted:
         lines.append("👀 Token seen by bot\n")
 
-    # ── Deployer identity section ──
     if deployer_info:
         x_user = deployer_info.get("x_username", "")
         fc_user = deployer_info.get("farcaster_username", "")
@@ -743,7 +714,6 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
         d_followers = deployer_info.get("follower_count")
 
         lines.append("👤 <b>Deployer Identity:</b>")
-
         if x_user:
             f_str = ""
             if d_followers is not None:
@@ -753,13 +723,10 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
                     f_str = f" — <b>{d_followers/1_000:.0f}K followers</b>"
                 else:
                     f_str = f" — {d_followers:,} followers"
-
-                # Flag whales
                 if d_followers >= 10_000:
                     f_str += " 🐋"
                 elif d_followers >= 5_000:
                     f_str += " 🔥"
-
             lines.append(f"├ 𝕏 <a href='https://x.com/{x_user}'>@{x_user}</a>{f_str}")
         else:
             lines.append("├ 𝕏 No X account found")
@@ -768,35 +735,18 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
             display = f" ({fc_display})" if fc_display and fc_display != fc_user else ""
             lines.append(f"├ 🟣 Farcaster: @{fc_user}{display}")
 
-        if method:
-            lines.append(f"└ 🔎 Found via: {method}")
-        else:
-            lines.append(f"└ 🔎 No deployer info in API metadata")
-
+        lines.append(f"└ 🔎 Found via: {method}" if method else "└ 🔎 No deployer info in API metadata")
         lines.append("")
-    else:
-        lines.append("👤 <b>Deployer:</b> Could not resolve\n")
 
-    # X mentions
     if x_mentions:
         lines.append(f"🐦 <b>Notable X mentions (${ticker}):</b>")
         for m in x_mentions:
             f_count = m['followers']
-            if f_count >= 1_000_000:
-                f_str = f"{f_count/1_000_000:.1f}M"
-            elif f_count >= 1_000:
-                f_str = f"{f_count/1_000:.0f}K"
-            else:
-                f_str = str(f_count)
-
-            # Clean up tweet text — remove t.co links, expand preview
-            text_clean = re.sub(r'https?://t\.co/\S+', '', m['text']).strip()
-            text_clean = text_clean.replace('\n', ' ').replace('  ', ' ')
-            # Escape HTML entities to prevent Telegram parse errors
+            f_str = f"{f_count/1_000_000:.1f}M" if f_count >= 1_000_000 else f"{f_count/1_000:.0f}K" if f_count >= 1_000 else str(f_count)
+            text_clean = re.sub(r'https?://t\.co/\S+', '', m['text']).strip().replace('\n', ' ').replace('  ', ' ')
             text_clean = text_clean.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
             if len(text_clean) > 280:
                 text_clean = text_clean[:277] + "..."
-
             lines.extend([
                 f"",
                 f"├ <a href='{m['url']}'>@{m['username']}</a> ({f_str} followers) · {m['date']}",
@@ -807,7 +757,6 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
     else:
         lines.append(f"\n🐦 No notable X mentions found for ${ticker}\n")
 
-    # Links
     if address:
         lines.extend([
             f"🔗 <b>Links:</b>",
@@ -823,7 +772,6 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
 # ─── Bankr API ────────────────────────────────────────────────────────────────
 
 async def fetch_bankr(session: aiohttp.ClientSession) -> list[dict]:
-    """Fetch & normalize launches from Bankr API."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Accept": "application/json",
@@ -845,17 +793,8 @@ async def fetch_bankr(session: aiohttp.ClientSession) -> list[dict]:
             address = (launch.get("tokenAddress") or "").lower()
             if not address:
                 continue
-
             deployer = launch.get("deployer", {}) or {}
             x_username = deployer.get("xUsername", "")
-
-            # Debug: log deployer keys when X is missing but deployer exists
-            if not x_username and deployer:
-                dep_keys = {k: v for k, v in deployer.items() if v}
-                if dep_keys:
-                    sym = launch.get("tokenSymbol", "?")
-                    log.debug(f"  [bankr] ${sym} deployer fields (no xUsername): {dep_keys}")
-
             normalized.append({
                 "source": "bankr",
                 "address": address,
@@ -864,34 +803,28 @@ async def fetch_bankr(session: aiohttp.ClientSession) -> list[dict]:
                 "x_username": x_username or "",
                 "tweet_url": launch.get("tweetUrl", ""),
                 "image_uri": launch.get("imageUri", ""),
-                "created_at": launch.get("createdAt") or launch.get("launchedAt") or launch.get("created_at") or "",
+                "created_at": launch.get("createdAt") or launch.get("launchedAt") or "",
             })
-
     except Exception as e:
         log.error(f"Bankr fetch error: {e}")
-
     return normalized
 
 
 # ─── Clanker API ──────────────────────────────────────────────────────────────
 
 async def fetch_clanker(session: aiohttp.ClientSession) -> list[dict]:
-    """Fetch & normalize launches from Clanker API."""
     normalized = []
     try:
-        # Fetch 2 pages to catch more tokens (API may cap results)
         all_tokens = []
         for page in [1, 2]:
             params = {"sort": "desc", "page": page, "pageSize": 50}
             async with session.get(CLANKER_API_URL, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if resp.status != 200:
-                    log.warning(f"Clanker API returned {resp.status}")
                     break
                 data = await resp.json()
-
             tokens = data.get("data", data if isinstance(data, list) else [])
             all_tokens.extend(tokens)
-            if len(tokens) < 10:  # no more pages
+            if len(tokens) < 10:
                 break
 
         log.info(f"Clanker: {len(all_tokens)} launches fetched")
@@ -929,22 +862,18 @@ async def fetch_clanker(session: aiohttp.ClientSession) -> list[dict]:
                 "x_username": x_username or "",
                 "tweet_url": "",
                 "image_uri": "",
-                "created_at": token.get("created_at") or token.get("createdAt") or token.get("deployedAt") or "",
+                "created_at": token.get("created_at") or token.get("createdAt") or "",
             })
-
     except Exception as e:
         log.error(f"Clanker fetch error: {e}")
-
     return normalized
 
 
 # ─── Virtuals API ─────────────────────────────────────────────────────────────
 
 async def fetch_virtuals(session: aiohttp.ClientSession) -> list[dict]:
-    """Fetch & normalize AI agent launches from Virtuals Protocol API."""
     normalized = []
     try:
-        # Fetch newest sentient agents (status=5), prototypes (status=3), and all others
         for status in [5, 3, 1, 2, 4]:
             params = {
                 "filters[status]": status,
@@ -953,52 +882,34 @@ async def fetch_virtuals(session: aiohttp.ClientSession) -> list[dict]:
                 "pagination[page]": 1,
                 "pagination[pageSize]": 50,
             }
-            async with session.get(
-                VIRTUALS_API_URL, params=params,
-                timeout=aiohttp.ClientTimeout(total=15)
-            ) as resp:
+            async with session.get(VIRTUALS_API_URL, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if resp.status != 200:
-                    log.warning(f"Virtuals API (status={status}) returned {resp.status}")
                     continue
                 data = await resp.json()
 
             agents = data.get("data", [])
             status_labels = {5: "sentient", 3: "prototype", 1: "init", 2: "pending", 4: "bonding"}
-            status_label = status_labels.get(status, f"status-{status}")
-            log.info(f"Virtuals ({status_label}): {len(agents)} agents fetched")
+            log.info(f"Virtuals ({status_labels.get(status, status)}): {len(agents)} agents fetched")
 
             for agent in agents:
                 address = (agent.get("tokenAddress") or "").lower()
                 if not address:
                     continue
 
-                # Extract X username — try both agent socials and creator socials
-                x_username = ""
-
-                # 1) Agent's own verified X
                 agent_socials = agent.get("socials", {}) or {}
                 verified_usernames = agent_socials.get("VERIFIED_USERNAMES", {}) or {}
                 x_username = verified_usernames.get("TWITTER", "")
 
-                # 2) Creator's verified X (fallback)
-                creator_x = ""
                 creator = agent.get("creator", {}) or {}
                 creator_socials = creator.get("socials", {}) or {}
                 creator_verified = creator_socials.get("VERIFIED_USERNAMES", {}) or {}
                 creator_x = creator_verified.get("TWITTER", "")
 
-                # Use agent X if available, else creator X
                 if not x_username:
                     x_username = creator_x
 
-                # Build tweet URL from video pitch if available
-                tweet_url = ""
                 video_pitch = agent_socials.get("VIDEO_PITCH", {}) or {}
-                tweet_url = video_pitch.get("TWEET_URL", "")
-
-                # Get image
                 image = agent.get("image", {}) or {}
-                image_uri = image.get("url", "")
 
                 normalized.append({
                     "source": "virtuals",
@@ -1007,17 +918,15 @@ async def fetch_virtuals(session: aiohttp.ClientSession) -> list[dict]:
                     "symbol": agent.get("symbol", "?"),
                     "x_username": x_username or "",
                     "creator_x": creator_x or "",
-                    "tweet_url": tweet_url,
-                    "image_uri": image_uri,
+                    "tweet_url": video_pitch.get("TWEET_URL", ""),
+                    "image_uri": image.get("url", ""),
                     "virtuals_id": agent.get("id", ""),
                     "holder_count": agent.get("holderCount", 0),
                     "fdv_virtual": agent.get("fdvInVirtual", 0),
                     "liquidity_usd": agent.get("liquidityUsd", 0),
                 })
-
     except Exception as e:
         log.error(f"Virtuals fetch error: {e}")
-
     return normalized
 
 
@@ -1032,32 +941,23 @@ def fmt_usd(val) -> str:
     return f"${val:.0f}"
 
 
-SOURCE_EMOJIS = {
-    "bankr": "🏦",
-    "clanker": "⚙️",
-    "virtuals": "🤖",
-}
+SOURCE_EMOJIS = {"bankr": "🏦", "clanker": "⚙️", "virtuals": "🤖"}
 
 
-def format_signal_telegram(launch: dict, dex: dict | None) -> str:
-    """Format a compact signal message for Telegram (HTML)."""
+def format_signal_telegram(launch: dict, dex: dict | None, executed: bool = False, job_id: str = "") -> str:
     source = launch["source"].upper()
     name = launch["name"]
     symbol = launch["symbol"]
     address = launch["address"]
     x_username = launch.get("x_username", "")
     tweet_url = launch.get("tweet_url", "")
-
     source_emoji = SOURCE_EMOJIS.get(launch["source"], "📡")
 
-    # Market data
     market_lines = ""
     age_line = ""
     if dex:
         change_1h = dex.get("price_change_1h", 0)
         change_emoji = "🟢" if change_1h >= 0 else "🔴"
-
-        # Token age from pair creation
         pair_created = dex.get("pair_created_at", 0)
         if pair_created:
             age_seconds = time.time() - (pair_created / 1000)
@@ -1076,12 +976,10 @@ def format_signal_telegram(launch: dict, dex: dict | None) -> str:
             f"└ {change_emoji} 1h: {change_1h:+.1f}%"
         )
 
-    # Deployer line (if known)
     deployer_line = ""
     if x_username:
         deployer_line = f"👤 Deployer: <a href='https://x.com/{x_username}'>@{x_username}</a>\n"
 
-    # Virtuals extra info
     if launch["source"] == "virtuals":
         creator_x = launch.get("creator_x", "")
         if creator_x and creator_x != x_username:
@@ -1090,7 +988,13 @@ def format_signal_telegram(launch: dict, dex: dict | None) -> str:
         if holders:
             deployer_line += f"👥 Holders: {holders:,}\n"
 
-    # Links
+    # Execution status line
+    execution_line = ""
+    if executed:
+        execution_line = f"\n💸 <b>Auto-bought ${BANKR_BUY_AMOUNT}</b> via Bankr" + (f" (job: <code>{job_id}</code>)" if job_id else "") + "\n"
+    elif AUTO_EXECUTE and not BANKR_EXECUTION_API_KEY:
+        execution_line = "\n⚠️ Auto-execute ON but no API key set\n"
+
     links = [
         f"├ <a href='https://www.geckoterminal.com/base/tokens/{address}'>Gecko</a>",
         f"├ <a href='https://gmgn.ai/base/token/{address}'>GMGN</a>",
@@ -1105,113 +1009,32 @@ def format_signal_telegram(launch: dict, dex: dict | None) -> str:
         links.append(f"├ <a href='{tweet_url}'>📝 Tweet</a>")
     links.append(f"└ <a href='https://app.uniswap.org/swap?chain=base&amp;outputCurrency={address}'>Uniswap</a>")
 
-    msg = (
+    return (
         f"📡 <b>SIGNAL</b> {source_emoji} {source}\n\n"
         f"<b>{name}</b> (${symbol})\n"
         f"{deployer_line}"
-        f"{market_lines}\n\n"
+        f"{market_lines}\n"
+        f"{execution_line}\n"
         f"🔗 " + " · ".join(links) + "\n\n"
         f"<code>{address}</code>\n"
         f"💡 /research {address}"
     )
 
-    return msg
 
-
-
-    """Format a Telegram alert message (HTML)."""
+def format_alert_whatsapp(launch: dict, dex: dict | None, executed: bool = False) -> str:
     source = launch["source"].upper()
     name = launch["name"]
     symbol = launch["symbol"]
     address = launch["address"]
-    x_username = launch["x_username"]
+    x_username = launch.get("x_username", "")
     tweet_url = launch.get("tweet_url", "")
-
     source_emoji = SOURCE_EMOJIS.get(launch["source"], "📡")
 
-    # Extra info for Virtuals
-    virtuals_line = ""
-    if launch["source"] == "virtuals":
-        creator_x = launch.get("creator_x", "")
-        if creator_x and creator_x != x_username:
-            virtuals_line = f"👷 Creator: <a href='https://x.com/{creator_x}'>@{creator_x}</a>\n"
-        holders = launch.get("holder_count", 0)
-        if holders:
-            virtuals_line += f"👥 Holders: {holders:,}\n"
-
-    market_lines = ""
-    if dex:
-        change_1h = dex.get("price_change_1h", 0)
-        change_emoji = "🟢" if change_1h >= 0 else "🔴"
-        market_lines = (
-            f"\n📊 <b>Market Data:</b>\n"
-            f"├ 💰 MCap: {fmt_usd(dex['mcap'])}\n"
-            f"├ 💧 Liq: {fmt_usd(dex['liquidity'])}\n"
-            f"├ 📈 Vol 24h: {fmt_usd(dex['volume_24h'])}\n"
-            f"└ {change_emoji} 1h: {change_1h:+.1f}%\n"
-        )
-
-    links = [
-        f"├ <a href='https://www.geckoterminal.com/base/tokens/{address}'>GeckoTerminal</a>",
-        f"├ <a href='https://basescan.org/token/{address}'>BaseScan</a>",
-        f"├ <a href='https://gmgn.ai/base/token/{address}'>GMGN</a>",
-    ]
-
-    # Source-specific links
-    if launch["source"] == "virtuals":
-        vid = launch.get("virtuals_id", "")
-        if vid:
-            links.append(f"├ <a href='https://app.virtuals.io/virtuals/{vid}'>Virtuals</a>")
-    elif launch["source"] == "clanker":
-        links.append(f"├ <a href='https://www.clanker.world/clanker/{address}'>Clanker</a>")
+    lines = [f"📡 *SIGNAL* {source_emoji} {source}", "", f"*{name}* (${symbol})"]
 
     if x_username:
-        links.append(f"├ <a href='https://x.com/{x_username}'>𝕏 @{x_username}</a>")
-    if tweet_url:
-        links.append(f"├ <a href='{tweet_url}'>📝 Launch Tweet</a>")
-    links.append(f"└ <a href='https://app.uniswap.org/swap?chain=base&amp;outputCurrency={address}'>Uniswap</a>")
+        lines.append(f"👤 Deployer: @{x_username}")
 
-    msg = (
-        f"🐋 <b>WHALE LAUNCH ALERT</b>\n\n"
-        f"<b>{name}</b> (${symbol})\n"
-        f"{source_emoji} Via: <b>{source}</b>\n"
-        f"👤 <a href='https://x.com/{x_username}'>@{x_username}</a> — <b>{follower_count:,}</b> followers\n"
-        f"{virtuals_line}"
-        f"{market_lines}\n"
-        f"🔗 <b>Links:</b>\n" + "\n".join(links) +
-        f"\n\n<code>{address}</code>"
-    )
-
-    return msg
-
-
-def format_alert_whatsapp(launch: dict, follower_count: int, dex: dict | None) -> str:
-    """Format a WhatsApp alert message (plain text with emojis)."""
-    source = launch["source"].upper()
-    name = launch["name"]
-    symbol = launch["symbol"]
-    address = launch["address"]
-    x_username = launch["x_username"]
-    tweet_url = launch.get("tweet_url", "")
-
-    source_emoji = SOURCE_EMOJIS.get(launch["source"], "📡")
-
-    if follower_count >= 1_000_000:
-        f_str = f"{follower_count / 1_000_000:.1f}M"
-    elif follower_count >= 1_000:
-        f_str = f"{follower_count / 1_000:.1f}K"
-    else:
-        f_str = str(follower_count)
-
-    lines = [
-        f"🐋 *WHALE LAUNCH ALERT*",
-        f"",
-        f"*{name}* (${symbol})",
-        f"{source_emoji} Via: *{source}*",
-        f"👤 @{x_username} — *{f_str} followers*",
-    ]
-
-    # Extra info for Virtuals
     if launch["source"] == "virtuals":
         creator_x = launch.get("creator_x", "")
         if creator_x and creator_x != x_username:
@@ -1224,46 +1047,78 @@ def format_alert_whatsapp(launch: dict, follower_count: int, dex: dict | None) -
         change_1h = dex.get("price_change_1h", 0)
         change_emoji = "🟢" if change_1h >= 0 else "🔴"
         lines.extend([
-            f"",
-            f"📊 *Market Data:*",
+            "",
             f"├ 💰 MCap: {fmt_usd(dex['mcap'])}",
+            f"├ 📈 Vol: {fmt_usd(dex['volume_24h'])}",
             f"├ 💧 Liq: {fmt_usd(dex['liquidity'])}",
-            f"├ 📈 Vol 24h: {fmt_usd(dex['volume_24h'])}",
             f"└ {change_emoji} 1h: {change_1h:+.1f}%",
         ])
 
+    if executed:
+        lines.extend(["", f"💸 Auto-bought ${BANKR_BUY_AMOUNT} via Bankr"])
+
     lines.extend([
-        f"",
-        f"🔗 *Links:*",
-        f"├ GeckoTerminal: https://www.geckoterminal.com/base/tokens/{address}",
+        "", "🔗 Links:",
+        f"├ Gecko: https://www.geckoterminal.com/base/tokens/{address}",
         f"├ GMGN: https://gmgn.ai/base/token/{address}",
     ])
-
-    if launch["source"] == "virtuals":
+    if launch["source"] == "clanker":
+        lines.append(f"├ Clanker: https://www.clanker.world/clanker/{address}")
+    elif launch["source"] == "virtuals":
         vid = launch.get("virtuals_id", "")
         if vid:
             lines.append(f"├ Virtuals: https://app.virtuals.io/virtuals/{vid}")
-    elif launch["source"] == "clanker":
-        lines.append(f"├ Clanker: https://www.clanker.world/clanker/{address}")
-
-    lines.append(f"├ X: https://x.com/{x_username}")
-
+    if x_username:
+        lines.append(f"├ X: https://x.com/{x_username}")
     if tweet_url:
         lines.append(f"├ Tweet: {tweet_url}")
-
     lines.extend([
         f"└ Uniswap: https://app.uniswap.org/swap?chain=base&outputCurrency={address}",
-        f"",
-        f"{address}",
+        "", address,
     ])
 
     return "\n".join(lines)
 
 
+# ─── Signal Handler (shared between new tokens and recheck) ──────────────────
+
+async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, source: str, symbol: str, is_recheck: bool = False):
+    """Fire alert + optional auto-execution for a token that passed all filters."""
+    global alert_count
+
+    address = launch["address"]
+    prefix = "RECHECK " if is_recheck else ""
+
+    # Auto-execute first (before alerting so job_id can appear in message)
+    executed = False
+    job_id = ""
+    if AUTO_EXECUTE:
+        result = await execute_bankr_buy(session, address, symbol, source)
+        if isinstance(result, dict):
+            executed = result.get("success", False)
+            job_id = result.get("jobId", "")
+        else:
+            executed = bool(result)
+
+    # Format and send alerts
+    tg_text = format_signal_telegram(launch, dex, executed=executed, job_id=job_id)
+    wa_text = format_alert_whatsapp(launch, dex, executed=executed)
+
+    log.info(
+        f"  📡 {prefix}SIGNAL: [{source}] ${symbol} "
+        f"MCap {fmt_usd(dex['mcap'])} Vol {fmt_usd(dex['volume_24h'])}"
+        f"{f' @{launch.get(\"x_username\",\"\")}' if launch.get('x_username') else ''}"
+        f"{' 💸 EXECUTED' if executed else ''}"
+    )
+
+    await send_alert_all(session, tg_text, wa_text)
+    signaled_tokens.add(address)
+    alert_count += 1
+
+
 # ─── Seeding ──────────────────────────────────────────────────────────────────
 
 async def seed_existing(session: aiohttp.ClientSession):
-    """Fetch existing tokens on startup. Add all to seen, queue recent ones for recheck."""
     log.info("📋 Seeding existing tokens...")
     bankr = await fetch_bankr(session)
     clanker = await fetch_clanker(session)
@@ -1275,25 +1130,20 @@ async def seed_existing(session: aiohttp.ClientSession):
     for launch in all_launches:
         addr = launch["address"]
         seen_tokens.add(addr)
-
-        # Add ALL fetched tokens to recheck queue (covers ~last 4 hours)
-        # The recheck cycle will check market data and signal any that pass.
-        # This avoids duplicate signals on restart since we don't signal here.
-        # Start as no_data=True — will be upgraded to full tracking if data found
         if addr not in recheck_queue and len(recheck_queue) < RECHECK_MAX_QUEUE:
             recheck_queue[addr] = {
                 "launch": launch,
                 "first_seen": time.time(),
-                "last_check": 0,  # force immediate check on first recheck cycle
+                "last_check": 0,
                 "checks": 0,
-                "no_data": True,  # assume no data until proven otherwise
+                "no_data": True,
             }
             queued += 1
 
     log.info(
         f"📋 Seeded {len(seen_tokens)} tokens "
-        f"(Bankr: {len(bankr)}, Clanker: {len(clanker)}, "
-        f"Virtuals: {len(virtuals)}) — {queued} queued for recheck"
+        f"(Bankr: {len(bankr)}, Clanker: {len(clanker)}, Virtuals: {len(virtuals)}) "
+        f"— {queued} queued for recheck"
     )
 
 
@@ -1302,7 +1152,6 @@ async def seed_existing(session: aiohttp.ClientSession):
 async def main():
     global alert_count
 
-    # Validate config
     if not TELEGRAM_BOT_TOKEN:
         log.error("❌ TELEGRAM_BOT_TOKEN not set!")
     if not TELEGRAM_CHAT_ID:
@@ -1317,16 +1166,18 @@ async def main():
     log.info(f"  Min Volume 24h: ${MIN_VOLUME_24H:,}")
     log.info(f"  Min Liquidity : ${MIN_LIQUIDITY:,}")
     log.info(f"  Poll interval : {POLL_INTERVAL}s")
-    log.info(f"  Telegram : {'✅' if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID else '❌'}")
-    log.info(f"  WhatsApp : {'✅' if WHAPI_TOKEN and WHATSAPP_GROUP_ID else '❌'}")
-    log.info(f"  SocialData: {'✅' if SOCIALDATA_API_KEY else '❌'}")
+    log.info(f"  Telegram      : {'✅' if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID else '❌'}")
+    log.info(f"  WhatsApp      : {'✅' if WHAPI_TOKEN and WHATSAPP_GROUP_ID else '❌'}")
+    log.info(f"  SocialData    : {'✅' if SOCIALDATA_API_KEY else '❌'}")
+    log.info(f"  Auto-execute  : {'✅ ON — $' + str(BANKR_BUY_AMOUNT) + '/trade' if AUTO_EXECUTE else '❌ OFF'}")
+    log.info(f"  Bankr Exec Key: {'✅' if BANKR_EXECUTION_API_KEY else '❌ NOT SET'}")
     log.info("=" * 60)
 
     async with aiohttp.ClientSession() as session:
 
-        # ── DexScreener health check ──
+        # DexScreener health check
         try:
-            test_addr = "0x532f27101965dd16442e59d40670faf5ebb142e4"  # BRETT on Base
+            test_addr = "0x532f27101965dd16442e59d40670faf5ebb142e4"
             test_url = f"{DEXSCREENER_API_URL}/token-pairs/v1/base/{test_addr}"
             async with session.get(test_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 test_data = await resp.json()
@@ -1334,44 +1185,54 @@ async def main():
                     p = test_data[0]
                     log.info(f"✅ DexScreener OK — BRETT: ${float(p.get('priceUsd') or 0):.4f}, mcap ${float(p.get('marketCap') or 0):,.0f}")
                 else:
-                    log.warning(f"⚠️ DexScreener returned unexpected format: {type(test_data).__name__}, status {resp.status}")
-                    if isinstance(test_data, dict):
-                        log.warning(f"   Keys: {list(test_data.keys())[:10]}")
+                    log.warning(f"⚠️ DexScreener unexpected format: {type(test_data).__name__}")
         except Exception as e:
             log.error(f"❌ DexScreener health check failed: {e}")
 
-        # Seed existing tokens
+        # Bankr execution health check
+        if AUTO_EXECUTE and BANKR_EXECUTION_API_KEY:
+            log.info("🔍 Verifying Bankr execution API key...")
+            try:
+                async with session.post(
+                    BANKR_AGENT_API_URL,
+                    headers={"Content-Type": "application/json", "X-API-Key": BANKR_EXECUTION_API_KEY},
+                    json={"prompt": "what are my token balances on base?"},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    data = await resp.json()
+                    if resp.status == 202 and data.get("success"):
+                        log.info(f"✅ Bankr execution API OK — jobId: {data.get('jobId', '?')}")
+                    elif resp.status == 403:
+                        log.error("❌ Bankr API key rejected (403) — check bankr.bot/api for Agent API access")
+                    else:
+                        log.warning(f"⚠️ Bankr API check: {resp.status} — {data}")
+            except Exception as e:
+                log.error(f"❌ Bankr execution health check failed: {e}")
+
         await seed_existing(session)
 
-        # Startup message
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            exec_note = f"\n💸 Auto-execute: ON (${BANKR_BUY_AMOUNT}/trade)" if AUTO_EXECUTE else "\n💸 Auto-execute: OFF"
             await send_telegram(
                 session,
                 f"🐋 <b>Whale Alert Bot started</b>\n\n"
                 f"Sources: Bankr + Clanker + Virtuals\n"
                 f"Market data: DexScreener\n"
                 f"Min MCap: ${MIN_MCAP:,} · Vol: ${MIN_VOLUME_24H:,} · Liq: ${MIN_LIQUIDITY:,}\n"
-                f"Blocked: {len(blocked_accounts)} accounts\n"
-                f"Polling every {POLL_INTERVAL}s\n\n"
-                f"📡 Mode: Signal all tokens passing market filters\n"
-                f"🔍 /research 0x... for deep deployer + X analysis\n\n"
+                f"Polling every {POLL_INTERVAL}s"
+                f"{exec_note}\n\n"
                 f"Commands: /research · /block · /unblock · /blocklist · /status",
             )
 
-        # Poll loop
         while True:
             try:
-                # Check for Telegram commands
                 await handle_telegram_commands(session)
 
-                # Fetch from ALL sources
                 bankr_launches = await fetch_bankr(session)
                 clanker_launches = await fetch_clanker(session)
                 virtuals_launches = await fetch_virtuals(session)
-
                 all_launches = bankr_launches + clanker_launches + virtuals_launches
 
-                # Log per-source new vs seen
                 for src_name, src_list in [("bankr", bankr_launches), ("clanker", clanker_launches), ("virtuals", virtuals_launches)]:
                     src_new = sum(1 for l in src_list if l["address"] not in seen_tokens)
                     if src_new == 0 and len(src_list) > 0:
@@ -1382,25 +1243,20 @@ async def main():
 
                 for launch in all_launches:
                     address = launch["address"]
-
                     if address in seen_tokens:
                         continue
 
                     symbol = launch.get("symbol", "?")
                     source = launch.get("source", "?")
 
-                    # ── STEP 1: Market data filter (MCap/Volume/Liquidity) ──
                     dex = await fetch_geckoterminal(session, address)
                     passes, reason = passes_market_filters(dex)
 
                     if not passes:
-                        # Don't recheck tokens that are permanently disqualified
                         if "too old" in reason or "likely old" in reason:
                             seen_tokens.add(address)
                             log.debug(f"  [{source}] ${symbol} — {reason}, skip (permanent)")
                         elif reason == "no market data":
-                            # No pool yet — mark seen so we don't re-fetch every cycle
-                            # Add to recheck queue with short window (3 checks / 15 min)
                             seen_tokens.add(address)
                             if address not in recheck_queue and len(recheck_queue) < RECHECK_MAX_QUEUE:
                                 recheck_queue[address] = {
@@ -1410,9 +1266,8 @@ async def main():
                                     "checks": 1,
                                     "no_data": True,
                                 }
-                            log.debug(f"  [{source}] ${symbol} — no market data, recheck queue (short)")
+                            log.debug(f"  [{source}] ${symbol} — no market data, recheck queue")
                         else:
-                            # Has data but below thresholds — full recheck window
                             seen_tokens.add(address)
                             new_count += 1
                             log.info(f"  [{source}] ${symbol} — {reason}, skip → recheck queue")
@@ -1429,35 +1284,31 @@ async def main():
                     seen_tokens.add(address)
                     new_count += 1
 
-                    # ── STEP 2: Grab deployer X if available (bonus, not required) ──
-                    deployer_x = ""
-                    if source == "virtuals":
-                        deployer_x = launch.get("creator_x", "") or launch.get("x_username", "")
-                    else:
-                        deployer_x = launch.get("x_username", "")
+                    if launch["source"] == "virtuals":
+                        launch["x_username"] = launch.get("creator_x", "") or launch.get("x_username", "")
 
-                    # Store for signal display
-                    launch["x_username"] = deployer_x
-
-                    # ── STEP 3: Signal to Telegram ──
                     if address not in signaled_tokens:
-                        signaled_tokens.add(address)
+                        await send_signal(session, launch, dex, source, symbol, is_recheck=False)
                         signal_count += 1
-                        alert_count += 1
-                        tg_text = format_signal_telegram(launch, dex)
-                        log.info(f"  📡 SIGNAL: [{source}] ${symbol} MCap {fmt_usd(dex['mcap'])} Vol {fmt_usd(dex['volume_24h'])}{f' @{deployer_x}' if deployer_x else ''}")
-                        await send_telegram(session, tg_text)
 
-                # ── RECHECK QUEUE: re-evaluate tokens that failed earlier ──
+                # ── Recheck Queue ──
                 now = time.time()
                 expired = []
                 eligible = []
 
-                # Quick pass: find expired and eligible entries without API calls
+                # Deduplicate the queue (fix for $SIMBA/$NEON double-logging)
+                seen_in_queue = set()
+                for addr in list(recheck_queue.keys()):
+                    if addr in seen_in_queue:
+                        expired.append(addr)
+                    else:
+                        seen_in_queue.add(addr)
+
                 for addr, entry in recheck_queue.items():
+                    if addr in expired:
+                        continue
                     age = now - entry["first_seen"]
                     since_last = now - entry["last_check"]
-
                     is_no_data = entry.get("no_data", False)
                     max_checks = 3 if is_no_data else RECHECK_MAX_CHECKS
                     max_age = 900 if is_no_data else RECHECK_MAX_AGE
@@ -1467,57 +1318,43 @@ async def main():
                     elif since_last >= RECHECK_INTERVAL:
                         eligible.append(addr)
 
-                # Only make API calls for eligible entries
                 for addr in eligible:
                     entry = recheck_queue[addr]
                     launch = entry["launch"]
                     symbol = launch.get("symbol", "?")
                     source = launch.get("source", "?")
 
-                    # Clear cache and re-fetch
                     gecko_cache.pop(addr, None)
                     dex = await fetch_geckoterminal(session, addr)
                     entry["last_check"] = time.time()
                     entry["checks"] += 1
 
-                    # If token was "no data" but now has data, upgrade to full tracking
                     if entry.get("no_data") and dex is not None:
                         entry["no_data"] = False
-                        entry["first_seen"] = time.time()  # reset age for full window
+                        entry["first_seen"] = time.time()
                         entry["checks"] = 1
 
                     passes, reason = passes_market_filters(dex)
                     if not passes:
-                        # If token is permanently disqualified (too old), drop it immediately
                         if "too old" in reason or "likely old" in reason:
-                            log.debug(f"  ♻️ [{source}] ${symbol} — {reason}, dropping from queue")
+                            log.debug(f"  ♻️ [{source}] ${symbol} — {reason}, dropping")
                             expired.append(addr)
                             continue
-                        # Only log tokens that have data (reduce noise from no-data spam)
                         if reason != "no market data":
                             log.info(f"  ♻️ [{source}] ${symbol} recheck #{entry['checks']} — {reason}, still waiting")
                         continue
 
-                    # Passed! Signal it (if not already signaled)
                     if addr in signaled_tokens:
                         log.info(f"  ♻️ [{source}] ${symbol} passed but already signaled, skipping")
                         expired.append(addr)
                         continue
 
-                    deployer_x = ""
-                    if source == "virtuals":
-                        deployer_x = launch.get("creator_x", "") or launch.get("x_username", "")
-                    else:
-                        deployer_x = launch.get("x_username", "")
-                    launch["x_username"] = deployer_x
+                    if launch["source"] == "virtuals":
+                        launch["x_username"] = launch.get("creator_x", "") or launch.get("x_username", "")
 
-                    signaled_tokens.add(addr)
+                    await send_signal(session, launch, dex, source, symbol, is_recheck=True)
                     signal_count += 1
-                    alert_count += 1
-                    tg_text = format_signal_telegram(launch, dex)
-                    log.info(f"  📡 RECHECK SIGNAL: [{source}] ${symbol} MCap {fmt_usd(dex['mcap'])} Vol {fmt_usd(dex['volume_24h'])}{f' @{deployer_x}' if deployer_x else ''}")
-                    await send_telegram(session, tg_text)
-                    expired.append(addr)  # remove from queue after signaling
+                    expired.append(addr)
 
                 for addr in expired:
                     recheck_queue.pop(addr, None)
