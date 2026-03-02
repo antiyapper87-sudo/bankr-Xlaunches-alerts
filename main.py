@@ -1107,8 +1107,8 @@ async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, s
     log.info(
         f"  📡 {prefix}SIGNAL: [{source}] ${symbol} "
         f"MCap {fmt_usd(dex['mcap'])} Vol {fmt_usd(dex['volume_24h'])}"
-        f"{f' @{launch.get(\"x_username\",\"\")}' if launch.get('x_username') else ''}"
-        f"{' 💸 EXECUTED' if executed else ''}"
+        + (f" @{launch.get('x_username')}" if launch.get('x_username') else "")
+        + (" 💸 EXECUTED" if executed else "")
     )
 
     await send_alert_all(session, tg_text, wa_text)
