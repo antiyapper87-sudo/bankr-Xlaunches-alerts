@@ -110,11 +110,6 @@ blocked_accounts: set[str] = load_blocklist()
 # ─── Bankr Auto-Execution ─────────────────────────────────────────────────────
 
 async def execute_bankr_buy(session: aiohttp.ClientSession, token_address: str, symbol: str, source: str) -> bool:
-    """
-    Submit a buy order to Bankr Agent API.
-    Only runs when AUTO_EXECUTE=true and BANKR_EXECUTION_API_KEY is set.
-    Returns True if submitted successfully.
-    """
     global execution_count
 
     if not AUTO_EXECUTE:
@@ -284,7 +279,7 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                 await send_telegram(
                     session,
                     f"📡 <b>Signal Bot</b>\n\n"
-                    f"• Sources: Bankr + Clanker + Virtuals\n"
+                    f"• Sources: Bankr + Clanker + Virtuals + DexScreener\n"
                     f"• Tokens seen: {len(seen_tokens)}\n"
                     f"• Signals sent: {alert_count}\n"
                     f"• Recheck queue: {len(recheck_queue)}\n"
@@ -460,7 +455,6 @@ def passes_market_filters(dex: dict | None) -> tuple[bool, str]:
     vol = dex.get("volume_24h", 0)
     liq = dex.get("liquidity", 0)
 
-    # Collect ALL failures, not just the first one
     failures = []
     if mcap < MIN_MCAP:
         failures.append(f"mcap ${mcap:,.0f} < ${MIN_MCAP:,}")
@@ -473,6 +467,91 @@ def passes_market_filters(dex: dict | None) -> tuple[bool, str]:
         return False, ", ".join(failures)
 
     return True, ""
+
+
+# ─── DexScreener New Pairs Feed ───────────────────────────────────────────────
+# Catches all launchpads not covered by Bankr/Clanker/Virtuals (e.g. ApeStore,
+# direct deploys). Dedup with other sources is automatic via seen_tokens.
+
+NATIVE_SOURCE_LABELS = {"bankr", "clanker", "virtuals"}
+
+async def fetch_dexscreener_new_pairs(session: aiohttp.ClientSession) -> list[dict]:
+    normalized = []
+    try:
+        url = f"{DEXSCREENER_API_URL}/token-pairs/v1/base/latest"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status == 429:
+                log.warning("DexScreener new pairs: rate limited")
+                return []
+            if resp.status != 200:
+                log.warning(f"DexScreener new pairs: HTTP {resp.status}")
+                return []
+            raw = await resp.json()
+
+        pairs = raw if isinstance(raw, list) else raw.get("pairs", [])
+        new_count = skipped_seen = skipped_native = 0
+
+        for pair in pairs:
+            base_token = pair.get("baseToken") or {}
+            address = (base_token.get("address") or "").lower()
+            if not address:
+                continue
+
+            # Dedup — already tracked by another source
+            if address in seen_tokens:
+                skipped_seen += 1
+                continue
+
+            # Skip if from a natively monitored launchpad
+            dex_id = (pair.get("dexId") or "").lower()
+            labels = [l.lower() for l in (pair.get("labels") or [])]
+            is_native = any(src in dex_id for src in NATIVE_SOURCE_LABELS)
+            if not is_native:
+                is_native = any(src in label for label in labels for src in NATIVE_SOURCE_LABELS)
+            if is_native:
+                skipped_native += 1
+                continue
+
+            # Age filter
+            pair_created_at = pair.get("pairCreatedAt", 0)
+            if pair_created_at and time.time() - (pair_created_at / 1000) > MAX_TOKEN_AGE:
+                continue
+
+            pair_url = pair.get("url", f"https://dexscreener.com/base/{address}")
+            pc = pair.get("priceChange") or {}
+
+            normalized.append({
+                "source": "dexscreener",
+                "address": address,
+                "name": base_token.get("name", "Unknown"),
+                "symbol": base_token.get("symbol", "?"),
+                "x_username": "",
+                "tweet_url": "",
+                "image_uri": "",
+                "created_at": "",
+                "dex_id": dex_id,
+                "pair_url": pair_url,
+                # Pre-filled market data — no extra API call needed per token
+                "_dex": {
+                    "mcap": float(pair.get("marketCap") or pair.get("fdv") or 0),
+                    "volume_24h": float((pair.get("volume") or {}).get("h24") or 0),
+                    "liquidity": float((pair.get("liquidity") or {}).get("usd") or 0),
+                    "price_usd": pair.get("priceUsd", "0"),
+                    "price_change_1h": float(pc.get("h1") or 0),
+                    "price_change_24h": float(pc.get("h24") or 0),
+                    "pair_url": pair_url,
+                    "pair_created_at": pair_created_at,
+                },
+            })
+            new_count += 1
+
+        log.info(
+            f"DexScreener new pairs: {len(pairs)} total, {new_count} new, "
+            f"{skipped_seen} already seen, {skipped_native} native skipped"
+        )
+    except Exception as e:
+        log.error(f"DexScreener new pairs error: {e}")
+    return normalized
 
 
 # ─── Token Research ───────────────────────────────────────────────────────────
@@ -941,7 +1020,7 @@ def fmt_usd(val) -> str:
     return f"${val:.0f}"
 
 
-SOURCE_EMOJIS = {"bankr": "🏦", "clanker": "⚙️", "virtuals": "🤖"}
+SOURCE_EMOJIS = {"bankr": "🏦", "clanker": "⚙️", "virtuals": "🤖", "dexscreener": "📊"}
 
 
 def format_signal_telegram(launch: dict, dex: dict | None, executed: bool = False, job_id: str = "") -> str:
@@ -988,7 +1067,10 @@ def format_signal_telegram(launch: dict, dex: dict | None, executed: bool = Fals
         if holders:
             deployer_line += f"👥 Holders: {holders:,}\n"
 
-    # Execution status line
+    if launch["source"] == "dexscreener":
+        dex_id = launch.get("dex_id", "")
+        deployer_line += f"🏭 Via: {dex_id.title() if dex_id else 'Unknown DEX'}\n"
+
     execution_line = ""
     if executed:
         execution_line = f"\n💸 <b>Auto-bought ${BANKR_BUY_AMOUNT}</b> via Bankr" + (f" (job: <code>{job_id}</code>)" if job_id else "") + "\n"
@@ -1005,6 +1087,10 @@ def format_signal_telegram(launch: dict, dex: dict | None, executed: bool = Fals
         vid = launch.get("virtuals_id", "")
         if vid:
             links.append(f"├ <a href='https://app.virtuals.io/virtuals/{vid}'>Virtuals</a>")
+    elif launch["source"] == "dexscreener":
+        pair_url = launch.get("pair_url", "")
+        if pair_url:
+            links.append(f"├ <a href='{pair_url}'>Chart</a>")
     if tweet_url:
         links.append(f"├ <a href='{tweet_url}'>📝 Tweet</a>")
     links.append(f"└ <a href='https://app.uniswap.org/swap?chain=base&amp;outputCurrency={address}'>Uniswap</a>")
@@ -1043,6 +1129,10 @@ def format_alert_whatsapp(launch: dict, dex: dict | None, executed: bool = False
         if holders:
             lines.append(f"👥 Holders: {holders:,}")
 
+    if launch["source"] == "dexscreener":
+        dex_id = launch.get("dex_id", "")
+        lines.append(f"🏭 Via: {dex_id.title() if dex_id else 'Unknown DEX'}")
+
     if dex:
         change_1h = dex.get("price_change_1h", 0)
         change_emoji = "🟢" if change_1h >= 0 else "🔴"
@@ -1068,6 +1158,10 @@ def format_alert_whatsapp(launch: dict, dex: dict | None, executed: bool = False
         vid = launch.get("virtuals_id", "")
         if vid:
             lines.append(f"├ Virtuals: https://app.virtuals.io/virtuals/{vid}")
+    elif launch["source"] == "dexscreener":
+        pair_url = launch.get("pair_url", "")
+        if pair_url:
+            lines.append(f"├ Chart: {pair_url}")
     if x_username:
         lines.append(f"├ X: https://x.com/{x_username}")
     if tweet_url:
@@ -1083,13 +1177,11 @@ def format_alert_whatsapp(launch: dict, dex: dict | None, executed: bool = False
 # ─── Signal Handler (shared between new tokens and recheck) ──────────────────
 
 async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, source: str, symbol: str, is_recheck: bool = False):
-    """Fire alert + optional auto-execution for a token that passed all filters."""
     global alert_count
 
     address = launch["address"]
     prefix = "RECHECK " if is_recheck else ""
 
-    # Auto-execute first (before alerting so job_id can appear in message)
     executed = False
     job_id = ""
     if AUTO_EXECUTE:
@@ -1100,7 +1192,6 @@ async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, s
         else:
             executed = bool(result)
 
-    # Format and send alerts
     tg_text = format_signal_telegram(launch, dex, executed=executed, job_id=job_id)
     wa_text = format_alert_whatsapp(launch, dex, executed=executed)
 
@@ -1160,7 +1251,7 @@ async def main():
         log.error("❌ SOCIALDATA_API_KEY not set!")
 
     log.info("=" * 60)
-    log.info("  🐋 Whale Alert Bot (Bankr + Clanker + Virtuals)")
+    log.info("  🐋 Whale Alert Bot (Bankr + Clanker + Virtuals + DexScreener)")
     log.info(f"  Min followers : {MIN_FOLLOWERS:,}")
     log.info(f"  Min MCap      : ${MIN_MCAP:,}")
     log.info(f"  Min Volume 24h: ${MIN_VOLUME_24H:,}")
@@ -1216,7 +1307,7 @@ async def main():
             await send_telegram(
                 session,
                 f"🐋 <b>Whale Alert Bot started</b>\n\n"
-                f"Sources: Bankr + Clanker + Virtuals\n"
+                f"Sources: Bankr + Clanker + Virtuals + DexScreener All Pairs\n"
                 f"Market data: DexScreener\n"
                 f"Min MCap: ${MIN_MCAP:,} · Vol: ${MIN_VOLUME_24H:,} · Liq: ${MIN_LIQUIDITY:,}\n"
                 f"Polling every {POLL_INTERVAL}s"
@@ -1231,7 +1322,8 @@ async def main():
                 bankr_launches = await fetch_bankr(session)
                 clanker_launches = await fetch_clanker(session)
                 virtuals_launches = await fetch_virtuals(session)
-                all_launches = bankr_launches + clanker_launches + virtuals_launches
+                dexscreener_launches = await fetch_dexscreener_new_pairs(session)
+                all_launches = bankr_launches + clanker_launches + virtuals_launches + dexscreener_launches
 
                 for src_name, src_list in [("bankr", bankr_launches), ("clanker", clanker_launches), ("virtuals", virtuals_launches)]:
                     src_new = sum(1 for l in src_list if l["address"] not in seen_tokens)
@@ -1249,7 +1341,12 @@ async def main():
                     symbol = launch.get("symbol", "?")
                     source = launch.get("source", "?")
 
-                    dex = await fetch_geckoterminal(session, address)
+                    # DexScreener tokens have pre-filled market data — use it directly
+                    if source == "dexscreener" and launch.get("_dex"):
+                        dex = launch["_dex"]
+                    else:
+                        dex = await fetch_geckoterminal(session, address)
+
                     passes, reason = passes_market_filters(dex)
 
                     if not passes:
@@ -1296,7 +1393,6 @@ async def main():
                 expired = []
                 eligible = []
 
-                # Deduplicate the queue (fix for $SIMBA/$NEON double-logging)
                 seen_in_queue = set()
                 for addr in list(recheck_queue.keys()):
                     if addr in seen_in_queue:
