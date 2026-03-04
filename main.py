@@ -1,11 +1,12 @@
 """
-Whale Alert Bot — Bankr + Clanker + Virtuals
+Whale Alert Bot — Bankr + Clanker + Virtuals + DexScreener
 ========================================================
-Monitors FOUR sources for new token launches on Base:
+Monitors FIVE sources for new token launches on Base:
   1. Bankr API   — https://api.bankr.bot/token-launches
   2. Clanker API  — https://www.clanker.world/api/tokens
   3. Virtuals API — https://api2.virtuals.io/api/virtuals  (AI agent launches)
   4. DexScreener — market data (MCap, Volume, Liquidity)
+  5. DexScreener — catch-all via profiles/boosts/search (ApeStore, direct deploys)
 
 When a token passes market filters → alerts to Telegram + WhatsApp.
 Auto-execution via Bankr Agent API when AUTO_EXECUTE=true.
@@ -37,9 +38,9 @@ MIN_LIQUIDITY = int(os.getenv("MIN_LIQUIDITY", "30000"))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
 
 # ─── Bankr Execution Config ───────────────────────────────────────────────────
-BANKR_EXECUTION_API_KEY = os.getenv("BANKR_EXECUTION_API_KEY", "")  # separate from monitoring API
-BANKR_BUY_AMOUNT = int(os.getenv("BANKR_BUY_AMOUNT", "100"))        # USD amount per trade
-AUTO_EXECUTE = os.getenv("AUTO_EXECUTE", "false").lower() == "true"  # safety kill switch
+BANKR_EXECUTION_API_KEY = os.getenv("BANKR_EXECUTION_API_KEY", "")
+BANKR_BUY_AMOUNT = int(os.getenv("BANKR_BUY_AMOUNT", "100"))
+AUTO_EXECUTE = os.getenv("AUTO_EXECUTE", "false").lower() == "true"
 
 BANKR_API_URL = "https://api.bankr.bot/token-launches"
 BANKR_AGENT_API_URL = "https://api.bankr.bot/agent/prompt"
@@ -415,6 +416,9 @@ async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str
         liquidity = float((best.get("liquidity") or {}).get("usd") or 0)
         price_change = best.get("priceChange") or {}
 
+        # Extract token name/symbol from pair data
+        base_token = best.get("baseToken") or {}
+
         result = {
             "mcap": mcap,
             "volume_24h": vol_24h,
@@ -424,6 +428,9 @@ async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str
             "price_change_24h": float(price_change.get("h24") or 0),
             "pair_url": best.get("url", f"https://dexscreener.com/base/{token_address}"),
             "pair_created_at": best.get("pairCreatedAt", 0),
+            "token_name": base_token.get("name", ""),
+            "token_symbol": base_token.get("symbol", ""),
+            "dex_id": best.get("dexId", ""),
         }
         gecko_cache[token_address] = (time.time(), result)
         return result
@@ -469,88 +476,115 @@ def passes_market_filters(dex: dict | None) -> tuple[bool, str]:
     return True, ""
 
 
-# ─── DexScreener New Pairs Feed ───────────────────────────────────────────────
-# Catches all launchpads not covered by Bankr/Clanker/Virtuals (e.g. ApeStore,
-# direct deploys). Dedup with other sources is automatic via seen_tokens.
+# ─── DexScreener Catch-All Feed ───────────────────────────────────────────────
+# Catches launchpads not covered by Bankr/Clanker/Virtuals (e.g. ApeStore,
+# direct deploys). Uses WORKING DexScreener endpoints:
+#   - /token-profiles/latest/v1  (tokens with new profiles)
+#   - /token-boosts/latest/v1    (boosted tokens)
+#   - /latest/dex/search?q=...   (search for new Base pairs)
 
 NATIVE_SOURCE_LABELS = {"bankr", "clanker", "virtuals"}
 
 async def fetch_dexscreener_new_pairs(session: aiohttp.ClientSession) -> list[dict]:
+    """Catch tokens from launchpads not covered by Bankr/Clanker/Virtuals."""
     normalized = []
+    found_addresses = set()
+
     try:
-        url = f"{DEXSCREENER_API_URL}/token-pairs/v1/base/latest"
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            if resp.status == 429:
-                log.warning("DexScreener new pairs: rate limited")
-                return []
-            if resp.status != 200:
-                log.warning(f"DexScreener new pairs: HTTP {resp.status}")
-                return []
-            raw = await resp.json()
+        # Method 1: Latest token profiles (tokens that recently set up profiles on DexScreener)
+        try:
+            url = f"{DEXSCREENER_API_URL}/token-profiles/latest/v1"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    profiles = await resp.json()
+                    if isinstance(profiles, list):
+                        for p in profiles:
+                            if (p.get("chainId") or "").lower() == "base":
+                                addr = (p.get("tokenAddress") or "").lower()
+                                if addr and addr not in seen_tokens:
+                                    found_addresses.add(addr)
+        except Exception as e:
+            log.debug(f"DexScreener profiles error: {e}")
 
-        pairs = raw if isinstance(raw, list) else raw.get("pairs", [])
-        new_count = skipped_seen = skipped_native = 0
+        # Method 2: Latest boosted tokens on Base
+        try:
+            url = f"{DEXSCREENER_API_URL}/token-boosts/latest/v1"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    boosts = await resp.json()
+                    if isinstance(boosts, list):
+                        for b in boosts:
+                            if (b.get("chainId") or "").lower() == "base":
+                                addr = (b.get("tokenAddress") or "").lower()
+                                if addr and addr not in seen_tokens:
+                                    found_addresses.add(addr)
+        except Exception as e:
+            log.debug(f"DexScreener boosts error: {e}")
 
-        for pair in pairs:
-            base_token = pair.get("baseToken") or {}
-            address = (base_token.get("address") or "").lower()
-            if not address:
-                continue
+        # Method 3: Search for new Base pairs (broad search)
+        try:
+            url = f"{DEXSCREENER_API_URL}/latest/dex/search"
+            params = {"q": "base new"}
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    pairs = data.get("pairs") or []
+                    for pair in pairs:
+                        if (pair.get("chainId") or "").lower() != "base":
+                            continue
+                        base_token = pair.get("baseToken") or {}
+                        addr = (base_token.get("address") or "").lower()
+                        if addr and addr not in seen_tokens:
+                            found_addresses.add(addr)
+        except Exception as e:
+            log.debug(f"DexScreener search error: {e}")
 
-            # Dedup — already tracked by another source
+        # Now fetch market data for discovered tokens
+        new_count = skipped_seen = 0
+        for address in found_addresses:
             if address in seen_tokens:
                 skipped_seen += 1
                 continue
 
-            # Skip if from a natively monitored launchpad
-            dex_id = (pair.get("dexId") or "").lower()
-            labels = [l.lower() for l in (pair.get("labels") or [])]
-            is_native = any(src in dex_id for src in NATIVE_SOURCE_LABELS)
-            if not is_native:
-                is_native = any(src in label for label in labels for src in NATIVE_SOURCE_LABELS)
-            if is_native:
-                skipped_native += 1
+            dex = await fetch_geckoterminal(session, address)
+            if not dex:
                 continue
 
             # Age filter
-            pair_created_at = pair.get("pairCreatedAt", 0)
+            pair_created_at = dex.get("pair_created_at", 0)
             if pair_created_at and time.time() - (pair_created_at / 1000) > MAX_TOKEN_AGE:
                 continue
 
-            pair_url = pair.get("url", f"https://dexscreener.com/base/{address}")
-            pc = pair.get("priceChange") or {}
+            # Skip if from a natively monitored launchpad
+            dex_id = (dex.get("dex_id") or "").lower()
+            if any(src in dex_id for src in NATIVE_SOURCE_LABELS):
+                continue
+
+            pair_url = dex.get("pair_url", f"https://dexscreener.com/base/{address}")
+            token_name = dex.get("token_name", "Unknown")
+            token_symbol = dex.get("token_symbol", "?")
 
             normalized.append({
                 "source": "dexscreener",
                 "address": address,
-                "name": base_token.get("name", "Unknown"),
-                "symbol": base_token.get("symbol", "?"),
+                "name": token_name,
+                "symbol": token_symbol,
                 "x_username": "",
                 "tweet_url": "",
                 "image_uri": "",
                 "created_at": "",
                 "dex_id": dex_id,
                 "pair_url": pair_url,
-                # Pre-filled market data — no extra API call needed per token
-                "_dex": {
-                    "mcap": float(pair.get("marketCap") or pair.get("fdv") or 0),
-                    "volume_24h": float((pair.get("volume") or {}).get("h24") or 0),
-                    "liquidity": float((pair.get("liquidity") or {}).get("usd") or 0),
-                    "price_usd": pair.get("priceUsd", "0"),
-                    "price_change_1h": float(pc.get("h1") or 0),
-                    "price_change_24h": float(pc.get("h24") or 0),
-                    "pair_url": pair_url,
-                    "pair_created_at": pair_created_at,
-                },
+                "_dex": dex,
             })
             new_count += 1
 
         log.info(
-            f"DexScreener new pairs: {len(pairs)} total, {new_count} new, "
-            f"{skipped_seen} already seen, {skipped_native} native skipped"
+            f"DexScreener catch-all: {len(found_addresses)} Base tokens found, {new_count} new, "
+            f"{skipped_seen} already seen"
         )
     except Exception as e:
-        log.error(f"DexScreener new pairs error: {e}")
+        log.error(f"DexScreener catch-all error: {e}")
     return normalized
 
 
@@ -1307,7 +1341,7 @@ async def main():
             await send_telegram(
                 session,
                 f"🐋 <b>Whale Alert Bot started</b>\n\n"
-                f"Sources: Bankr + Clanker + Virtuals + DexScreener All Pairs\n"
+                f"Sources: Bankr + Clanker + Virtuals + DexScreener Catch-All\n"
                 f"Market data: DexScreener\n"
                 f"Min MCap: ${MIN_MCAP:,} · Vol: ${MIN_VOLUME_24H:,} · Liq: ${MIN_LIQUIDITY:,}\n"
                 f"Polling every {POLL_INTERVAL}s"
@@ -1332,6 +1366,7 @@ async def main():
 
                 new_count = 0
                 signal_count = 0
+                no_data_count = 0
 
                 for launch in all_launches:
                     address = launch["address"]
@@ -1355,6 +1390,7 @@ async def main():
                             log.debug(f"  [{source}] ${symbol} — {reason}, skip (permanent)")
                         elif reason == "no market data":
                             seen_tokens.add(address)
+                            no_data_count += 1
                             if address not in recheck_queue and len(recheck_queue) < RECHECK_MAX_QUEUE:
                                 recheck_queue[address] = {
                                     "launch": launch,
@@ -1363,7 +1399,7 @@ async def main():
                                     "checks": 1,
                                     "no_data": True,
                                 }
-                            log.debug(f"  [{source}] ${symbol} — no market data, recheck queue")
+                            log.debug(f"  [{source}] ${symbol} — no market data, recheck queue (short)")
                         else:
                             seen_tokens.add(address)
                             new_count += 1
@@ -1393,21 +1429,13 @@ async def main():
                 expired = []
                 eligible = []
 
-                seen_in_queue = set()
-                for addr in list(recheck_queue.keys()):
-                    if addr in seen_in_queue:
-                        expired.append(addr)
-                    else:
-                        seen_in_queue.add(addr)
-
+                # Quick pass: find expired and eligible without API calls
                 for addr, entry in recheck_queue.items():
-                    if addr in expired:
-                        continue
                     age = now - entry["first_seen"]
                     since_last = now - entry["last_check"]
                     is_no_data = entry.get("no_data", False)
-                    max_checks = 3 if is_no_data else RECHECK_MAX_CHECKS
-                    max_age = 900 if is_no_data else RECHECK_MAX_AGE
+                    max_checks = 6 if is_no_data else RECHECK_MAX_CHECKS     # 6 vs 12
+                    max_age = 1800 if is_no_data else RECHECK_MAX_AGE        # 30 min vs 60 min
 
                     if age > max_age or entry["checks"] >= max_checks:
                         expired.append(addr)
@@ -1425,6 +1453,7 @@ async def main():
                     entry["last_check"] = time.time()
                     entry["checks"] += 1
 
+                    # Upgrade: if was no_data but now has data, give full recheck window
                     if entry.get("no_data") and dex is not None:
                         entry["no_data"] = False
                         entry["first_seen"] = time.time()
@@ -1452,11 +1481,23 @@ async def main():
                     signal_count += 1
                     expired.append(addr)
 
-                for addr in expired:
-                    recheck_queue.pop(addr, None)
+                # Log expired tokens before removing
+                if expired:
+                    dropped_names = []
+                    for addr in expired:
+                        entry = recheck_queue.get(addr)
+                        if entry:
+                            sym = entry["launch"].get("symbol", "?")
+                            src = entry["launch"].get("source", "?")
+                            nd = "nd" if entry.get("no_data") else "d"
+                            dropped_names.append(f"${sym}[{src}/{nd}]")
+                        recheck_queue.pop(addr, None)
+                    if dropped_names:
+                        log.info(f"  🗑️ Recheck expired ({len(dropped_names)}): {', '.join(dropped_names[:10])}{'...' if len(dropped_names) > 10 else ''}")
 
                 recheck_log = f", {len(recheck_queue)} in recheck queue" if recheck_queue else ""
-                log.info(f"🔍 {new_count} new launches processed, {signal_count} signals sent{recheck_log}")
+                no_data_log = f", {no_data_count} no-data queued" if no_data_count else ""
+                log.info(f"🔍 {new_count} new launches processed, {signal_count} signals sent{no_data_log}{recheck_log}")
 
             except Exception as e:
                 log.error(f"Poll loop error: {e}", exc_info=True)
