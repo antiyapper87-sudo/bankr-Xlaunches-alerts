@@ -476,115 +476,150 @@ def passes_market_filters(dex: dict | None) -> tuple[bool, str]:
     return True, ""
 
 
-# ─── DexScreener Catch-All Feed ───────────────────────────────────────────────
-# Catches launchpads not covered by Bankr/Clanker/Virtuals (e.g. ApeStore,
-# direct deploys). Uses WORKING DexScreener endpoints:
-#   - /token-profiles/latest/v1  (tokens with new profiles)
-#   - /token-boosts/latest/v1    (boosted tokens)
-#   - /latest/dex/search?q=...   (search for new Base pairs)
+# ─── GeckoTerminal New Pools Catch-All ─────────────────────────────────────────
+# Catches ALL new pools on Base regardless of launchpad (ApeStore, direct
+# deploys, etc). Uses GeckoTerminal /networks/base/new_pools which is
+# the API behind https://www.geckoterminal.com/explore/new-crypto-pools/base
+# Free tier: 30 req/min. We use ~2/min (pages 1-2 every 30s cycle).
+# Returns pools sorted newest-first with full market data included.
 
-NATIVE_SOURCE_LABELS = {"bankr", "clanker", "virtuals"}
+GECKO_NEW_POOLS_URL = f"{GECKOTERMINAL_API_URL}/networks/base/new_pools"
 
 async def fetch_dexscreener_new_pairs(session: aiohttp.ClientSession) -> list[dict]:
-    """Catch tokens from launchpads not covered by Bankr/Clanker/Virtuals."""
+    """Catch new Base pools from ALL launchpads via GeckoTerminal new_pools."""
     normalized = []
-    found_addresses = set()
-
     try:
-        # Method 1: Latest token profiles (tokens that recently set up profiles on DexScreener)
-        try:
-            url = f"{DEXSCREENER_API_URL}/token-profiles/latest/v1"
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    profiles = await resp.json()
-                    if isinstance(profiles, list):
-                        for p in profiles:
-                            if (p.get("chainId") or "").lower() == "base":
-                                addr = (p.get("tokenAddress") or "").lower()
-                                if addr and addr not in seen_tokens:
-                                    found_addresses.add(addr)
-        except Exception as e:
-            log.debug(f"DexScreener profiles error: {e}")
+        headers = {"Accept": "application/json;version=20230302"}
+        all_pools = []
 
-        # Method 2: Latest boosted tokens on Base
-        try:
-            url = f"{DEXSCREENER_API_URL}/token-boosts/latest/v1"
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    boosts = await resp.json()
-                    if isinstance(boosts, list):
-                        for b in boosts:
-                            if (b.get("chainId") or "").lower() == "base":
-                                addr = (b.get("tokenAddress") or "").lower()
-                                if addr and addr not in seen_tokens:
-                                    found_addresses.add(addr)
-        except Exception as e:
-            log.debug(f"DexScreener boosts error: {e}")
+        # Fetch 2 pages (40 pools) to catch more launches
+        for page in [1, 2]:
+            params = {
+                "include": "base_token,dex",
+                "page": page,
+            }
+            async with session.get(
+                GECKO_NEW_POOLS_URL, headers=headers, params=params,
+                timeout=aiohttp.ClientTimeout(total=12),
+            ) as resp:
+                if resp.status == 429:
+                    log.warning("GeckoTerminal new_pools: rate limited")
+                    break
+                if resp.status != 200:
+                    log.warning(f"GeckoTerminal new_pools: HTTP {resp.status}")
+                    break
+                data = await resp.json()
 
-        # Method 3: Search for new Base pairs (broad search)
-        try:
-            url = f"{DEXSCREENER_API_URL}/latest/dex/search"
-            params = {"q": "base new"}
-            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    pairs = data.get("pairs") or []
-                    for pair in pairs:
-                        if (pair.get("chainId") or "").lower() != "base":
-                            continue
-                        base_token = pair.get("baseToken") or {}
-                        addr = (base_token.get("address") or "").lower()
-                        if addr and addr not in seen_tokens:
-                            found_addresses.add(addr)
-        except Exception as e:
-            log.debug(f"DexScreener search error: {e}")
+            pools = data.get("data", [])
+            all_pools.extend(pools)
+            if len(pools) < 20:
+                break
 
-        # Now fetch market data for discovered tokens
-        new_count = skipped_seen = 0
-        for address in found_addresses:
+        # Build lookup for included base_token data
+        included = data.get("included", []) if all_pools else []
+        token_info: dict[str, dict] = {}
+        for inc in included:
+            if inc.get("type") == "token":
+                inc_id = inc.get("id", "")  # e.g. "base_0x1234..."
+                attrs = inc.get("attributes", {})
+                token_info[inc_id] = {
+                    "name": attrs.get("name", "Unknown"),
+                    "symbol": attrs.get("symbol", "?"),
+                    "image_url": attrs.get("image_url", ""),
+                }
+
+        new_count = skipped_seen = skipped_old = 0
+
+        for pool in all_pools:
+            attrs = pool.get("attributes", {})
+            pool_name = attrs.get("name", "")  # e.g. "DEUS / WETH"
+
+            # Extract base token address from relationships
+            rels = pool.get("relationships", {})
+            base_token_data = rels.get("base_token", {}).get("data", {})
+            base_token_id = base_token_data.get("id", "")  # e.g. "base_0x637b..."
+            address = base_token_id.replace("base_", "").lower() if base_token_id.startswith("base_") else ""
+
+            if not address:
+                continue
+
+            # Dedup — already tracked by another source
             if address in seen_tokens:
                 skipped_seen += 1
                 continue
 
-            dex = await fetch_geckoterminal(session, address)
-            if not dex:
-                continue
-
             # Age filter
-            pair_created_at = dex.get("pair_created_at", 0)
-            if pair_created_at and time.time() - (pair_created_at / 1000) > MAX_TOKEN_AGE:
-                continue
+            pool_created = attrs.get("pool_created_at", "")
+            if pool_created:
+                try:
+                    created_dt = datetime.fromisoformat(pool_created.replace("Z", "+00:00"))
+                    age_seconds = (datetime.now(timezone.utc) - created_dt).total_seconds()
+                    if age_seconds > MAX_TOKEN_AGE:
+                        skipped_old += 1
+                        continue
+                except (ValueError, TypeError):
+                    pass
 
-            # Skip if from a natively monitored launchpad
-            dex_id = (dex.get("dex_id") or "").lower()
-            if any(src in dex_id for src in NATIVE_SOURCE_LABELS):
-                continue
+            # Get token name/symbol from included data or pool name
+            info = token_info.get(base_token_id, {})
+            token_name = info.get("name") or (pool_name.split(" / ")[0].strip() if " / " in pool_name else "Unknown")
+            token_symbol = info.get("symbol") or "?"
 
-            pair_url = dex.get("pair_url", f"https://dexscreener.com/base/{address}")
-            token_name = dex.get("token_name", "Unknown")
-            token_symbol = dex.get("token_symbol", "?")
+            # Extract market data directly from pool attributes (no extra API call!)
+            vol_raw = attrs.get("volume_usd") or {}
+            pc_raw = attrs.get("price_change_percentage") or {}
+
+            mcap = float(attrs.get("fdv_usd") or 0)
+            vol_24h = float(vol_raw.get("h24") or 0)
+            liquidity = float(attrs.get("reserve_in_usd") or 0)
+            price_usd = attrs.get("base_token_price_usd") or "0"
+
+            # Convert pool_created_at to epoch ms for consistency
+            pair_created_ms = 0
+            if pool_created:
+                try:
+                    created_dt = datetime.fromisoformat(pool_created.replace("Z", "+00:00"))
+                    pair_created_ms = int(created_dt.timestamp() * 1000)
+                except (ValueError, TypeError):
+                    pass
+
+            # Get DEX info from relationships
+            dex_data = rels.get("dex", {}).get("data", {})
+            dex_id = (dex_data.get("id") or "").lower()
+
+            pair_url = f"https://www.geckoterminal.com/base/pools/{attrs.get('address', address)}"
 
             normalized.append({
-                "source": "dexscreener",
+                "source": "dexscreener",  # keep source name for signal formatting compatibility
                 "address": address,
                 "name": token_name,
                 "symbol": token_symbol,
                 "x_username": "",
                 "tweet_url": "",
-                "image_uri": "",
-                "created_at": "",
+                "image_uri": info.get("image_url", ""),
+                "created_at": pool_created,
                 "dex_id": dex_id,
                 "pair_url": pair_url,
-                "_dex": dex,
+                # Pre-filled market data — no extra API call needed
+                "_dex": {
+                    "mcap": mcap,
+                    "volume_24h": vol_24h,
+                    "liquidity": liquidity,
+                    "price_usd": price_usd,
+                    "price_change_1h": float(pc_raw.get("h1") or 0),
+                    "price_change_24h": float(pc_raw.get("h24") or 0),
+                    "pair_url": pair_url,
+                    "pair_created_at": pair_created_ms,
+                },
             })
             new_count += 1
 
         log.info(
-            f"DexScreener catch-all: {len(found_addresses)} Base tokens found, {new_count} new, "
-            f"{skipped_seen} already seen"
+            f"GeckoTerminal new pools: {len(all_pools)} total, {new_count} new, "
+            f"{skipped_seen} already seen, {skipped_old} too old"
         )
     except Exception as e:
-        log.error(f"DexScreener catch-all error: {e}")
+        log.error(f"GeckoTerminal new pools error: {e}")
     return normalized
 
 
