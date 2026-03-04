@@ -75,7 +75,7 @@ execution_count: int = 0
 RECHECK_MAX_AGE = 3600
 RECHECK_INTERVAL = 300
 RECHECK_MAX_CHECKS = 12
-RECHECK_MAX_QUEUE = 200
+RECHECK_MAX_QUEUE = 300
 recheck_queue: dict[str, dict] = {}
 
 # ─── Blocklist ────────────────────────────────────────────────────────────────
@@ -476,153 +476,6 @@ def passes_market_filters(dex: dict | None) -> tuple[bool, str]:
     return True, ""
 
 
-# ─── GeckoTerminal New Pools Catch-All ─────────────────────────────────────────
-# Catches ALL new pools on Base regardless of launchpad (ApeStore, direct
-# deploys, etc). Uses GeckoTerminal /networks/base/new_pools which is
-# the API behind https://www.geckoterminal.com/explore/new-crypto-pools/base
-# Free tier: 30 req/min. We use ~2/min (pages 1-2 every 30s cycle).
-# Returns pools sorted newest-first with full market data included.
-
-GECKO_NEW_POOLS_URL = f"{GECKOTERMINAL_API_URL}/networks/base/new_pools"
-
-async def fetch_dexscreener_new_pairs(session: aiohttp.ClientSession) -> list[dict]:
-    """Catch new Base pools from ALL launchpads via GeckoTerminal new_pools."""
-    normalized = []
-    try:
-        headers = {"Accept": "application/json;version=20230302"}
-        all_pools = []
-
-        # Fetch 2 pages (40 pools) to catch more launches
-        for page in [1, 2]:
-            params = {
-                "include": "base_token,dex",
-                "page": page,
-            }
-            async with session.get(
-                GECKO_NEW_POOLS_URL, headers=headers, params=params,
-                timeout=aiohttp.ClientTimeout(total=12),
-            ) as resp:
-                if resp.status == 429:
-                    log.warning("GeckoTerminal new_pools: rate limited")
-                    break
-                if resp.status != 200:
-                    log.warning(f"GeckoTerminal new_pools: HTTP {resp.status}")
-                    break
-                data = await resp.json()
-
-            pools = data.get("data", [])
-            all_pools.extend(pools)
-            if len(pools) < 20:
-                break
-
-        # Build lookup for included base_token data
-        included = data.get("included", []) if all_pools else []
-        token_info: dict[str, dict] = {}
-        for inc in included:
-            if inc.get("type") == "token":
-                inc_id = inc.get("id", "")  # e.g. "base_0x1234..."
-                attrs = inc.get("attributes", {})
-                token_info[inc_id] = {
-                    "name": attrs.get("name", "Unknown"),
-                    "symbol": attrs.get("symbol", "?"),
-                    "image_url": attrs.get("image_url", ""),
-                }
-
-        new_count = skipped_seen = skipped_old = 0
-
-        for pool in all_pools:
-            attrs = pool.get("attributes", {})
-            pool_name = attrs.get("name", "")  # e.g. "DEUS / WETH"
-
-            # Extract base token address from relationships
-            rels = pool.get("relationships", {})
-            base_token_data = rels.get("base_token", {}).get("data", {})
-            base_token_id = base_token_data.get("id", "")  # e.g. "base_0x637b..."
-            address = base_token_id.replace("base_", "").lower() if base_token_id.startswith("base_") else ""
-
-            if not address:
-                continue
-
-            # Dedup — already tracked by another source
-            if address in seen_tokens:
-                skipped_seen += 1
-                continue
-
-            # Age filter
-            pool_created = attrs.get("pool_created_at", "")
-            if pool_created:
-                try:
-                    created_dt = datetime.fromisoformat(pool_created.replace("Z", "+00:00"))
-                    age_seconds = (datetime.now(timezone.utc) - created_dt).total_seconds()
-                    if age_seconds > MAX_TOKEN_AGE:
-                        skipped_old += 1
-                        continue
-                except (ValueError, TypeError):
-                    pass
-
-            # Get token name/symbol from included data or pool name
-            info = token_info.get(base_token_id, {})
-            token_name = info.get("name") or (pool_name.split(" / ")[0].strip() if " / " in pool_name else "Unknown")
-            token_symbol = info.get("symbol") or "?"
-
-            # Extract market data directly from pool attributes (no extra API call!)
-            vol_raw = attrs.get("volume_usd") or {}
-            pc_raw = attrs.get("price_change_percentage") or {}
-
-            mcap = float(attrs.get("fdv_usd") or 0)
-            vol_24h = float(vol_raw.get("h24") or 0)
-            liquidity = float(attrs.get("reserve_in_usd") or 0)
-            price_usd = attrs.get("base_token_price_usd") or "0"
-
-            # Convert pool_created_at to epoch ms for consistency
-            pair_created_ms = 0
-            if pool_created:
-                try:
-                    created_dt = datetime.fromisoformat(pool_created.replace("Z", "+00:00"))
-                    pair_created_ms = int(created_dt.timestamp() * 1000)
-                except (ValueError, TypeError):
-                    pass
-
-            # Get DEX info from relationships
-            dex_data = rels.get("dex", {}).get("data", {})
-            dex_id = (dex_data.get("id") or "").lower()
-
-            pair_url = f"https://www.geckoterminal.com/base/pools/{attrs.get('address', address)}"
-
-            normalized.append({
-                "source": "dexscreener",  # keep source name for signal formatting compatibility
-                "address": address,
-                "name": token_name,
-                "symbol": token_symbol,
-                "x_username": "",
-                "tweet_url": "",
-                "image_uri": info.get("image_url", ""),
-                "created_at": pool_created,
-                "dex_id": dex_id,
-                "pair_url": pair_url,
-                # Pre-filled market data — no extra API call needed
-                "_dex": {
-                    "mcap": mcap,
-                    "volume_24h": vol_24h,
-                    "liquidity": liquidity,
-                    "price_usd": price_usd,
-                    "price_change_1h": float(pc_raw.get("h1") or 0),
-                    "price_change_24h": float(pc_raw.get("h24") or 0),
-                    "pair_url": pair_url,
-                    "pair_created_at": pair_created_ms,
-                },
-            })
-            new_count += 1
-
-        log.info(
-            f"GeckoTerminal new pools: {len(all_pools)} total, {new_count} new, "
-            f"{skipped_seen} already seen, {skipped_old} too old"
-        )
-    except Exception as e:
-        log.error(f"GeckoTerminal new pools error: {e}")
-    return normalized
-
-
 # ─── Token Research ───────────────────────────────────────────────────────────
 
 async def search_x_mentions(session: aiohttp.ClientSession, ticker: str, token_name: str = "") -> list[dict]:
@@ -928,16 +781,28 @@ async def fetch_bankr(session: aiohttp.ClientSession) -> list[dict]:
     }
     normalized = []
     try:
-        async with session.get(BANKR_API_URL, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            if resp.status != 200:
-                log.warning(f"Bankr API returned {resp.status}")
-                return []
-            data = await resp.json()
+        all_launches = []
+        # Try fetching multiple pages (50 per page) to catch more launches
+        # including ClawLaunch tokens which deploy through Bankr
+        for page_offset in [0, 50, 100]:
+            params = {"offset": page_offset, "limit": 50}
+            async with session.get(BANKR_API_URL, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    if page_offset == 0:
+                        log.warning(f"Bankr API returned {resp.status}")
+                        return []
+                    break
+                data = await resp.json()
 
-        launches = data.get("launches", data if isinstance(data, list) else [])
-        log.info(f"Bankr: {len(launches)} launches fetched")
+            launches = data.get("launches", data if isinstance(data, list) else [])
+            all_launches.extend(launches)
+            # If we got fewer than 50, no more pages
+            if len(launches) < 50:
+                break
 
-        for launch in launches:
+        log.info(f"Bankr: {len(all_launches)} launches fetched")
+
+        for launch in all_launches:
             address = (launch.get("tokenAddress") or "").lower()
             if not address:
                 continue
@@ -1391,8 +1256,7 @@ async def main():
                 bankr_launches = await fetch_bankr(session)
                 clanker_launches = await fetch_clanker(session)
                 virtuals_launches = await fetch_virtuals(session)
-                dexscreener_launches = await fetch_dexscreener_new_pairs(session)
-                all_launches = bankr_launches + clanker_launches + virtuals_launches + dexscreener_launches
+                all_launches = bankr_launches + clanker_launches + virtuals_launches
 
                 for src_name, src_list in [("bankr", bankr_launches), ("clanker", clanker_launches), ("virtuals", virtuals_launches)]:
                     src_new = sum(1 for l in src_list if l["address"] not in seen_tokens)
@@ -1474,6 +1338,9 @@ async def main():
 
                     if age > max_age or entry["checks"] >= max_checks:
                         expired.append(addr)
+                    # Smart eviction: if we checked 2+ times and mcap is tiny, it's dead weight
+                    elif entry["checks"] >= 2 and entry.get("last_mcap", 0) < 1000:
+                        expired.append(addr)
                     elif since_last >= RECHECK_INTERVAL:
                         eligible.append(addr)
 
@@ -1487,6 +1354,9 @@ async def main():
                     dex = await fetch_geckoterminal(session, addr)
                     entry["last_check"] = time.time()
                     entry["checks"] += 1
+                    # Track mcap for smart eviction (kick dead tokens with <$1K mcap after 2 checks)
+                    if dex:
+                        entry["last_mcap"] = dex.get("mcap", 0)
 
                     # Upgrade: if was no_data but now has data, give full recheck window
                     if entry.get("no_data") and dex is not None:
