@@ -487,8 +487,31 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                 else:
                     await send_telegram(session, "No accounts blocked.", chat_id)
 
-            elif text.lower().startswith("/status"):
-                exec_status = f"✅ ON (${BANKR_BUY_AMOUNT}/trade)" if AUTO_EXECUTE else "❌ OFF"
+            elif text.lower().startswith("/test"):
+                test_launch = {
+                    "source": "bankr",
+                    "address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "name": "Test Token",
+                    "symbol": "TEST",
+                    "x_username": "testuser",
+                    "tweet_url": "",
+                    "image_uri": "",
+                }
+                test_dex = {
+                    "mcap": 98500,
+                    "volume_24h": 74000,
+                    "liquidity": 45200,
+                    "price_usd": "0.000098",
+                    "price_change_1h": 12.4,
+                    "price_change_24h": 34.1,
+                    "pair_url": "https://dexscreener.com/base/test",
+                    "pair_created_at": int(time.time() - 180) * 1000,
+                }
+                _address_map["0x1234567890abcdef"] = "0x1234567890abcdef1234567890abcdef12345678"
+                await send_signal(session, test_launch, test_dex, "bankr", "TEST")
+                await send_telegram(session, "✅ Test signal sent", chat_id=chat_id)
+
+            elif text.lower().startswith("/status"):                exec_status = f"✅ ON (${BANKR_BUY_AMOUNT}/trade)" if AUTO_EXECUTE else "❌ OFF"
                 trade_status = "✅ ON" if TRADING_ENABLED else "❌ OFF"
                 await send_telegram(
                     session,
