@@ -297,6 +297,13 @@ async def send_alert_all(session: aiohttp.ClientSession, tg_text: str, wa_text: 
 
 async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: dict):
     """Handle buy/sell button presses from Telegram inline keyboard."""
+    # ── Restrict to authorized user only ──
+    TRADER_USER_ID = os.getenv("TRADER_USER_ID", "")
+    user_id = str(callback_query.get("from", {}).get("id", ""))
+    if TRADER_USER_ID and user_id != TRADER_USER_ID:
+        await answer_callback_query(session, callback_query["id"], "⛔ Not authorized", show_alert=True)
+        return
+
     if not TRADING_ENABLED:
         await answer_callback_query(session, callback_query["id"], "⚠️ Trading not enabled. Set TRADING_ENABLED=true", show_alert=True)
         return
