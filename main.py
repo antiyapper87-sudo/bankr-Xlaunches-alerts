@@ -9,6 +9,7 @@ Monitors FIVE sources for new token launches on Base:
   5. DexScreener — catch-all via profiles/boosts/search (ApeStore, direct deploys)
 
 When a token passes market filters → alerts to Telegram + WhatsApp.
+Telegram signals include inline buy/sell buttons (20% / 50% / 100%).
 Auto-execution via Bankr Agent API when AUTO_EXECUTE=true.
 
 Deploy: GitHub + Railway
@@ -41,6 +42,11 @@ POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
 BANKR_EXECUTION_API_KEY = os.getenv("BANKR_EXECUTION_API_KEY", "")
 BANKR_BUY_AMOUNT = int(os.getenv("BANKR_BUY_AMOUNT", "100"))
 AUTO_EXECUTE = os.getenv("AUTO_EXECUTE", "false").lower() == "true"
+
+# ─── Trader Config ────────────────────────────────────────────────────────────
+TRADING_ENABLED = os.getenv("TRADING_ENABLED", "false").lower() == "true"
+ALCHEMY_RPC_URL = os.getenv("ALCHEMY_RPC_URL", "")
+PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
 
 BANKR_API_URL = "https://api.bankr.bot/token-launches"
 BANKR_AGENT_API_URL = "https://api.bankr.bot/agent/prompt"
@@ -157,7 +163,8 @@ async def execute_bankr_buy(session: aiohttp.ClientSession, token_address: str, 
 
 # ─── Telegram ─────────────────────────────────────────────────────────────────
 
-async def send_telegram(session: aiohttp.ClientSession, text: str, chat_id: str = "") -> bool:
+async def send_telegram(session: aiohttp.ClientSession, text: str, chat_id: str = "", reply_markup: dict = None) -> bool | int:
+    """Send a Telegram message. Returns message_id on success, False on failure."""
     target = chat_id or TELEGRAM_CHAT_ID
     if not TELEGRAM_BOT_TOKEN or not target:
         return False
@@ -168,10 +175,13 @@ async def send_telegram(session: aiohttp.ClientSession, text: str, chat_id: str 
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     try:
         async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status == 200:
-                return True
+                data = await resp.json()
+                return data.get("result", {}).get("message_id", True)
             else:
                 body = await resp.text()
                 log.error(f"Telegram error {resp.status} (chat {target}): {body[:200]}")
@@ -179,6 +189,74 @@ async def send_telegram(session: aiohttp.ClientSession, text: str, chat_id: str 
     except Exception as e:
         log.error(f"Telegram send failed: {e}")
         return False
+
+
+async def edit_telegram_message(session: aiohttp.ClientSession, chat_id: str, message_id: int, text: str, reply_markup: dict = None) -> bool:
+    """Edit an existing Telegram message."""
+    if not TELEGRAM_BOT_TOKEN:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    try:
+        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            return resp.status == 200
+    except Exception as e:
+        log.error(f"Telegram edit failed: {e}")
+        return False
+
+
+async def answer_callback_query(session: aiohttp.ClientSession, callback_query_id: str, text: str = "", show_alert: bool = False) -> bool:
+    """Acknowledge a Telegram callback query (removes loading spinner)."""
+    if not TELEGRAM_BOT_TOKEN:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
+    payload = {
+        "callback_query_id": callback_query_id,
+        "text": text,
+        "show_alert": show_alert,
+    }
+    try:
+        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            return resp.status == 200
+    except Exception as e:
+        log.error(f"answerCallbackQuery failed: {e}")
+        return False
+
+
+# ─── Inline Keyboard Builder ──────────────────────────────────────────────────
+
+def build_trade_keyboard(token_address: str, symbol: str) -> dict:
+    """
+    Build inline keyboard with buy/sell buttons.
+    Callback data format: "buy:20:0xADDRESS:SYMBOL" or "sell:50:0xADDRESS:SYMBOL"
+    """
+    addr = token_address[:20]  # truncate to stay within 64-byte callback limit
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🟢 BUY 20%",  "callback_data": f"buy:20:{addr}"},
+                {"text": "🟢 BUY 50%",  "callback_data": f"buy:50:{addr}"},
+                {"text": "🟢 BUY 100%", "callback_data": f"buy:100:{addr}"},
+            ],
+            [
+                {"text": "🔴 SELL 20%",  "callback_data": f"sell:20:{addr}"},
+                {"text": "🔴 SELL 50%",  "callback_data": f"sell:50:{addr}"},
+                {"text": "🔴 SELL 100%", "callback_data": f"sell:100:{addr}"},
+            ],
+        ]
+    }
+
+
+# Store full address lookup: truncated_addr -> full_address
+_address_map: dict[str, str] = {}
 
 
 # ─── WhatsApp via Whapi ───────────────────────────────────────────────────────
@@ -206,11 +284,90 @@ async def send_whatsapp(session: aiohttp.ClientSession, text: str) -> bool:
         return False
 
 
-async def send_alert_all(session: aiohttp.ClientSession, tg_text: str, wa_text: str):
+async def send_alert_all(session: aiohttp.ClientSession, tg_text: str, wa_text: str, token_address: str = "", symbol: str = ""):
+    """Send alert to Telegram (with inline buttons) and WhatsApp."""
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        await send_telegram(session, tg_text)
+        keyboard = build_trade_keyboard(token_address, symbol) if token_address else None
+        await send_telegram(session, tg_text, reply_markup=keyboard)
     if WHAPI_TOKEN and WHATSAPP_GROUP_ID:
         await send_whatsapp(session, wa_text)
+
+
+# ─── Trade Callback Handler ───────────────────────────────────────────────────
+
+async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: dict):
+    """Handle buy/sell button presses from Telegram inline keyboard."""
+    if not TRADING_ENABLED:
+        await answer_callback_query(session, callback_query["id"], "⚠️ Trading not enabled. Set TRADING_ENABLED=true", show_alert=True)
+        return
+
+    callback_id = callback_query["id"]
+    data = callback_query.get("data", "")
+    chat_id = str(callback_query.get("message", {}).get("chat", {}).get("id", ""))
+    message_id = callback_query.get("message", {}).get("message_id")
+    user = callback_query.get("from", {})
+    username = user.get("username", user.get("first_name", "unknown"))
+
+    parts = data.split(":")
+    if len(parts) != 3:
+        await answer_callback_query(session, callback_id, "Invalid callback data")
+        return
+
+    action, percent_str, addr_truncated = parts
+    percent = int(percent_str)
+
+    # Resolve full address from map
+    full_address = _address_map.get(addr_truncated)
+    if not full_address:
+        await answer_callback_query(session, callback_id, "⚠️ Token address not found — signal too old?", show_alert=True)
+        return
+
+    # Acknowledge immediately (removes spinner)
+    await answer_callback_query(session, callback_id, f"⏳ Executing {action.upper()} {percent}%...")
+
+    log.info(f"  🎯 [{username}] {action.upper()} {percent}% → {full_address[:12]}...")
+
+    try:
+        from trader import buy_token, sell_token, get_eth_balance, get_token_balance
+
+        if action == "buy":
+            eth_bal = await get_eth_balance()
+            result = await buy_token(full_address, percent)
+        else:
+            result = await sell_token(full_address, percent)
+
+        if result["success"]:
+            tx_hash = result["tx_hash"]
+            basescan_url = f"https://basescan.org/tx/{tx_hash}"
+
+            if action == "buy":
+                amount_eth = result.get("amount_eth", 0)
+                confirm_text = (
+                    f"✅ <b>BUY executed</b> — {percent}% ({amount_eth:.4f} ETH)\n"
+                    f"🔗 <a href='{basescan_url}'>View on BaseScan</a>"
+                )
+            else:
+                amount_tokens = result.get("amount_tokens", 0)
+                confirm_text = (
+                    f"✅ <b>SELL executed</b> — {percent}% ({amount_tokens:.2f} tokens)\n"
+                    f"🔗 <a href='{basescan_url}'>View on BaseScan</a>"
+                )
+
+            await send_telegram(session, confirm_text, chat_id=chat_id)
+            log.info(f"  ✅ Trade confirmed: {tx_hash}")
+
+        else:
+            error = result.get("error", "Unknown error")
+            await send_telegram(
+                session,
+                f"❌ <b>Trade failed</b> — {action.upper()} {percent}%\n<code>{error[:200]}</code>",
+                chat_id=chat_id,
+            )
+            log.error(f"  ❌ Trade failed: {error}")
+
+    except Exception as e:
+        log.error(f"handle_trade_callback error: {e}")
+        await send_telegram(session, f"❌ Trade error: {str(e)[:150]}", chat_id=chat_id)
 
 
 # ─── Telegram Command Handler ─────────────────────────────────────────────────
@@ -236,6 +393,12 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
 
         for update in updates:
             last_update_id = update["update_id"]
+
+            # ── Handle inline button callbacks ──
+            if "callback_query" in update:
+                await handle_trade_callback(session, update["callback_query"])
+                continue
+
             msg = update.get("message", {})
             text = msg.get("text", "").strip()
             chat_id = str(msg.get("chat", {}).get("id", ""))
@@ -277,6 +440,7 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
 
             elif text.lower().startswith("/status"):
                 exec_status = f"✅ ON (${BANKR_BUY_AMOUNT}/trade)" if AUTO_EXECUTE else "❌ OFF"
+                trade_status = "✅ ON" if TRADING_ENABLED else "❌ OFF"
                 await send_telegram(
                     session,
                     f"📡 <b>Signal Bot</b>\n\n"
@@ -290,9 +454,30 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                     f"• Min Liquidity: ${MIN_LIQUIDITY:,}\n"
                     f"• Poll interval: {POLL_INTERVAL}s\n"
                     f"• Auto-execute: {exec_status}\n"
-                    f"• Executions: {execution_count}",
+                    f"• Executions: {execution_count}\n"
+                    f"• Inline trading: {trade_status}",
                     chat_id,
                 )
+
+            elif text.lower().startswith("/wallet"):
+                if not TRADING_ENABLED:
+                    await send_telegram(session, "⚠️ Trading not enabled.", chat_id)
+                    continue
+                try:
+                    from trader import get_eth_balance, get_web3, get_wallet
+                    w3 = get_web3()
+                    account = get_wallet(w3)
+                    eth_bal = await get_eth_balance(w3)
+                    await send_telegram(
+                        session,
+                        f"💼 <b>Bot Wallet</b>\n\n"
+                        f"<code>{account.address}</code>\n"
+                        f"💎 ETH: <b>{eth_bal:.4f}</b>\n"
+                        f"🔗 <a href='https://basescan.org/address/{account.address}'>BaseScan</a>",
+                        chat_id,
+                    )
+                except Exception as e:
+                    await send_telegram(session, f"❌ Wallet error: {e}", chat_id)
 
             elif text.lower().startswith("/research") or text.lower().startswith("/r "):
                 parts = text.split(maxsplit=1)
@@ -416,7 +601,6 @@ async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str
         liquidity = float((best.get("liquidity") or {}).get("usd") or 0)
         price_change = best.get("priceChange") or {}
 
-        # Extract token name/symbol from pair data
         base_token = best.get("baseToken") or {}
 
         result = {
@@ -782,8 +966,6 @@ async def fetch_bankr(session: aiohttp.ClientSession) -> list[dict]:
     normalized = []
     try:
         all_launches = []
-        # Try fetching multiple pages (50 per page) to catch more launches
-        # including ClawLaunch tokens which deploy through Bankr
         for page_offset in [0, 50, 100]:
             params = {"offset": page_offset, "limit": 50}
             async with session.get(BANKR_API_URL, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
@@ -796,7 +978,6 @@ async def fetch_bankr(session: aiohttp.ClientSession) -> list[dict]:
 
             launches = data.get("launches", data if isinstance(data, list) else [])
             all_launches.extend(launches)
-            # If we got fewer than 50, no more pages
             if len(launches) < 50:
                 break
 
@@ -1108,13 +1289,17 @@ def format_alert_whatsapp(launch: dict, dex: dict | None, executed: bool = False
     return "\n".join(lines)
 
 
-# ─── Signal Handler (shared between new tokens and recheck) ──────────────────
+# ─── Signal Handler ───────────────────────────────────────────────────────────
 
 async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, source: str, symbol: str, is_recheck: bool = False):
     global alert_count
 
     address = launch["address"]
     prefix = "RECHECK " if is_recheck else ""
+
+    # Register full address in map for callback resolution
+    addr_truncated = address[:20]
+    _address_map[addr_truncated] = address
 
     executed = False
     job_id = ""
@@ -1136,7 +1321,8 @@ async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, s
         + (" 💸 EXECUTED" if executed else "")
     )
 
-    await send_alert_all(session, tg_text, wa_text)
+    # Send Telegram with inline buttons, WhatsApp as plain text
+    await send_alert_all(session, tg_text, wa_text, token_address=address, symbol=symbol)
     signaled_tokens.add(address)
     alert_count += 1
 
@@ -1195,6 +1381,7 @@ async def main():
     log.info(f"  WhatsApp      : {'✅' if WHAPI_TOKEN and WHATSAPP_GROUP_ID else '❌'}")
     log.info(f"  SocialData    : {'✅' if SOCIALDATA_API_KEY else '❌'}")
     log.info(f"  Auto-execute  : {'✅ ON — $' + str(BANKR_BUY_AMOUNT) + '/trade' if AUTO_EXECUTE else '❌ OFF'}")
+    log.info(f"  Inline trading: {'✅ ON' if TRADING_ENABLED else '❌ OFF (set TRADING_ENABLED=true)'}")
     log.info(f"  Bankr Exec Key: {'✅' if BANKR_EXECUTION_API_KEY else '❌ NOT SET'}")
     log.info("=" * 60)
 
@@ -1236,17 +1423,19 @@ async def main():
 
         await seed_existing(session)
 
+        trade_note = "\n💸 Inline trading: ✅ ON — tap buttons on signals to buy/sell" if TRADING_ENABLED else "\n💸 Inline trading: ❌ OFF"
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
             exec_note = f"\n💸 Auto-execute: ON (${BANKR_BUY_AMOUNT}/trade)" if AUTO_EXECUTE else "\n💸 Auto-execute: OFF"
             await send_telegram(
                 session,
                 f"🐋 <b>Whale Alert Bot started</b>\n\n"
-                f"Sources: Bankr + Clanker + Virtuals + DexScreener Catch-All\n"
+                f"Sources: Bankr + Clanker + Virtuals + DexScreener\n"
                 f"Market data: DexScreener\n"
                 f"Min MCap: ${MIN_MCAP:,} · Vol: ${MIN_VOLUME_24H:,} · Liq: ${MIN_LIQUIDITY:,}\n"
                 f"Polling every {POLL_INTERVAL}s"
-                f"{exec_note}\n\n"
-                f"Commands: /research · /block · /unblock · /blocklist · /status",
+                f"{exec_note}"
+                f"{trade_note}\n\n"
+                f"Commands: /research · /block · /unblock · /blocklist · /status · /wallet",
             )
 
         while True:
@@ -1275,7 +1464,6 @@ async def main():
                     symbol = launch.get("symbol", "?")
                     source = launch.get("source", "?")
 
-                    # DexScreener tokens have pre-filled market data — use it directly
                     if source == "dexscreener" and launch.get("_dex"):
                         dex = launch["_dex"]
                     else:
@@ -1328,17 +1516,15 @@ async def main():
                 expired = []
                 eligible = []
 
-                # Quick pass: find expired and eligible without API calls
                 for addr, entry in recheck_queue.items():
                     age = now - entry["first_seen"]
                     since_last = now - entry["last_check"]
                     is_no_data = entry.get("no_data", False)
-                    max_checks = 6 if is_no_data else RECHECK_MAX_CHECKS     # 6 vs 12
-                    max_age = 1800 if is_no_data else RECHECK_MAX_AGE        # 30 min vs 60 min
+                    max_checks = 6 if is_no_data else RECHECK_MAX_CHECKS
+                    max_age = 1800 if is_no_data else RECHECK_MAX_AGE
 
                     if age > max_age or entry["checks"] >= max_checks:
                         expired.append(addr)
-                    # Smart eviction: if we checked 2+ times and mcap is tiny, it's dead weight
                     elif entry["checks"] >= 2 and entry.get("last_mcap", 0) < 1000:
                         expired.append(addr)
                     elif since_last >= RECHECK_INTERVAL:
@@ -1354,11 +1540,9 @@ async def main():
                     dex = await fetch_geckoterminal(session, addr)
                     entry["last_check"] = time.time()
                     entry["checks"] += 1
-                    # Track mcap for smart eviction (kick dead tokens with <$1K mcap after 2 checks)
                     if dex:
                         entry["last_mcap"] = dex.get("mcap", 0)
 
-                    # Upgrade: if was no_data but now has data, give full recheck window
                     if entry.get("no_data") and dex is not None:
                         entry["no_data"] = False
                         entry["first_seen"] = time.time()
@@ -1386,7 +1570,6 @@ async def main():
                     signal_count += 1
                     expired.append(addr)
 
-                # Log expired tokens before removing
                 if expired:
                     dropped_names = []
                     for addr in expired:
