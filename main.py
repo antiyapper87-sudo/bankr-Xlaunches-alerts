@@ -511,7 +511,8 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                 await send_signal(session, test_launch, test_dex, "bankr", "TEST")
                 await send_telegram(session, "✅ Test signal sent", chat_id=chat_id)
 
-            elif text.lower().startswith("/status"):                exec_status = f"✅ ON (${BANKR_BUY_AMOUNT}/trade)" if AUTO_EXECUTE else "❌ OFF"
+            elif text.lower().startswith("/status"):
+                exec_status = f"✅ ON (${BANKR_BUY_AMOUNT}/trade)" if AUTO_EXECUTE else "❌ OFF"
                 trade_status = "✅ ON" if TRADING_ENABLED else "❌ OFF"
                 await send_telegram(
                     session,
