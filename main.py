@@ -235,10 +235,12 @@ async def answer_callback_query(session: aiohttp.ClientSession, callback_query_i
 
 def build_trade_keyboard(token_address: str, symbol: str) -> dict:
     """
-    Build inline keyboard with buy/sell buttons.
-    Callback data format: "buy:20:0xADDRESS:SYMBOL" or "sell:50:0xADDRESS:SYMBOL"
+    Build inline keyboard with buy/sell + research buttons.
+    Callback data format: "buy:20:0xADDRESS", "sell:50:0xADDRESS", "xresearch:SYMBOL:0xADDRESS"
     """
     addr = token_address[:20]  # truncate to stay within 64-byte callback limit
+    # symbol truncated to 10 chars to stay within limit
+    sym = symbol[:10]
     return {
         "inline_keyboard": [
             [
@@ -250,6 +252,9 @@ def build_trade_keyboard(token_address: str, symbol: str) -> dict:
                 {"text": "🔴 SELL 20%",  "callback_data": f"sell:20:{addr}"},
                 {"text": "🔴 SELL 50%",  "callback_data": f"sell:50:{addr}"},
                 {"text": "🔴 SELL 100%", "callback_data": f"sell:100:{addr}"},
+            ],
+            [
+                {"text": "🔍 Research X", "callback_data": f"xresearch:{sym}:{addr}"},
             ],
         ]
     }
@@ -320,7 +325,44 @@ async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: 
         await answer_callback_query(session, callback_id, "Invalid callback data")
         return
 
-    action, percent_str, addr_truncated = parts
+    action, second, addr_truncated = parts
+
+    # ── X Research callback (no trading auth needed) ──
+    if action == "xresearch":
+        symbol = second
+        await answer_callback_query(session, callback_id, f"🔍 Searching X for ${symbol}...")
+        full_address = _address_map.get(addr_truncated, addr_truncated)
+
+        async def do_x_research():
+            try:
+                mentions = await search_x_mentions(session, symbol)
+                if not mentions:
+                    await send_telegram(session, f"🔍 <b>X Research: ${symbol}</b>\n\nNo notable mentions found (10K+ followers).", chat_id=chat_id)
+                    return
+
+                lines = [f"🔍 <b>X Research: ${symbol}</b>\n"]
+                for m in mentions:
+                    f_count = m['followers']
+                    f_str = f"{f_count/1_000_000:.1f}M" if f_count >= 1_000_000 else f"{f_count/1_000:.0f}K"
+                    text_clean = re.sub(r'https?://t\.co/\S+', '', m['text']).strip().replace('\n', ' ')
+                    text_clean = text_clean.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                    if len(text_clean) > 200:
+                        text_clean = text_clean[:197] + "..."
+                    lines.extend([
+                        f"",
+                        f"<a href='{m['url']}'>@{m['username']}</a> · {f_str} followers · {m['date']}",
+                        f"❤️ {m['likes']} 🔁 {m['retweets']}",
+                        f"<i>{text_clean}</i>" if text_clean else "<i>[media only]</i>",
+                    ])
+                await send_telegram(session, "\n".join(lines), chat_id=chat_id)
+            except Exception as e:
+                log.error(f"X research callback error: {e}")
+                await send_telegram(session, f"❌ X research failed: {str(e)[:100]}", chat_id=chat_id)
+
+        asyncio.create_task(do_x_research())
+        return
+
+    percent_str = second
     percent = int(percent_str)
 
     # Resolve full address from map
