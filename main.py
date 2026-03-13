@@ -487,6 +487,80 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                 else:
                     await send_telegram(session, "No accounts blocked.", chat_id)
 
+            elif text.lower().startswith("/buy"):
+                parts = text.split()
+                if len(parts) != 3:
+                    await send_telegram(session, "Usage: /buy 0xADDRESS 20\n(percent = 20, 50, or 100)", chat_id=chat_id)
+                    continue
+                token_addr = parts[1].strip()
+                try:
+                    percent = int(parts[2].strip())
+                    if percent not in [20, 50, 100]:
+                        raise ValueError
+                except ValueError:
+                    await send_telegram(session, "❌ Percent must be 20, 50, or 100", chat_id=chat_id)
+                    continue
+                if not token_addr.startswith("0x") or len(token_addr) != 42:
+                    await send_telegram(session, "❌ Invalid token address", chat_id=chat_id)
+                    continue
+                if not TRADING_ENABLED:
+                    await send_telegram(session, "⚠️ Trading not enabled. Set TRADING_ENABLED=true", chat_id=chat_id)
+                    continue
+                TRADER_USER_ID = os.getenv("TRADER_USER_ID", "")
+                user_id = str(msg.get("from", {}).get("id", ""))
+                if TRADER_USER_ID and user_id != TRADER_USER_ID:
+                    await send_telegram(session, "⛔ Not authorized", chat_id=chat_id)
+                    continue
+                await send_telegram(session, f"⏳ Buying {percent}% ETH of <code>{token_addr}</code>...", chat_id=chat_id)
+                try:
+                    from trader import buy_token
+                    result = await buy_token(token_addr, percent)
+                    if result["success"]:
+                        tx_hash = result["tx_hash"]
+                        amount_eth = result.get("amount_eth", 0)
+                        await send_telegram(session, f"✅ <b>BUY executed</b> — {percent}% ({amount_eth:.4f} ETH)\n🔗 <a href='https://basescan.org/tx/{tx_hash}'>View on BaseScan</a>", chat_id=chat_id)
+                    else:
+                        await send_telegram(session, f"❌ Buy failed: <code>{result.get('error','')[:200]}</code>", chat_id=chat_id)
+                except Exception as e:
+                    await send_telegram(session, f"❌ Buy error: {str(e)[:150]}", chat_id=chat_id)
+
+            elif text.lower().startswith("/sell"):
+                parts = text.split()
+                if len(parts) != 3:
+                    await send_telegram(session, "Usage: /sell 0xADDRESS 50\n(percent = 20, 50, or 100)", chat_id=chat_id)
+                    continue
+                token_addr = parts[1].strip()
+                try:
+                    percent = int(parts[2].strip())
+                    if percent not in [20, 50, 100]:
+                        raise ValueError
+                except ValueError:
+                    await send_telegram(session, "❌ Percent must be 20, 50, or 100", chat_id=chat_id)
+                    continue
+                if not token_addr.startswith("0x") or len(token_addr) != 42:
+                    await send_telegram(session, "❌ Invalid token address", chat_id=chat_id)
+                    continue
+                if not TRADING_ENABLED:
+                    await send_telegram(session, "⚠️ Trading not enabled. Set TRADING_ENABLED=true", chat_id=chat_id)
+                    continue
+                TRADER_USER_ID = os.getenv("TRADER_USER_ID", "")
+                user_id = str(msg.get("from", {}).get("id", ""))
+                if TRADER_USER_ID and user_id != TRADER_USER_ID:
+                    await send_telegram(session, "⛔ Not authorized", chat_id=chat_id)
+                    continue
+                await send_telegram(session, f"⏳ Selling {percent}% of <code>{token_addr}</code>...", chat_id=chat_id)
+                try:
+                    from trader import sell_token
+                    result = await sell_token(token_addr, percent)
+                    if result["success"]:
+                        tx_hash = result["tx_hash"]
+                        amount_tokens = result.get("amount_tokens", 0)
+                        await send_telegram(session, f"✅ <b>SELL executed</b> — {percent}% ({amount_tokens:.2f} tokens)\n🔗 <a href='https://basescan.org/tx/{tx_hash}'>View on BaseScan</a>", chat_id=chat_id)
+                    else:
+                        await send_telegram(session, f"❌ Sell failed: <code>{result.get('error','')[:200]}</code>", chat_id=chat_id)
+                except Exception as e:
+                    await send_telegram(session, f"❌ Sell error: {str(e)[:150]}", chat_id=chat_id)
+
             elif text.lower().startswith("/test"):
                 test_launch = {
                     "source": "bankr",
