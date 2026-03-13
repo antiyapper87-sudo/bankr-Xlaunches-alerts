@@ -235,8 +235,8 @@ async def answer_callback_query(session: aiohttp.ClientSession, callback_query_i
 
 def build_trade_keyboard(token_address: str, symbol: str) -> dict:
     """
-    Build inline keyboard with buy/sell + research buttons.
-    Callback data format: "buy:20:0xADDRESS", "sell:50:0xADDRESS", "xresearch:SYMBOL:0xADDRESS"
+    Build inline keyboard with buy/sell + copy CA + research buttons.
+    Callback data format: "buy:20:0xADDRESS", "sell:50:0xADDRESS", "copyca:0:0xADDRESS", "xresearch:SYMBOL:0xADDRESS"
     """
     addr = token_address[:20]  # truncate to stay within 64-byte callback limit
     # symbol truncated to 10 chars to stay within limit
@@ -254,6 +254,7 @@ def build_trade_keyboard(token_address: str, symbol: str) -> dict:
                 {"text": "🔴 SELL 100%", "callback_data": f"sell:100:{addr}"},
             ],
             [
+                {"text": "📋 Copy CA", "callback_data": f"copyca:0:{addr}"},
                 {"text": "🔍 Research X", "callback_data": f"xresearch:{sym}:{addr}"},
             ],
         ]
@@ -301,18 +302,7 @@ async def send_alert_all(session: aiohttp.ClientSession, tg_text: str, wa_text: 
 # ─── Trade Callback Handler ───────────────────────────────────────────────────
 
 async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: dict):
-    """Handle buy/sell button presses from Telegram inline keyboard."""
-    # ── Restrict to authorized user only ──
-    TRADER_USER_ID = os.getenv("TRADER_USER_ID", "")
-    user_id = str(callback_query.get("from", {}).get("id", ""))
-    if TRADER_USER_ID and user_id != TRADER_USER_ID:
-        await answer_callback_query(session, callback_query["id"], "⛔ Not authorized", show_alert=True)
-        return
-
-    if not TRADING_ENABLED:
-        await answer_callback_query(session, callback_query["id"], "⚠️ Trading not enabled. Set TRADING_ENABLED=true", show_alert=True)
-        return
-
+    """Handle buy/sell/copyca/xresearch button presses from Telegram inline keyboard."""
     callback_id = callback_query["id"]
     data = callback_query.get("data", "")
     chat_id = str(callback_query.get("message", {}).get("chat", {}).get("id", ""))
@@ -326,6 +316,17 @@ async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: 
         return
 
     action, second, addr_truncated = parts
+
+    # ── Copy CA callback (no auth needed) ──
+    if action == "copyca":
+        full_address = _address_map.get(addr_truncated, addr_truncated)
+        await answer_callback_query(session, callback_id, "📋 Contract address sent below")
+        await send_telegram(
+            session,
+            f"<code>{full_address}</code>",
+            chat_id=chat_id,
+        )
+        return
 
     # ── X Research callback (no trading auth needed) ──
     if action == "xresearch":
@@ -360,6 +361,17 @@ async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: 
                 await send_telegram(session, f"❌ X research failed: {str(e)[:100]}", chat_id=chat_id)
 
         asyncio.create_task(do_x_research())
+        return
+
+    # ── Restrict trading actions to authorized user only ──
+    TRADER_USER_ID = os.getenv("TRADER_USER_ID", "")
+    user_id = str(callback_query.get("from", {}).get("id", ""))
+    if TRADER_USER_ID and user_id != TRADER_USER_ID:
+        await answer_callback_query(session, callback_id, "⛔ Not authorized", show_alert=True)
+        return
+
+    if not TRADING_ENABLED:
+        await answer_callback_query(session, callback_id, "⚠️ Trading not enabled. Set TRADING_ENABLED=true", show_alert=True)
         return
 
     percent_str = second
