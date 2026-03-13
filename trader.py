@@ -26,37 +26,18 @@ WETH_ADDRESS = Web3.to_checksum_address("0x4200000000000000000000000000000000000
 # Default slippage: 10% (handles volatile new tokens)
 SLIPPAGE_BPS = int(os.getenv("SLIPPAGE_BPS", "1000"))
 
-# Uniswap V3 SwapRouter02 ABI (exactInputSingle + exactOutputSingle)
+# Uniswap V3 SwapRouter02 ABI
 ROUTER_ABI = [
     {
         "inputs": [{
             "components": [
-                {"name": "tokenIn",       "type": "address"},
-                {"name": "tokenOut",      "type": "address"},
-                {"name": "fee",           "type": "uint24"},
-                {"name": "recipient",     "type": "address"},
-                {"name": "amountIn",      "type": "uint256"},
+                {"name": "tokenIn",          "type": "address"},
+                {"name": "tokenOut",         "type": "address"},
+                {"name": "fee",              "type": "uint24"},
+                {"name": "recipient",        "type": "address"},
+                {"name": "amountIn",         "type": "uint256"},
                 {"name": "amountOutMinimum", "type": "uint256"},
-                {"name": "sqrtPriceLimitX96", "type": "uint160"},
-            ],
-            "name": "params",
-            "type": "tuple",
-        }],
-        "name": "exactInputSingle",
-        "outputs": [{"name": "amountOut", "type": "uint256"}],
-        "stateMutability": "payable",
-        "type": "function",
-    },
-    {
-        "inputs": [{
-            "components": [
-                {"name": "tokenIn",       "type": "address"},
-                {"name": "tokenOut",      "type": "address"},
-                {"name": "fee",           "type": "uint24"},
-                {"name": "recipient",     "type": "address"},
-                {"name": "amountIn",      "type": "uint256"},
-                {"name": "amountOutMinimum", "type": "uint256"},
-                {"name": "sqrtPriceLimitX96", "type": "uint160"},
+                {"name": "sqrtPriceLimitX96","type": "uint160"},
             ],
             "name": "params",
             "type": "tuple",
