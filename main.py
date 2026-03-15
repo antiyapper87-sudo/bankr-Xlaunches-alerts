@@ -8,7 +8,7 @@ Monitors FIVE sources for new token launches on Base:
   4. DexScreener — market data (MCap, Volume, Liquidity)
   5. DexScreener — catch-all via profiles/boosts/search (ApeStore, direct deploys)
 
-When a token passes market filters → alerts to Telegram + WhatsApp.
+When a token passes market filters → alerts to Telegram + WhatsApp + Pushover.
 Telegram signals include inline buy/sell buttons (20% / 50% / 100%).
 Auto-execution via Bankr Agent API when AUTO_EXECUTE=true.
 
@@ -42,6 +42,10 @@ POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
 BANKR_EXECUTION_API_KEY = os.getenv("BANKR_EXECUTION_API_KEY", "")
 BANKR_BUY_AMOUNT = int(os.getenv("BANKR_BUY_AMOUNT", "100"))
 AUTO_EXECUTE = os.getenv("AUTO_EXECUTE", "false").lower() == "true"
+
+# ─── Pushover Config ──────────────────────────────────────────────────────────
+PUSHOVER_USER_KEY = os.getenv("PUSHOVER_USER_KEY", "")
+PUSHOVER_API_TOKEN = os.getenv("PUSHOVER_API_TOKEN", "")
 
 # ─── Trader Config ────────────────────────────────────────────────────────────
 TRADING_ENABLED = os.getenv("TRADING_ENABLED", "false").lower() == "true"
@@ -287,6 +291,39 @@ async def send_whatsapp(session: aiohttp.ClientSession, text: str) -> bool:
                 return False
     except Exception as e:
         log.error(f"WhatsApp send failed: {e}")
+        return False
+
+
+# ─── Pushover Emergency Alert ─────────────────────────────────────────────────
+
+async def send_pushover(session: aiohttp.ClientSession, title: str, message: str, url: str = "") -> bool:
+    """Send emergency Pushover alert — repeats every 30s until acknowledged."""
+    if not PUSHOVER_USER_KEY or not PUSHOVER_API_TOKEN:
+        return False
+    payload = {
+        "token": PUSHOVER_API_TOKEN,
+        "user": PUSHOVER_USER_KEY,
+        "title": title,
+        "message": message,
+        "priority": 2,       # Emergency — repeats until acknowledged
+        "retry": 30,          # Retry every 30 seconds
+        "expire": 600,        # Stop after 10 minutes
+        "sound": "persistent",
+    }
+    if url:
+        payload["url"] = url
+        payload["url_title"] = "Open DexScreener"
+    try:
+        async with session.post("https://api.pushover.net/1/messages.json", data=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status == 200:
+                log.info("🔔 Pushover emergency alert sent")
+                return True
+            else:
+                body = await resp.text()
+                log.error(f"Pushover error {resp.status}: {body[:200]}")
+                return False
+    except Exception as e:
+        log.error(f"Pushover send failed: {e}")
         return False
 
 
@@ -600,6 +637,7 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
             elif text.lower().startswith("/status"):
                 exec_status = f"✅ ON (${BANKR_BUY_AMOUNT}/trade)" if AUTO_EXECUTE else "❌ OFF"
                 trade_status = "✅ ON" if TRADING_ENABLED else "❌ OFF"
+                pushover_status = "✅ ON" if PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN else "❌ OFF"
                 await send_telegram(
                     session,
                     f"📡 <b>Signal Bot</b>\n\n"
@@ -614,7 +652,8 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                     f"• Poll interval: {POLL_INTERVAL}s\n"
                     f"• Auto-execute: {exec_status}\n"
                     f"• Executions: {execution_count}\n"
-                    f"• Inline trading: {trade_status}",
+                    f"• Inline trading: {trade_status}\n"
+                    f"• Pushover alerts: {pushover_status}",
                     chat_id,
                 )
 
@@ -1482,6 +1521,14 @@ async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, s
 
     # Send Telegram with inline buttons, WhatsApp as plain text
     await send_alert_all(session, tg_text, wa_text, token_address=address, symbol=symbol)
+
+    # Pushover emergency alert — repeats every 30s until acknowledged
+    dex_url = f"https://dexscreener.com/base/{address}"
+    pushover_msg = f"${symbol} · MCap {fmt_usd(dex['mcap'])} · Vol {fmt_usd(dex['volume_24h'])}"
+    if launch.get("x_username"):
+        pushover_msg += f" · @{launch['x_username']}"
+    await send_pushover(session, f"🐋 {source.upper()}: ${symbol}", pushover_msg, url=dex_url)
+
     signaled_tokens.add(address)
     alert_count += 1
 
@@ -1539,6 +1586,7 @@ async def main():
     log.info(f"  Telegram      : {'✅' if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID else '❌'}")
     log.info(f"  WhatsApp      : {'✅' if WHAPI_TOKEN and WHATSAPP_GROUP_ID else '❌'}")
     log.info(f"  SocialData    : {'✅' if SOCIALDATA_API_KEY else '❌'}")
+    log.info(f"  Pushover      : {'✅' if PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN else '❌ NOT SET'}")
     log.info(f"  Auto-execute  : {'✅ ON — $' + str(BANKR_BUY_AMOUNT) + '/trade' if AUTO_EXECUTE else '❌ OFF'}")
     log.info(f"  Inline trading: {'✅ ON' if TRADING_ENABLED else '❌ OFF (set TRADING_ENABLED=true)'}")
     log.info(f"  Bankr Exec Key: {'✅' if BANKR_EXECUTION_API_KEY else '❌ NOT SET'}")
@@ -1580,9 +1628,27 @@ async def main():
             except Exception as e:
                 log.error(f"❌ Bankr execution health check failed: {e}")
 
+        # Pushover health check
+        if PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN:
+            log.info("🔍 Verifying Pushover credentials...")
+            try:
+                async with session.post(
+                    "https://api.pushover.net/1/users/validate.json",
+                    data={"token": PUSHOVER_API_TOKEN, "user": PUSHOVER_USER_KEY},
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    if resp.status == 200:
+                        log.info("✅ Pushover credentials valid")
+                    else:
+                        body = await resp.text()
+                        log.error(f"❌ Pushover validation failed {resp.status}: {body[:200]}")
+            except Exception as e:
+                log.error(f"❌ Pushover health check failed: {e}")
+
         await seed_existing(session)
 
         trade_note = "\n💸 Inline trading: ✅ ON — tap buttons on signals to buy/sell" if TRADING_ENABLED else "\n💸 Inline trading: ❌ OFF"
+        pushover_note = "\n🔔 Pushover: ✅ Emergency alerts ON" if PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN else "\n🔔 Pushover: ❌ OFF"
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
             exec_note = f"\n💸 Auto-execute: ON (${BANKR_BUY_AMOUNT}/trade)" if AUTO_EXECUTE else "\n💸 Auto-execute: OFF"
             await send_telegram(
@@ -1593,7 +1659,8 @@ async def main():
                 f"Min MCap: ${MIN_MCAP:,} · Vol: ${MIN_VOLUME_24H:,} · Liq: ${MIN_LIQUIDITY:,}\n"
                 f"Polling every {POLL_INTERVAL}s"
                 f"{exec_note}"
-                f"{trade_note}\n\n"
+                f"{trade_note}"
+                f"{pushover_note}\n\n"
                 f"Commands: /research · /block · /unblock · /blocklist · /status · /wallet",
             )
 
