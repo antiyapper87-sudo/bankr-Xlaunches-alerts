@@ -239,23 +239,18 @@ async def answer_callback_query(session: aiohttp.ClientSession, callback_query_i
 
 def build_trade_keyboard(token_address: str, symbol: str) -> dict:
     """
-    Build inline keyboard with buy/sell + copy CA + research buttons.
-    Callback data format: "buy:20:0xADDRESS", "sell:50:0xADDRESS", "copyca:0:0xADDRESS", "xresearch:SYMBOL:0xADDRESS"
+    Build inline keyboard with Banana Gun deep link + Copy CA + Research X.
+    Banana Gun bot accepts a CA pasted into DM to trigger buy flow.
+    Deep link pre-fills the CA so user just taps Send.
     """
     addr = token_address[:20]  # truncate to stay within 64-byte callback limit
-    # symbol truncated to 10 chars to stay within limit
     sym = symbol[:10]
+    # Deep link: opens BananaGun_bot DM with the CA pre-filled as start param
+    banana_url = f"https://t.me/BananaGun_bot?start={token_address}"
     return {
         "inline_keyboard": [
             [
-                {"text": "🟢 BUY 20%",  "callback_data": f"buy:20:{addr}"},
-                {"text": "🟢 BUY 50%",  "callback_data": f"buy:50:{addr}"},
-                {"text": "🟢 BUY 100%", "callback_data": f"buy:100:{addr}"},
-            ],
-            [
-                {"text": "🔴 SELL 20%",  "callback_data": f"sell:20:{addr}"},
-                {"text": "🔴 SELL 50%",  "callback_data": f"sell:50:{addr}"},
-                {"text": "🔴 SELL 100%", "callback_data": f"sell:100:{addr}"},
+                {"text": "🍌 Buy on Banana Gun", "url": banana_url},
             ],
             [
                 {"text": "📋 Copy CA", "callback_data": f"copyca:0:{addr}"},
