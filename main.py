@@ -12,6 +12,9 @@ When a token passes market filters → alerts to Telegram + WhatsApp + Pushover.
 Telegram signals include inline buy/sell buttons (20% / 50% / 100%).
 Auto-execution via Bankr Agent API when AUTO_EXECUTE=true.
 
+Liquidity filter is SKIPPED for safe launchpads (Bankr, Clanker, Virtuals)
+because they have locked LP / bonding curves — no rug possible.
+
 Deploy: GitHub + Railway
 """
 
@@ -91,6 +94,9 @@ recheck_queue: dict[str, dict] = {}
 # ─── Blocklist ────────────────────────────────────────────────────────────────
 
 BLOCKLIST_FILE = Path("/data/blocklist.json") if Path("/data").exists() else Path("blocklist.json")
+
+# ─── Safe launchpads (locked LP / bonding curves — no rug possible) ───────────
+SAFE_LAUNCHPADS = {"bankr", "clanker", "virtuals"}
 
 
 def load_blocklist() -> set[str]:
@@ -238,14 +244,8 @@ async def answer_callback_query(session: aiohttp.ClientSession, callback_query_i
 # ─── Inline Keyboard Builder ──────────────────────────────────────────────────
 
 def build_trade_keyboard(token_address: str, symbol: str) -> dict:
-    """
-    Build inline keyboard with Banana Gun deep link + Copy CA + Research X.
-    Banana Gun bot accepts a CA pasted into DM to trigger buy flow.
-    Deep link pre-fills the CA so user just taps Send.
-    """
-    addr = token_address[:20]  # truncate to stay within 64-byte callback limit
+    addr = token_address[:20]
     sym = symbol[:10]
-    # Deep link: opens BananaGun_bot DM with the CA pre-filled as start param
     banana_url = f"https://t.me/BananaGun_bot?start={token_address}"
     return {
         "inline_keyboard": [
@@ -260,7 +260,6 @@ def build_trade_keyboard(token_address: str, symbol: str) -> dict:
     }
 
 
-# Store full address lookup: truncated_addr -> full_address
 _address_map: dict[str, str] = {}
 
 
@@ -292,7 +291,6 @@ async def send_whatsapp(session: aiohttp.ClientSession, text: str) -> bool:
 # ─── Pushover Emergency Alert ─────────────────────────────────────────────────
 
 async def send_pushover(session: aiohttp.ClientSession, title: str, message: str, url: str = "") -> bool:
-    """Send emergency Pushover alert — repeats every 30s until acknowledged."""
     if not PUSHOVER_USER_KEY or not PUSHOVER_API_TOKEN:
         return False
     payload = {
@@ -300,9 +298,9 @@ async def send_pushover(session: aiohttp.ClientSession, title: str, message: str
         "user": PUSHOVER_USER_KEY,
         "title": title,
         "message": message,
-        "priority": 2,       # Emergency — repeats until acknowledged
-        "retry": 30,          # Retry every 30 seconds
-        "expire": 600,        # Stop after 10 minutes
+        "priority": 2,
+        "retry": 30,
+        "expire": 600,
         "sound": "persistent",
     }
     if url:
@@ -323,7 +321,6 @@ async def send_pushover(session: aiohttp.ClientSession, title: str, message: str
 
 
 async def send_alert_all(session: aiohttp.ClientSession, tg_text: str, wa_text: str, token_address: str = "", symbol: str = ""):
-    """Send alert to Telegram (with inline buttons) and WhatsApp."""
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         keyboard = build_trade_keyboard(token_address, symbol) if token_address else None
         await send_telegram(session, tg_text, reply_markup=keyboard)
@@ -334,7 +331,6 @@ async def send_alert_all(session: aiohttp.ClientSession, tg_text: str, wa_text: 
 # ─── Trade Callback Handler ───────────────────────────────────────────────────
 
 async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: dict):
-    """Handle buy/sell/copyca/xresearch button presses from Telegram inline keyboard."""
     callback_id = callback_query["id"]
     data = callback_query.get("data", "")
     chat_id = str(callback_query.get("message", {}).get("chat", {}).get("id", ""))
@@ -349,18 +345,12 @@ async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: 
 
     action, second, addr_truncated = parts
 
-    # ── Copy CA callback (no auth needed) ──
     if action == "copyca":
         full_address = _address_map.get(addr_truncated, addr_truncated)
         await answer_callback_query(session, callback_id, "📋 Contract address sent below")
-        await send_telegram(
-            session,
-            f"<code>{full_address}</code>",
-            chat_id=chat_id,
-        )
+        await send_telegram(session, f"<code>{full_address}</code>", chat_id=chat_id)
         return
 
-    # ── X Research callback (no trading auth needed) ──
     if action == "xresearch":
         symbol = second
         await answer_callback_query(session, callback_id, f"🔍 Searching X for ${symbol}...")
@@ -395,7 +385,6 @@ async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: 
         asyncio.create_task(do_x_research())
         return
 
-    # ── Restrict trading actions to authorized user only ──
     TRADER_USER_ID = os.getenv("TRADER_USER_ID", "")
     user_id = str(callback_query.get("from", {}).get("id", ""))
     if TRADER_USER_ID and user_id != TRADER_USER_ID:
@@ -409,15 +398,12 @@ async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: 
     percent_str = second
     percent = int(percent_str)
 
-    # Resolve full address from map
     full_address = _address_map.get(addr_truncated)
     if not full_address:
         await answer_callback_query(session, callback_id, "⚠️ Token address not found — signal too old?", show_alert=True)
         return
 
-    # Acknowledge immediately (removes spinner)
     await answer_callback_query(session, callback_id, f"⏳ Executing {action.upper()} {percent}%...")
-
     log.info(f"  🎯 [{username}] {action.upper()} {percent}% → {full_address[:12]}...")
 
     try:
@@ -432,30 +418,17 @@ async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: 
         if result["success"]:
             tx_hash = result["tx_hash"]
             basescan_url = f"https://basescan.org/tx/{tx_hash}"
-
             if action == "buy":
                 amount_eth = result.get("amount_eth", 0)
-                confirm_text = (
-                    f"✅ <b>BUY executed</b> — {percent}% ({amount_eth:.4f} ETH)\n"
-                    f"🔗 <a href='{basescan_url}'>View on BaseScan</a>"
-                )
+                confirm_text = f"✅ <b>BUY executed</b> — {percent}% ({amount_eth:.4f} ETH)\n🔗 <a href='{basescan_url}'>View on BaseScan</a>"
             else:
                 amount_tokens = result.get("amount_tokens", 0)
-                confirm_text = (
-                    f"✅ <b>SELL executed</b> — {percent}% ({amount_tokens:.2f} tokens)\n"
-                    f"🔗 <a href='{basescan_url}'>View on BaseScan</a>"
-                )
-
+                confirm_text = f"✅ <b>SELL executed</b> — {percent}% ({amount_tokens:.2f} tokens)\n🔗 <a href='{basescan_url}'>View on BaseScan</a>"
             await send_telegram(session, confirm_text, chat_id=chat_id)
             log.info(f"  ✅ Trade confirmed: {tx_hash}")
-
         else:
             error = result.get("error", "Unknown error")
-            await send_telegram(
-                session,
-                f"❌ <b>Trade failed</b> — {action.upper()} {percent}%\n<code>{error[:200]}</code>",
-                chat_id=chat_id,
-            )
+            await send_telegram(session, f"❌ <b>Trade failed</b> — {action.upper()} {percent}%\n<code>{error[:200]}</code>", chat_id=chat_id)
             log.error(f"  ❌ Trade failed: {error}")
 
     except Exception as e:
@@ -487,7 +460,6 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
         for update in updates:
             last_update_id = update["update_id"]
 
-            # ── Handle inline button callbacks ──
             if "callback_query" in update:
                 await handle_trade_callback(session, update["callback_query"])
                 continue
@@ -643,7 +615,8 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                     f"• Blocked: {len(blocked_accounts)} accounts\n"
                     f"• Min MCap: ${MIN_MCAP:,}\n"
                     f"• Min Volume: ${MIN_VOLUME_24H:,}\n"
-                    f"• Min Liquidity: ${MIN_LIQUIDITY:,}\n"
+                    f"• Min Liquidity: ${MIN_LIQUIDITY:,} (DexScreener only)\n"
+                    f"• 🔓 Safe sources (no liq check): {', '.join(SAFE_LAUNCHPADS)}\n"
                     f"• Poll interval: {POLL_INTERVAL}s\n"
                     f"• Auto-execute: {exec_status}\n"
                     f"• Executions: {execution_count}\n"
@@ -741,25 +714,16 @@ async def get_follower_count(session: aiohttp.ClientSession, username: str) -> i
 
 # ─── DexScreener Market Data ──────────────────────────────────────────────────
 
-async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str) -> dict | None:
-    token_address = token_address.lower()
-
-    if token_address in gecko_cache:
-        cached_time, cached_result = gecko_cache[token_address]
-        ttl = GECKO_CACHE_TTL_HIT if cached_result else GECKO_CACHE_TTL_MISS
-        if time.time() - cached_time < ttl:
-            return cached_result
-
+async def _fetch_dexscreener(session: aiohttp.ClientSession, token_address: str) -> dict | None:
+    """Fetch market data from DexScreener (primary source)."""
     try:
         url = f"{DEXSCREENER_API_URL}/token-pairs/v1/base/{token_address}"
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status == 404:
-                gecko_cache[token_address] = (time.time(), None)
                 return None
             if resp.status == 429:
                 log.warning("DexScreener rate limited, backing off...")
                 await asyncio.sleep(2)
-                gecko_cache[token_address] = (time.time(), None)
                 return None
             if resp.status != 200:
                 log.debug(f"DexScreener {resp.status} for {token_address[:10]}...")
@@ -774,7 +738,6 @@ async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str
             pairs = []
 
         if not pairs:
-            gecko_cache[token_address] = (time.time(), None)
             return None
 
         best = None
@@ -786,17 +749,15 @@ async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str
                 best = pair
 
         if not best:
-            gecko_cache[token_address] = (time.time(), None)
             return None
 
         mcap = float(best.get("marketCap") or best.get("fdv") or 0)
         vol_24h = float((best.get("volume") or {}).get("h24") or 0)
         liquidity = float((best.get("liquidity") or {}).get("usd") or 0)
         price_change = best.get("priceChange") or {}
-
         base_token = best.get("baseToken") or {}
 
-        result = {
+        return {
             "mcap": mcap,
             "volume_24h": vol_24h,
             "liquidity": liquidity,
@@ -808,21 +769,191 @@ async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str
             "token_name": base_token.get("name", ""),
             "token_symbol": base_token.get("symbol", ""),
             "dex_id": best.get("dexId", ""),
+            "_source": "dexscreener",
         }
-        gecko_cache[token_address] = (time.time(), result)
-        return result
     except Exception as e:
         log.debug(f"DexScreener error for {token_address[:10]}...: {e}")
-        gecko_cache[token_address] = (time.time(), None)
         return None
+
+
+# ─── GeckoTerminal rate limiter (30 calls/min free tier) ─────────────────────
+_gecko_calls: list[float] = []
+GECKO_RATE_LIMIT = 25  # stay under 30/min with safety margin
+
+
+def _gecko_rate_ok() -> bool:
+    """Check if we can make a GeckoTerminal call without hitting rate limit."""
+    now = time.time()
+    # Purge calls older than 60s
+    while _gecko_calls and _gecko_calls[0] < now - 60:
+        _gecko_calls.pop(0)
+    return len(_gecko_calls) < GECKO_RATE_LIMIT
+
+
+async def _fetch_geckoterminal_api(session: aiohttp.ClientSession, token_address: str) -> dict | None:
+    """Fetch market data from GeckoTerminal (fallback source). 30 calls/min free tier."""
+    if not _gecko_rate_ok():
+        log.debug(f"GeckoTerminal rate limit reached, skipping fallback for {token_address[:10]}...")
+        return None
+
+    try:
+        url = f"{GECKOTERMINAL_API_URL}/networks/base/tokens/{token_address}"
+        headers = {"Accept": "application/json;version=20230302"}
+        _gecko_calls.append(time.time())
+
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status == 429:
+                log.warning("GeckoTerminal rate limited (429)")
+                return None
+            if resp.status != 200:
+                log.debug(f"GeckoTerminal {resp.status} for {token_address[:10]}...")
+                return None
+            data = await resp.json()
+
+        # GeckoTerminal returns token info — we need pool data for mcap/vol/liq
+        # Try the pools endpoint instead
+        token_data = data.get("data", {})
+        attrs = token_data.get("attributes", {})
+
+        # Now fetch pools for this token
+        pools_url = f"{GECKOTERMINAL_API_URL}/networks/base/tokens/{token_address}/pools"
+        params = {"page": 1}
+        _gecko_calls.append(time.time())
+
+        async with session.get(pools_url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                log.debug(f"GeckoTerminal pools {resp.status} for {token_address[:10]}...")
+                return None
+            pools_data = await resp.json()
+
+        pools = pools_data.get("data", [])
+        if not pools:
+            return None
+
+        # Find the best pool by reserve (liquidity)
+        best = None
+        best_reserve = -1
+        for pool in pools:
+            pool_attrs = pool.get("attributes", {})
+            reserve = float(pool_attrs.get("reserve_in_usd") or 0)
+            if reserve > best_reserve:
+                best_reserve = reserve
+                best = pool_attrs
+
+        if not best:
+            return None
+
+        # Parse GeckoTerminal pool format
+        mcap = float(best.get("market_cap_usd") or best.get("fdv_usd") or 0)
+        vol_raw = best.get("volume_usd") or {}
+        vol_24h = float(vol_raw.get("h24") or 0)
+        liquidity = float(best.get("reserve_in_usd") or 0)
+        price_changes = best.get("price_change_percentage") or {}
+
+        token_name = attrs.get("name", "")
+        token_symbol = attrs.get("symbol", "")
+
+        result = {
+            "mcap": mcap,
+            "volume_24h": vol_24h,
+            "liquidity": liquidity,
+            "price_usd": best.get("base_token_price_usd", "0"),
+            "price_change_1h": float(price_changes.get("h1") or 0),
+            "price_change_24h": float(price_changes.get("h24") or 0),
+            "pair_url": f"https://www.geckoterminal.com/base/pools/{best.get('address', token_address)}",
+            "pair_created_at": 0,  # GeckoTerminal returns ISO date, convert if needed
+            "token_name": token_name,
+            "token_symbol": token_symbol,
+            "dex_id": best.get("dex_id", ""),
+            "_source": "geckoterminal",
+        }
+
+        # Try to parse pool_created_at from ISO string
+        created_str = best.get("pool_created_at", "")
+        if created_str:
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+                result["pair_created_at"] = int(dt.timestamp() * 1000)
+            except Exception:
+                pass
+
+        log.info(f"  🦎 GeckoTerminal fallback: {token_address[:10]}... mcap ${mcap:,.0f} vol ${vol_24h:,.0f} liq ${liquidity:,.0f}")
+        return result
+
+    except Exception as e:
+        log.debug(f"GeckoTerminal error for {token_address[:10]}...: {e}")
+        return None
+
+
+async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str) -> dict | None:
+    """Fetch market data: DexScreener first, GeckoTerminal fallback.
+
+    GeckoTerminal is used when DexScreener returns:
+    - No data at all (not indexed yet)
+    - $0 liquidity (common with Uniswap V4 pairs)
+    - $0 mcap but token exists
+    """
+    token_address = token_address.lower()
+
+    if token_address in gecko_cache:
+        cached_time, cached_result = gecko_cache[token_address]
+        ttl = GECKO_CACHE_TTL_HIT if cached_result else GECKO_CACHE_TTL_MISS
+        if time.time() - cached_time < ttl:
+            return cached_result
+
+    # ── Primary: DexScreener ──
+    result = await _fetch_dexscreener(session, token_address)
+
+    # ── Fallback: GeckoTerminal ──
+    # Trigger when DexScreener returns nothing OR has data gaps
+    needs_fallback = False
+    if result is None:
+        needs_fallback = True
+    elif result.get("liquidity", 0) == 0 and result.get("mcap", 0) > 0:
+        # DexScreener has the token but $0 liquidity — V4 indexing gap
+        needs_fallback = True
+    elif result.get("mcap", 0) == 0 and result.get("volume_24h", 0) == 0:
+        # DexScreener returned empty data
+        needs_fallback = True
+
+    if needs_fallback:
+        gecko_result = await _fetch_geckoterminal_api(session, token_address)
+        if gecko_result:
+            if result is None:
+                # DexScreener had nothing — use GeckoTerminal entirely
+                result = gecko_result
+            else:
+                # DexScreener had partial data — merge: prefer non-zero values
+                if gecko_result.get("liquidity", 0) > result.get("liquidity", 0):
+                    result["liquidity"] = gecko_result["liquidity"]
+                if gecko_result.get("mcap", 0) > result.get("mcap", 0):
+                    result["mcap"] = gecko_result["mcap"]
+                if gecko_result.get("volume_24h", 0) > result.get("volume_24h", 0):
+                    result["volume_24h"] = gecko_result["volume_24h"]
+                if not result.get("pair_created_at") and gecko_result.get("pair_created_at"):
+                    result["pair_created_at"] = gecko_result["pair_created_at"]
+                result["_source"] = "dexscreener+geckoterminal"
+
+    # Cache the result
+    gecko_cache[token_address] = (time.time(), result)
+    return result
 
 
 MAX_TOKEN_AGE = int(os.getenv("MAX_TOKEN_AGE", str(4 * 3600)))
 
 
-def passes_market_filters(dex: dict | None) -> tuple[bool, str]:
+def passes_market_filters(dex: dict | None, source: str = "") -> tuple[bool, str]:
+    """Check if token passes market filters.
+
+    For safe launchpads (bankr, clanker, virtuals) — skip liquidity check
+    because they have locked LP / bonding curves and can't rug.
+    Only mcap + volume need to pass.
+    """
     if dex is None:
         return False, "no market data"
+
+    is_safe = source.lower() in SAFE_LAUNCHPADS
 
     pair_created = dex.get("pair_created_at", 0)
     if pair_created:
@@ -844,7 +975,8 @@ def passes_market_filters(dex: dict | None) -> tuple[bool, str]:
         failures.append(f"mcap ${mcap:,.0f} < ${MIN_MCAP:,}")
     if vol < MIN_VOLUME_24H:
         failures.append(f"vol ${vol:,.0f} < ${MIN_VOLUME_24H:,}")
-    if liq < MIN_LIQUIDITY:
+    # Only check liquidity for non-safe sources (DexScreener discoveries, unknown DEXes)
+    if not is_safe and liq < MIN_LIQUIDITY:
         failures.append(f"liq ${liq:,.0f} < ${MIN_LIQUIDITY:,}")
 
     if failures:
@@ -1355,11 +1487,13 @@ def format_signal_telegram(launch: dict, dex: dict | None, executed: bool = Fals
             else:
                 age_line = f"🕐 Launched: {age_seconds / 86400:.1f}d ago\n"
 
+        liq_val = dex.get('liquidity', 0)
+        liq_note = " 🔓" if launch["source"] in SAFE_LAUNCHPADS else ""
         market_lines = (
             f"{age_line}"
             f"├ 💰 MCap: {fmt_usd(dex['mcap'])}\n"
             f"├ 📈 Vol: {fmt_usd(dex['volume_24h'])}\n"
-            f"├ 💧 Liq: {fmt_usd(dex['liquidity'])}\n"
+            f"├ 💧 Liq: {fmt_usd(liq_val)}{liq_note}\n"
             f"└ {change_emoji} 1h: {change_1h:+.1f}%"
         )
 
@@ -1444,11 +1578,12 @@ def format_alert_whatsapp(launch: dict, dex: dict | None, executed: bool = False
     if dex:
         change_1h = dex.get("price_change_1h", 0)
         change_emoji = "🟢" if change_1h >= 0 else "🔴"
+        liq_note = " 🔓" if launch["source"] in SAFE_LAUNCHPADS else ""
         lines.extend([
             "",
             f"├ 💰 MCap: {fmt_usd(dex['mcap'])}",
             f"├ 📈 Vol: {fmt_usd(dex['volume_24h'])}",
-            f"├ 💧 Liq: {fmt_usd(dex['liquidity'])}",
+            f"├ 💧 Liq: {fmt_usd(dex['liquidity'])}{liq_note}",
             f"└ {change_emoji} 1h: {change_1h:+.1f}%",
         ])
 
@@ -1490,7 +1625,6 @@ async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, s
     address = launch["address"]
     prefix = "RECHECK " if is_recheck else ""
 
-    # Register full address in map for callback resolution
     addr_truncated = address[:20]
     _address_map[addr_truncated] = address
 
@@ -1514,10 +1648,8 @@ async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, s
         + (" 💸 EXECUTED" if executed else "")
     )
 
-    # Send Telegram with inline buttons, WhatsApp as plain text
     await send_alert_all(session, tg_text, wa_text, token_address=address, symbol=symbol)
 
-    # Pushover emergency alert — repeats every 30s until acknowledged
     dex_url = f"https://dexscreener.com/base/{address}"
     pushover_msg = f"${symbol} · MCap {fmt_usd(dex['mcap'])} · Vol {fmt_usd(dex['volume_24h'])}"
     if launch.get("x_username"):
@@ -1576,7 +1708,8 @@ async def main():
     log.info(f"  Min followers : {MIN_FOLLOWERS:,}")
     log.info(f"  Min MCap      : ${MIN_MCAP:,}")
     log.info(f"  Min Volume 24h: ${MIN_VOLUME_24H:,}")
-    log.info(f"  Min Liquidity : ${MIN_LIQUIDITY:,}")
+    log.info(f"  Min Liquidity : ${MIN_LIQUIDITY:,} (DexScreener-sourced only)")
+    log.info(f"  Safe sources  : {', '.join(SAFE_LAUNCHPADS)} (liq check SKIPPED)")
     log.info(f"  Poll interval : {POLL_INTERVAL}s")
     log.info(f"  Telegram      : {'✅' if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID else '❌'}")
     log.info(f"  WhatsApp      : {'✅' if WHAPI_TOKEN and WHATSAPP_GROUP_ID else '❌'}")
@@ -1651,7 +1784,8 @@ async def main():
                 f"🐋 <b>Whale Alert Bot started</b>\n\n"
                 f"Sources: Bankr + Clanker + Virtuals + DexScreener\n"
                 f"Market data: DexScreener\n"
-                f"Min MCap: ${MIN_MCAP:,} · Vol: ${MIN_VOLUME_24H:,} · Liq: ${MIN_LIQUIDITY:,}\n"
+                f"Min MCap: ${MIN_MCAP:,} · Vol: ${MIN_VOLUME_24H:,}\n"
+                f"Liq: ${MIN_LIQUIDITY:,} (DexScreener only — 🔓 skipped for Bankr/Clanker/Virtuals)\n"
                 f"Polling every {POLL_INTERVAL}s"
                 f"{exec_note}"
                 f"{trade_note}"
@@ -1690,7 +1824,7 @@ async def main():
                     else:
                         dex = await fetch_geckoterminal(session, address)
 
-                    passes, reason = passes_market_filters(dex)
+                    passes, reason = passes_market_filters(dex, source=source)
 
                     if not passes:
                         if "too old" in reason or "likely old" in reason:
@@ -1769,7 +1903,7 @@ async def main():
                         entry["first_seen"] = time.time()
                         entry["checks"] = 1
 
-                    passes, reason = passes_market_filters(dex)
+                    passes, reason = passes_market_filters(dex, source=source)
                     if not passes:
                         if "too old" in reason or "likely old" in reason:
                             log.debug(f"  ♻️ [{source}] ${symbol} — {reason}, dropping")
