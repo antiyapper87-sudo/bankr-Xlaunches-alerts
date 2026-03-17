@@ -256,6 +256,9 @@ def build_trade_keyboard(token_address: str, symbol: str) -> dict:
                 {"text": "📋 Copy CA", "callback_data": f"copyca:0:{addr}"},
                 {"text": "🔍 Research X", "callback_data": f"xresearch:{sym}:{addr}"},
             ],
+            [
+                {"text": "🔎 Ticker X", "callback_data": f"xtickerx:{sym}:{addr}"},
+            ],
         ]
     }
 
@@ -383,6 +386,45 @@ async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: 
                 await send_telegram(session, f"❌ X research failed: {str(e)[:100]}", chat_id=chat_id)
 
         asyncio.create_task(do_x_research())
+        return
+
+    if action == "xtickerx":
+        symbol = second
+        await answer_callback_query(session, callback_id, f"🔎 Fetching latest ${symbol} tweets...")
+        full_address = _address_map.get(addr_truncated, addr_truncated)
+
+        async def do_ticker_search():
+            try:
+                tweets = await search_x_ticker_recent(session, symbol)
+                if not tweets:
+                    await send_telegram(session, f"🔎 <b>Latest tweets: ${symbol}</b>\n\nNo recent tweets found.", chat_id=chat_id)
+                    return
+
+                lines = [f"🔎 <b>Latest tweets: ${symbol}</b>\n"]
+                for t in tweets:
+                    f_count = t['followers']
+                    if f_count >= 1_000_000:
+                        f_str = f"{f_count/1_000_000:.1f}M"
+                    elif f_count >= 1_000:
+                        f_str = f"{f_count/1_000:.0f}K"
+                    else:
+                        f_str = str(f_count)
+                    text_clean = re.sub(r'https?://t\.co/\S+', '', t['text']).strip().replace('\n', ' ')
+                    text_clean = text_clean.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                    if len(text_clean) > 200:
+                        text_clean = text_clean[:197] + "..."
+                    lines.extend([
+                        f"",
+                        f"<a href='{t['url']}'>@{t['username']}</a> · {f_str} · {t['date']}",
+                        f"❤️ {t['likes']} 🔁 {t['retweets']}",
+                        f"<i>{text_clean}</i>" if text_clean else "<i>[media only]</i>",
+                    ])
+                await send_telegram(session, "\n".join(lines), chat_id=chat_id)
+            except Exception as e:
+                log.error(f"Ticker X search callback error: {e}")
+                await send_telegram(session, f"❌ Ticker search failed: {str(e)[:100]}", chat_id=chat_id)
+
+        asyncio.create_task(do_ticker_search())
         return
 
     TRADER_USER_ID = os.getenv("TRADER_USER_ID", "")
@@ -1027,6 +1069,46 @@ async def search_x_mentions(session: aiohttp.ClientSession, ticker: str, token_n
         log.debug(f"X search error for ${ticker}: {e}")
 
     return mentions[:5]
+
+
+async def search_x_ticker_recent(session: aiohttp.ClientSession, ticker: str, limit: int = 8) -> list[dict]:
+    """Search X for most recent tweets mentioning $TICKER — no follower filter, Latest sort."""
+    if not SOCIALDATA_API_KEY:
+        return []
+
+    results = []
+    try:
+        query = f"${ticker}"
+        url = "https://api.socialdata.tools/twitter/search"
+        headers = {
+            "Authorization": f"Bearer {SOCIALDATA_API_KEY}",
+            "Accept": "application/json",
+        }
+        params = {"query": query, "type": "Latest"}
+
+        async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json()
+
+        for tweet in data.get("tweets", [])[:limit]:
+            user = tweet.get("user", {})
+            followers = user.get("followers_count", 0)
+            results.append({
+                "username": user.get("screen_name", ""),
+                "name": user.get("name", ""),
+                "followers": followers,
+                "text": (tweet.get("full_text") or tweet.get("text") or "")[:300],
+                "likes": tweet.get("favorite_count", 0),
+                "retweets": tweet.get("retweet_count", 0),
+                "date": tweet.get("tweet_created_at", "")[:16],
+                "url": f"https://x.com/{user.get('screen_name', '')}/status/{tweet.get('id_str', '')}",
+            })
+
+    except Exception as e:
+        log.debug(f"X ticker search error for ${ticker}: {e}")
+
+    return results
 
 
 async def resolve_deployer_x(session: aiohttp.ClientSession, address: str) -> dict:
