@@ -12,6 +12,9 @@ When a token passes market filters → alerts to Telegram + WhatsApp + Pushover.
 Telegram signals include inline buy/sell buttons (20% / 50% / 100%).
 Auto-execution via Bankr Agent API when AUTO_EXECUTE=true.
 
+After a signal is sent, a 🧠 VERDICT (auto X-research) runs in the BACKGROUND
+and edits the message in place — signal latency is unchanged. See verdict.py.
+
 Liquidity filter is SKIPPED for safe launchpads (Bankr, Clanker, Virtuals)
 because they have locked LP / bonding curves — no rug possible.
 
@@ -27,6 +30,8 @@ import json
 import time
 from pathlib import Path
 from datetime import datetime, timezone
+
+from verdict import build_verdict, format_verdict_block
 
 # ─── Config from environment ──────────────────────────────────────────────────
 
@@ -1730,7 +1735,12 @@ async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, s
         + (" 💸 EXECUTED" if executed else "")
     )
 
-    await send_alert_all(session, tg_text, wa_text, token_address=address, symbol=symbol)
+    # ── Send the signal INSTANTLY (no verdict yet) — capture message_id ──
+    keyboard = build_trade_keyboard(address, symbol)
+    message_id = await send_telegram(session, tg_text, reply_markup=keyboard)
+
+    if WHAPI_TOKEN and WHATSAPP_GROUP_ID:
+        await send_whatsapp(session, wa_text)
 
     dex_url = f"https://dexscreener.com/base/{address}"
     pushover_msg = f"${symbol} · MCap {fmt_usd(dex['mcap'])} · Vol {fmt_usd(dex['volume_24h'])}"
@@ -1740,6 +1750,38 @@ async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, s
 
     signaled_tokens.add(address)
     alert_count += 1
+
+    # ── Verdict runs in the BACKGROUND, then edits the message in place ──
+    # Signal latency is unchanged; the 🧠 block fills in ~3-8s later.
+    if isinstance(message_id, int):
+        asyncio.create_task(
+            _attach_verdict(session, tg_text, keyboard, message_id, launch, source, symbol)
+        )
+
+
+async def _attach_verdict(session: aiohttp.ClientSession, base_text: str, keyboard: dict,
+                          message_id: int, launch: dict, source: str, symbol: str):
+    """Background task: auto-research the launch and edit the signal to append a 🧠 verdict."""
+    try:
+        address = launch["address"]
+        handle = launch.get("x_username", "")
+
+        # If the feed gave no deployer handle, resolve it from Clanker metadata
+        if not handle and source in ("clanker", "bankr"):
+            info = await resolve_deployer_x(session, address)
+            handle = info.get("x_username", "")
+
+        verdict = await build_verdict(session, handle, symbol, launch.get("name", ""))
+        block = format_verdict_block(verdict)
+        new_text = f"{base_text}\n\n{block}"
+
+        ok = await edit_telegram_message(session, TELEGRAM_CHAT_ID, message_id, new_text, reply_markup=keyboard)
+        if ok:
+            log.info(f"  🧠 Verdict: [{source}] ${symbol} → {verdict['emoji']} {verdict['label']} ({verdict['score']}/10)")
+        else:
+            log.warning(f"  ⚠️ Verdict edit rejected for ${symbol}")
+    except Exception as e:
+        log.warning(f"  ⚠️ Verdict attach failed for ${symbol}: {e}")
 
 
 # ─── Seeding ──────────────────────────────────────────────────────────────────
@@ -1872,6 +1914,7 @@ async def main():
                 f"{exec_note}"
                 f"{trade_note}"
                 f"{pushover_note}\n\n"
+                f"🧠 Auto-verdict: ON — signals get an X-research verdict a few seconds after firing\n\n"
                 f"Commands: /research · /block · /unblock · /blocklist · /status · /wallet",
             )
 
