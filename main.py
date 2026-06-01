@@ -34,6 +34,11 @@ from urllib.parse import quote
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+AUTHORIZED_USER_IDS = {
+    user_id.strip()
+    for user_id in os.getenv("AUTHORIZED_USER_IDS", "544999608").split(",")
+    if user_id.strip()
+}
 WHAPI_TOKEN = os.getenv("WHAPI_TOKEN", "")
 WHATSAPP_GROUP_ID = os.getenv("WHATSAPP_GROUP_ID", "")
 SOCIALDATA_API_KEY = os.getenv("SOCIALDATA_API_KEY", "")
@@ -319,6 +324,79 @@ async def answer_callback_query(session: aiohttp.ClientSession, callback_query_i
         return False
 
 
+# ─── Bot Commands ─────────────────────────────────────────────────────────────
+
+BOT_COMMANDS = [
+    {"command": "start", "description": "Show command menu"},
+    {"command": "help", "description": "Show command menu"},
+    {"command": "status", "description": "Runtime status"},
+    {"command": "research", "description": "Research ticker or Base CA"},
+    {"command": "r", "description": "Short alias for research"},
+    {"command": "test", "description": "Send a test signal"},
+    {"command": "wallets", "description": "List tracked wallets"},
+    {"command": "track", "description": "Track wallet: /track 0x... label"},
+    {"command": "untrack", "description": "Stop tracking wallet"},
+    {"command": "block", "description": "Block X account"},
+    {"command": "unblock", "description": "Unblock X account"},
+    {"command": "blocklist", "description": "List blocked accounts"},
+    {"command": "wallet", "description": "Show bot trading wallet"},
+    {"command": "buy", "description": "Manual buy when trading enabled"},
+    {"command": "sell", "description": "Manual sell when trading enabled"},
+]
+
+
+def build_help_text() -> str:
+    auth = ", ".join(sorted(AUTHORIZED_USER_IDS)) if AUTHORIZED_USER_IDS else "none"
+    return (
+        "🐋 <b>Base Bot Commands</b>\n\n"
+        "<b>Research</b>\n"
+        "• <code>/research $TICKER</code> — token research\n"
+        "• <code>/research 0xCONTRACT</code> — CA research on Base\n"
+        "• <code>/r $TICKER</code> — short research alias\n"
+        "• Signal buttons: X Research, Ticker X, Copy CA\n\n"
+        "<b>Wallet tracking</b>\n"
+        "• <code>/track 0xADDRESS [label]</code> — add wallet\n"
+        "• <code>/untrack 0xADDRESS</code> — remove wallet\n"
+        "• <code>/wallets</code> — list tracked wallets\n\n"
+        "<b>Bot control</b>\n"
+        "• <code>/status</code> — runtime status\n"
+        "• <code>/test</code> — send test signal\n"
+        "• <code>/block @user</code> / <code>/unblock @user</code>\n"
+        "• <code>/blocklist</code> — blocked X accounts\n\n"
+        "<b>Trading</b>\n"
+        "• <code>/wallet</code> — bot wallet, requires trading config\n"
+        "• <code>/buy 0xADDRESS 20</code> / <code>/sell 0xADDRESS 50</code>\n\n"
+        f"DM access: <code>{auth}</code>"
+    )
+
+
+def command_name(text: str) -> str:
+    head = text.split(maxsplit=1)[0].lower()
+    return head.split("@", 1)[0]
+
+
+def is_authorized_update(msg: dict) -> bool:
+    chat_id = str(msg.get("chat", {}).get("id", ""))
+    user_id = str(msg.get("from", {}).get("id", ""))
+    return chat_id == TELEGRAM_CHAT_ID or user_id in AUTHORIZED_USER_IDS
+
+
+async def set_bot_commands(session: aiohttp.ClientSession) -> bool:
+    if not TELEGRAM_BOT_TOKEN:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setMyCommands"
+    try:
+        async with session.post(url, json={"commands": BOT_COMMANDS}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status == 200:
+                log.info("✅ Telegram command menu updated")
+                return True
+            body = await resp.text()
+            log.warning(f"setMyCommands failed {resp.status}: {body[:200]}")
+    except Exception as e:
+        log.warning(f"setMyCommands error: {e}")
+    return False
+
+
 # ─── Inline Keyboard Builder ──────────────────────────────────────────────────
 
 def build_x_research_url(token_address: str, symbol: str) -> str:
@@ -599,8 +677,16 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                 continue
 
             log.info(f"📩 Command from chat {chat_id}: {text[:50]}")
+            cmd = command_name(text)
 
-            if text.lower().startswith("/block") and not text.lower().startswith("/blocklist"):
+            if not is_authorized_update(msg):
+                await send_telegram(session, "⛔ Not authorized for this bot.", chat_id=chat_id)
+                continue
+
+            if cmd in ("/start", "/help"):
+                await send_telegram(session, build_help_text(), chat_id=chat_id)
+
+            elif cmd == "/block":
                 parts = text.split(maxsplit=1)
                 if len(parts) < 2:
                     await send_telegram(session, "Usage: /block @username", chat_id)
@@ -612,7 +698,7 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                 log.info(f"🚫 Blocked @{username}")
                 await send_telegram(session, f"🚫 Blocked <b>@{username}</b> — future launches ignored", chat_id)
 
-            elif text.lower().startswith("/unblock"):
+            elif cmd == "/unblock":
                 parts = text.split(maxsplit=1)
                 if len(parts) < 2:
                     await send_telegram(session, "Usage: /unblock @username", chat_id)
@@ -623,14 +709,14 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                 log.info(f"✅ Unblocked @{username}")
                 await send_telegram(session, f"✅ Unblocked <b>@{username}</b>", chat_id)
 
-            elif text.lower().startswith("/blocklist"):
+            elif cmd == "/blocklist":
                 if blocked_accounts:
                     names = "\n".join(f"• @{u}" for u in sorted(blocked_accounts))
                     await send_telegram(session, f"🚫 <b>Blocked ({len(blocked_accounts)}):</b>\n{names}", chat_id)
                 else:
                     await send_telegram(session, "No accounts blocked.", chat_id)
 
-            elif text.lower().startswith("/buy"):
+            elif cmd == "/buy":
                 parts = text.split()
                 if len(parts) != 3:
                     await send_telegram(session, "Usage: /buy 0xADDRESS 20\n(percent = 20, 50, or 100)", chat_id=chat_id)
@@ -667,7 +753,7 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                 except Exception as e:
                     await send_telegram(session, f"❌ Buy error: {str(e)[:150]}", chat_id=chat_id)
 
-            elif text.lower().startswith("/sell"):
+            elif cmd == "/sell":
                 parts = text.split()
                 if len(parts) != 3:
                     await send_telegram(session, "Usage: /sell 0xADDRESS 50\n(percent = 20, 50, or 100)", chat_id=chat_id)
@@ -704,7 +790,7 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                 except Exception as e:
                     await send_telegram(session, f"❌ Sell error: {str(e)[:150]}", chat_id=chat_id)
 
-            elif text.lower().startswith("/test"):
+            elif cmd == "/test":
                 test_launch = {
                     "source": "bankr",
                     "address": "0x1234567890abcdef1234567890abcdef12345678",
@@ -728,7 +814,7 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                 await send_signal(session, test_launch, test_dex, "bankr", "TEST")
                 await send_telegram(session, "✅ Test signal sent", chat_id=chat_id)
 
-            elif text.lower().startswith("/status"):
+            elif cmd == "/status":
                 exec_status = f"✅ ON (${BANKR_BUY_AMOUNT}/trade)" if AUTO_EXECUTE else "❌ OFF"
                 trade_status = "✅ ON" if TRADING_ENABLED else "❌ OFF"
                 pushover_status = "✅ ON" if PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN else "❌ OFF"
@@ -752,7 +838,7 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                     chat_id,
                 )
 
-            elif text.lower() == "/wallet":
+            elif cmd == "/wallet":
                 if not TRADING_ENABLED:
                     await send_telegram(session, "⚠️ Trading not enabled.", chat_id)
                     continue
@@ -772,7 +858,7 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                 except Exception as e:
                     await send_telegram(session, f"❌ Wallet error: {e}", chat_id)
 
-            elif text.lower().startswith("/track "):
+            elif cmd == "/track":
                 parts = text.split(maxsplit=2)
                 address = parts[1].strip() if len(parts) >= 2 else ""
                 label = parts[2].strip() if len(parts) >= 3 else ""
@@ -782,7 +868,7 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                 else:
                     await send_telegram(session, "Usage: /track 0xADDRESS [label]", chat_id)
 
-            elif text.lower().startswith("/untrack "):
+            elif cmd == "/untrack":
                 parts = text.split(maxsplit=1)
                 address = parts[1].strip() if len(parts) == 2 else ""
                 if remove_tracked_wallet(address):
@@ -790,7 +876,7 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                 else:
                     await send_telegram(session, "Wallet not found. Usage: /untrack 0xADDRESS", chat_id)
 
-            elif text.lower() in ("/wallets", "/tracked_wallets"):
+            elif cmd in ("/wallets", "/tracked_wallets"):
                 wallets = load_tracked_wallets()
                 if not wallets:
                     await send_telegram(session, "No wallets tracked yet.\nUse /track 0xADDRESS [label] to add one.", chat_id)
@@ -804,7 +890,7 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                     lines.append(f"   <a href='https://basescan.org/address/{address}'>BaseScan</a>")
                 await send_telegram(session, "\n".join(lines), chat_id)
 
-            elif text.lower().startswith("/research") or text.lower().startswith("/r "):
+            elif cmd in ("/research", "/r"):
                 parts = text.split(maxsplit=1)
                 if len(parts) < 2:
                     await send_telegram(session, "Usage: /research $TICKER or /research 0x...", chat_id)
@@ -817,6 +903,9 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                 except Exception as re:
                     log.error(f"Research error for {ticker_query}: {re}")
                     await send_telegram(session, f"❌ Research failed for {ticker_query}: {str(re)[:100]}", chat_id)
+
+            else:
+                await send_telegram(session, "Unknown command. Use /help.", chat_id=chat_id)
 
     except Exception as e:
         log.warning(f"Telegram command check error: {e}")
@@ -2047,6 +2136,7 @@ async def main():
     log.info(f"  Safe sources  : {', '.join(SAFE_LAUNCHPADS)} (liq check SKIPPED)")
     log.info(f"  Poll interval : {POLL_INTERVAL}s")
     log.info(f"  Telegram      : {'✅' if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID else '❌'}")
+    log.info(f"  Authorized DMs: {', '.join(sorted(AUTHORIZED_USER_IDS)) if AUTHORIZED_USER_IDS else 'none'}")
     log.info(f"  WhatsApp      : {'✅' if WHAPI_TOKEN and WHATSAPP_GROUP_ID else '❌'}")
     log.info(f"  SocialData    : {'✅' if SOCIALDATA_API_KEY else '❌'}")
     log.info(f"  Pushover      : {'✅' if PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN else '❌ NOT SET'}")
@@ -2056,6 +2146,7 @@ async def main():
     log.info("=" * 60)
 
     async with aiohttp.ClientSession() as session:
+        await set_bot_commands(session)
 
         # DexScreener health check
         try:
@@ -2125,7 +2216,7 @@ async def main():
                 f"{exec_note}"
                 f"{trade_note}"
                 f"{pushover_note}\n\n"
-                f"Commands: /research · /block · /unblock · /blocklist · /status · /wallet",
+                f"Commands: /help · /research · /status · /wallets · /track",
             )
 
         while True:
