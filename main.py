@@ -27,6 +27,7 @@ import json
 import time
 from pathlib import Path
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 # ─── Config from environment ──────────────────────────────────────────────────
 
@@ -243,20 +244,27 @@ async def answer_callback_query(session: aiohttp.ClientSession, callback_query_i
 
 # ─── Inline Keyboard Builder ──────────────────────────────────────────────────
 
+def build_x_research_url(token_address: str, symbol: str) -> str:
+    clean_symbol = (symbol or "").strip().lstrip("$")
+    query = f"{token_address} OR ${clean_symbol}" if clean_symbol else token_address
+    return f"https://x.com/search?q={quote(query, safe='$')}&src=typed_query"
+
+
 def build_trade_keyboard(token_address: str, symbol: str) -> dict:
     addr = token_address[:20]
     sym = symbol[:10]
     banana_url = f"https://t.me/BananaGun_bot?start={token_address}"
+    x_research_url = build_x_research_url(token_address, symbol)
     return {
         "inline_keyboard": [
             [
                 {"text": "🍌 Buy on Banana Gun", "url": banana_url},
             ],
             [
-                {"text": "📋 Copy CA", "callback_data": f"copyca:0:{addr}"},
-                {"text": "🔍 Research X", "callback_data": f"xresearch:{sym}:{addr}"},
+                {"text": "🔎 X Research", "url": x_research_url},
             ],
             [
+                {"text": "📋 Copy CA", "callback_data": f"copyca:0:{addr}"},
                 {"text": "🔎 Ticker X", "callback_data": f"xtickerx:{sym}:{addr}"},
             ],
         ]
