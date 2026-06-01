@@ -7,3 +7,4 @@ venv/
 *.log
 *.pid
 run_local.sh
+data/tracked_wallets.json

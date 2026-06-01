@@ -25,6 +25,7 @@ import os
 import re
 import json
 import time
+import html
 from pathlib import Path
 from datetime import datetime, timezone
 from urllib.parse import quote
@@ -37,6 +38,8 @@ WHAPI_TOKEN = os.getenv("WHAPI_TOKEN", "")
 WHATSAPP_GROUP_ID = os.getenv("WHATSAPP_GROUP_ID", "")
 SOCIALDATA_API_KEY = os.getenv("SOCIALDATA_API_KEY", "")
 MIN_FOLLOWERS = int(os.getenv("MIN_FOLLOWERS", "5000"))
+RESEARCH_MIN_FOLLOWERS = int(os.getenv("RESEARCH_MIN_FOLLOWERS", "1000"))
+RESEARCH_HIGH_SIGNAL_SCORE = int(os.getenv("RESEARCH_HIGH_SIGNAL_SCORE", "8"))
 MIN_MCAP = int(os.getenv("MIN_MCAP", "50000"))
 MIN_VOLUME_24H = int(os.getenv("MIN_VOLUME_24H", "30000"))
 MIN_LIQUIDITY = int(os.getenv("MIN_LIQUIDITY", "30000"))
@@ -95,6 +98,10 @@ recheck_queue: dict[str, dict] = {}
 # ─── Blocklist ────────────────────────────────────────────────────────────────
 
 BLOCKLIST_FILE = Path("/data/blocklist.json") if Path("/data").exists() else Path("blocklist.json")
+DATA_DIR = Path("/data") if Path("/data").exists() else Path("data")
+INFLUENCER_ACCOUNTS_FILE = DATA_DIR / "accounts.txt"
+HIGH_PRIORITY_ACCOUNTS_FILE = DATA_DIR / "high_priority.txt"
+TRACKED_WALLETS_FILE = DATA_DIR / "tracked_wallets.json"
 
 # ─── Safe launchpads (locked LP / bonding curves — no rug possible) ───────────
 SAFE_LAUNCHPADS = {"bankr", "clanker", "virtuals"}
@@ -123,6 +130,76 @@ def save_blocklist(blocked: set[str]):
 
 
 blocked_accounts: set[str] = load_blocklist()
+
+
+def load_account_file(path: Path) -> list[str]:
+    try:
+        if not path.exists():
+            return []
+        accounts = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            account = line.strip().lstrip("@")
+            if account and not account.startswith("#"):
+                accounts.append(account)
+        return accounts
+    except Exception as e:
+        log.error(f"Error loading accounts from {path}: {e}")
+        return []
+
+
+WATCHED_INFLUENCERS = load_account_file(INFLUENCER_ACCOUNTS_FILE)
+HIGH_PRIORITY_INFLUENCERS = {u.lower() for u in load_account_file(HIGH_PRIORITY_ACCOUNTS_FILE)}
+
+
+def load_tracked_wallets() -> list[dict]:
+    try:
+        if TRACKED_WALLETS_FILE.exists():
+            data = json.loads(TRACKED_WALLETS_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return [w for w in data if isinstance(w, dict) and w.get("address")]
+    except Exception as e:
+        log.error(f"Error loading tracked wallets: {e}")
+    return []
+
+
+def save_tracked_wallets(wallets: list[dict]):
+    try:
+        TRACKED_WALLETS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        TRACKED_WALLETS_FILE.write_text(json.dumps(wallets, indent=2), encoding="utf-8")
+    except Exception as e:
+        log.error(f"Error saving tracked wallets: {e}")
+
+
+def add_tracked_wallet(address: str, label: str = "", chain: str = "base") -> bool:
+    address = address.strip()
+    if not re.fullmatch(r"0x[a-fA-F0-9]{40}", address):
+        return False
+    wallets = load_tracked_wallets()
+    normalized = address.lower()
+    for wallet in wallets:
+        if wallet["address"].lower() == normalized:
+            wallet["label"] = label
+            wallet["chain"] = chain
+            save_tracked_wallets(wallets)
+            return True
+    wallets.append({
+        "address": normalized,
+        "label": label,
+        "chain": chain,
+        "added_at": datetime.now(timezone.utc).isoformat(),
+    })
+    save_tracked_wallets(wallets)
+    return True
+
+
+def remove_tracked_wallet(address: str) -> bool:
+    normalized = address.strip().lower()
+    wallets = load_tracked_wallets()
+    updated = [w for w in wallets if w["address"].lower() != normalized]
+    if len(updated) == len(wallets):
+        return False
+    save_tracked_wallets(updated)
+    return True
 
 
 # ─── Bankr Auto-Execution ─────────────────────────────────────────────────────
@@ -369,7 +446,7 @@ async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: 
 
         async def do_x_research():
             try:
-                mentions = await search_x_mentions(session, symbol)
+                mentions = await search_x_mentions(session, symbol, address=full_address)
                 if not mentions:
                     await send_telegram(session, f"🔍 <b>X Research: ${symbol}</b>\n\nNo notable mentions found (10K+ followers).", chat_id=chat_id)
                     return
@@ -403,7 +480,7 @@ async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: 
 
         async def do_ticker_search():
             try:
-                tweets = await search_x_ticker_recent(session, symbol)
+                tweets = await search_x_ticker_recent(session, symbol, full_address)
                 if not tweets:
                     await send_telegram(session, f"🔎 <b>Latest tweets: ${symbol}</b>\n\nNo recent tweets found.", chat_id=chat_id)
                     return
@@ -675,7 +752,7 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                     chat_id,
                 )
 
-            elif text.lower().startswith("/wallet"):
+            elif text.lower() == "/wallet":
                 if not TRADING_ENABLED:
                     await send_telegram(session, "⚠️ Trading not enabled.", chat_id)
                     continue
@@ -694,6 +771,38 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                     )
                 except Exception as e:
                     await send_telegram(session, f"❌ Wallet error: {e}", chat_id)
+
+            elif text.lower().startswith("/track "):
+                parts = text.split(maxsplit=2)
+                address = parts[1].strip() if len(parts) >= 2 else ""
+                label = parts[2].strip() if len(parts) >= 3 else ""
+                if add_tracked_wallet(address, label):
+                    label_text = f" — {html.escape(label)}" if label else ""
+                    await send_telegram(session, f"✅ Tracking wallet\n<code>{address.lower()}</code>{label_text}", chat_id)
+                else:
+                    await send_telegram(session, "Usage: /track 0xADDRESS [label]", chat_id)
+
+            elif text.lower().startswith("/untrack "):
+                parts = text.split(maxsplit=1)
+                address = parts[1].strip() if len(parts) == 2 else ""
+                if remove_tracked_wallet(address):
+                    await send_telegram(session, f"✅ Untracked wallet\n<code>{address.lower()}</code>", chat_id)
+                else:
+                    await send_telegram(session, "Wallet not found. Usage: /untrack 0xADDRESS", chat_id)
+
+            elif text.lower() in ("/wallets", "/tracked_wallets"):
+                wallets = load_tracked_wallets()
+                if not wallets:
+                    await send_telegram(session, "No wallets tracked yet.\nUse /track 0xADDRESS [label] to add one.", chat_id)
+                    continue
+                lines = [f"🐋 <b>Tracked Wallets ({len(wallets)})</b>"]
+                for idx, wallet in enumerate(wallets[:30], 1):
+                    label = html.escape(wallet.get("label", ""))
+                    suffix = f" — {label}" if label else ""
+                    address = wallet["address"]
+                    lines.append(f"{idx}. <code>{address}</code>{suffix}")
+                    lines.append(f"   <a href='https://basescan.org/address/{address}'>BaseScan</a>")
+                await send_telegram(session, "\n".join(lines), chat_id)
 
             elif text.lower().startswith("/research") or text.lower().startswith("/r "):
                 parts = text.split(maxsplit=1)
@@ -1037,86 +1146,198 @@ def passes_market_filters(dex: dict | None, source: str = "") -> tuple[bool, str
 
 # ─── Token Research ───────────────────────────────────────────────────────────
 
-async def search_x_mentions(session: aiohttp.ClientSession, ticker: str, token_name: str = "") -> list[dict]:
-    if not SOCIALDATA_API_KEY:
-        return []
-
-    mentions = []
-    try:
-        query = f"${ticker} min_faves:10"
-        url = "https://api.socialdata.tools/twitter/search"
-        headers = {
-            "Authorization": f"Bearer {SOCIALDATA_API_KEY}",
-            "Accept": "application/json",
-        }
-        params = {"query": query, "type": "Top"}
-
-        async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-            if resp.status != 200:
-                return []
-            data = await resp.json()
-
-        for tweet in data.get("tweets", [])[:10]:
-            user = tweet.get("user", {})
-            followers = user.get("followers_count", 0)
-            if followers < 10000:
-                continue
-            mentions.append({
-                "username": user.get("screen_name", ""),
-                "name": user.get("name", ""),
-                "followers": followers,
-                "text": (tweet.get("full_text") or tweet.get("text") or "")[:300],
-                "likes": tweet.get("favorite_count", 0),
-                "retweets": tweet.get("retweet_count", 0),
-                "date": tweet.get("tweet_created_at", "")[:10],
-                "url": f"https://x.com/{user.get('screen_name', '')}/status/{tweet.get('id_str', '')}",
-            })
-
-        mentions.sort(key=lambda m: m["followers"], reverse=True)
-    except Exception as e:
-        log.debug(f"X search error for ${ticker}: {e}")
-
-    return mentions[:5]
+RESEARCH_TIER1_KEYWORDS = {
+    "thesis", "conviction", "undervalued", "re-rating", "moat",
+    "flywheel", "asymmetric", "mispriced", "alpha", "inevitable",
+    "paradigm", "revaluation", "asymmetrical",
+}
+RESEARCH_TIER2_KEYWORDS = {
+    "buy", "bag", "catalyst", "add", "loading", "dip", "entry",
+    "hold", "accumulation", "position", "gem", "play", "upside",
+    "watchlist", "long term", "early", "sleeper", "overlooked",
+    "under the radar",
+}
+RESEARCH_METRIC_KEYWORDS = {
+    "tvl", "volume", "revenue", "fees", "yield", "mainnet", "tge",
+    "listing", "unlock", "fdv", "mc", "inflows", "outflows",
+    "whale", "dominance", "holders", "burn", "deflationary",
+    "onchain", "circulating supply",
+}
 
 
-async def search_x_ticker_recent(session: aiohttp.ClientSession, ticker: str, limit: int = 8) -> list[dict]:
-    """Search X for most recent tweets mentioning $TICKER — no follower filter, Latest sort."""
+def contains_term(text_lower: str, term: str) -> bool:
+    return bool(re.search(rf"(?<![A-Za-z0-9_]){re.escape(term.lower())}(?![A-Za-z0-9_])", text_lower))
+
+
+def build_research_query(ticker: str, address: str = "") -> str:
+    clean_ticker = (ticker or "").strip().lstrip("$")
+    terms = []
+    if address:
+        terms.append(address.lower())
+    if clean_ticker:
+        terms.append(f"${clean_ticker.upper()}")
+    if not terms:
+        return ""
+    return terms[0] if len(terms) == 1 else "(" + " OR ".join(terms) + ")"
+
+
+def score_research_tweet(tweet: dict) -> dict:
+    text = re.sub(r"https?://t\.co/\S+", "", tweet.get("text", "")).strip()
+    lower = text.lower()
+    score = 0
+    tier = 3
+
+    tier1_hits = sum(1 for kw in RESEARCH_TIER1_KEYWORDS if contains_term(lower, kw))
+    tier2_hits = sum(1 for kw in RESEARCH_TIER2_KEYWORDS if contains_term(lower, kw))
+    metric_hits = sum(1 for kw in RESEARCH_METRIC_KEYWORDS if contains_term(lower, kw))
+    if tier1_hits:
+        score += tier1_hits * 6
+        tier = 1
+    if tier2_hits:
+        score += tier2_hits * 3
+        if tier != 1:
+            tier = 2
+    score += metric_hits * 2
+
+    if tweet.get("high_priority"):
+        score += 5
+        if tier == 3:
+            tier = 2
+
+    likes = int(tweet.get("likes") or 0)
+    retweets = int(tweet.get("retweets") or 0)
+    replies = int(tweet.get("replies") or 0)
+    views = int(tweet.get("views") or 0)
+    followers = int(tweet.get("followers") or 0)
+
+    score += 6 if likes >= 200 else 4 if likes >= 50 else 2 if likes >= 10 else 0
+    score += 4 if retweets >= 100 else 2 if retweets >= 25 else 1 if retweets >= 5 else 0
+    score += 3 if replies >= 100 else 2 if replies >= 50 else 1 if replies >= 10 else 0
+    score += 3 if views >= 100_000 else 2 if views >= 10_000 else 1 if views >= 1_000 else 0
+    score += 4 if followers >= 100_000 else 3 if followers >= 50_000 else 2 if followers >= 10_000 else 1 if followers >= 1_000 else 0
+
+    if any(contains_term(lower, noise) for noise in ("gm", "gn", "lol", "lmao", "vibes", "shitpost")):
+        score -= 2
+
+    tweet["score"] = max(score, 0)
+    tweet["tier"] = tier
+    return tweet
+
+
+def parse_socialdata_tweet(tweet: dict) -> dict | None:
+    user = tweet.get("user", {})
+    username = user.get("screen_name", "")
+    tweet_id = tweet.get("id_str", "")
+    text = (tweet.get("full_text") or tweet.get("text") or "").strip()
+    if not username or not tweet_id or not text:
+        return None
+    item = {
+        "username": username,
+        "name": user.get("name", ""),
+        "followers": int(user.get("followers_count") or 0),
+        "text": text[:500],
+        "likes": int(tweet.get("favorite_count") or 0),
+        "retweets": int(tweet.get("retweet_count") or 0),
+        "replies": int(tweet.get("reply_count") or 0),
+        "views": int(tweet.get("views_count") or 0),
+        "date": (tweet.get("tweet_created_at") or "")[:16],
+        "url": f"https://x.com/{username}/status/{tweet_id}",
+        "high_priority": username.lower() in HIGH_PRIORITY_INFLUENCERS,
+    }
+    return score_research_tweet(item)
+
+
+async def socialdata_search(
+    session: aiohttp.ClientSession,
+    query: str,
+    search_type: str = "Top",
+    limit: int = 20,
+    timeout_sec: int = 10,
+) -> list[dict]:
     if not SOCIALDATA_API_KEY:
         return []
 
     results = []
     try:
-        query = f"${ticker}"
         url = "https://api.socialdata.tools/twitter/search"
         headers = {
             "Authorization": f"Bearer {SOCIALDATA_API_KEY}",
             "Accept": "application/json",
         }
-        params = {"query": query, "type": "Latest"}
+        params = {"query": query, "type": search_type}
 
-        async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+        async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=timeout_sec)) as resp:
             if resp.status != 200:
+                body = await resp.text()
+                log.debug(f"SocialData search {resp.status}: {body[:160]}")
                 return []
             data = await resp.json()
 
-        for tweet in data.get("tweets", [])[:limit]:
-            user = tweet.get("user", {})
-            followers = user.get("followers_count", 0)
-            results.append({
-                "username": user.get("screen_name", ""),
-                "name": user.get("name", ""),
-                "followers": followers,
-                "text": (tweet.get("full_text") or tweet.get("text") or "")[:300],
-                "likes": tweet.get("favorite_count", 0),
-                "retweets": tweet.get("retweet_count", 0),
-                "date": tweet.get("tweet_created_at", "")[:16],
-                "url": f"https://x.com/{user.get('screen_name', '')}/status/{tweet.get('id_str', '')}",
-            })
-
+        seen_urls = set()
+        for tweet in data.get("tweets", []):
+            item = parse_socialdata_tweet(tweet)
+            if not item or item["url"] in seen_urls:
+                continue
+            seen_urls.add(item["url"])
+            results.append(item)
+            if len(results) >= limit:
+                break
     except Exception as e:
-        log.debug(f"X ticker search error for ${ticker}: {e}")
+        log.debug(f"SocialData search error for '{query[:60]}': {e}")
 
     return results
+
+
+async def search_x_mentions(session: aiohttp.ClientSession, ticker: str, token_name: str = "", address: str = "") -> list[dict]:
+    query = build_research_query(ticker, address)
+    if not query:
+        return []
+
+    mentions = await socialdata_search(session, f"{query} min_faves:5", search_type="Top", limit=20)
+    mentions = [
+        m for m in mentions
+        if m["followers"] >= RESEARCH_MIN_FOLLOWERS
+        or m.get("high_priority")
+        or m.get("score", 0) >= RESEARCH_HIGH_SIGNAL_SCORE
+    ]
+    mentions.sort(key=lambda m: (m.get("tier", 3) == 1, m.get("score", 0), m["followers"], m["likes"]), reverse=True)
+    return mentions[:6]
+
+
+async def search_x_ticker_recent(session: aiohttp.ClientSession, ticker: str, address: str = "", limit: int = 8) -> list[dict]:
+    """Search X for most recent tweets mentioning $TICKER or contract."""
+    query = build_research_query(ticker, address)
+    if not query:
+        return []
+    return await socialdata_search(session, query, search_type="Latest", limit=limit)
+
+
+async def search_influencer_mentions(session: aiohttp.ClientSession, ticker: str, address: str = "", limit: int = 8) -> list[dict]:
+    """Search watched influencer accounts imported from Jarvis."""
+    if not WATCHED_INFLUENCERS:
+        return []
+
+    token_query = build_research_query(ticker, address)
+    if not token_query:
+        return []
+
+    found = []
+    seen = set()
+    batch_size = 12
+    for i in range(0, len(WATCHED_INFLUENCERS), batch_size):
+        batch = WATCHED_INFLUENCERS[i:i + batch_size]
+        from_query = "(" + " OR ".join(f"from:{account}" for account in batch) + ")"
+        tweets = await socialdata_search(session, f"{token_query} {from_query}", search_type="Latest", limit=limit)
+        for tweet in tweets:
+            if tweet["url"] in seen:
+                continue
+            tweet["watched_influencer"] = True
+            seen.add(tweet["url"])
+            found.append(tweet)
+        if len(found) >= limit:
+            break
+    found.sort(key=lambda m: (m.get("high_priority", False), m.get("score", 0), m["followers"], m["likes"]), reverse=True)
+    return found[:limit]
 
 
 async def resolve_deployer_x(session: aiohttp.ClientSession, address: str) -> dict:
@@ -1268,10 +1489,13 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
     if address:
         deployer_info = await resolve_deployer_x(session, address)
 
-    x_mentions = await search_x_mentions(session, ticker, token_name)
+    x_mentions = await search_x_mentions(session, ticker, token_name, address)
+    influencer_mentions = await search_influencer_mentions(session, ticker, address)
+    existing_urls = {m["url"] for m in x_mentions}
+    influencer_mentions = [m for m in influencer_mentions if m["url"] not in existing_urls]
     was_alerted = address.lower() in seen_tokens if address else False
 
-    if not dex and not x_mentions:
+    if not dex and not x_mentions and not influencer_mentions:
         return (
             f"🔍 <b>No data found for ${ticker}</b>\n\n"
             f"No market data on Base or notable X mentions.\n"
@@ -1284,6 +1508,7 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
 
     if address:
         lines.append(f"📋 <code>{address}</code>\n")
+        lines.append(f"🔎 <a href='{build_x_research_url(address, ticker)}'>X Research</a>\n")
 
     if dex:
         change_1h = dex.get("price_change_1h", 0)
@@ -1339,23 +1564,43 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
         lines.append("")
 
     if x_mentions:
-        lines.append(f"🐦 <b>Notable X mentions (${ticker}):</b>")
+        lines.append(f"🐦 <b>Notable X mentions (${ticker} / CA):</b>")
         for m in x_mentions:
             f_count = m['followers']
             f_str = f"{f_count/1_000_000:.1f}M" if f_count >= 1_000_000 else f"{f_count/1_000:.0f}K" if f_count >= 1_000 else str(f_count)
             text_clean = re.sub(r'https?://t\.co/\S+', '', m['text']).strip().replace('\n', ' ').replace('  ', ' ')
-            text_clean = text_clean.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            text_clean = html.escape(text_clean)
             if len(text_clean) > 280:
                 text_clean = text_clean[:277] + "..."
+            tier = m.get("tier", 3)
+            score = m.get("score", 0)
+            hp = " ★" if m.get("high_priority") else ""
             lines.extend([
                 f"",
-                f"├ <a href='{m['url']}'>@{m['username']}</a> ({f_str} followers) · {m['date']}",
-                f"│ ❤️ {m['likes']} 🔁 {m['retweets']}",
+                f"├ <a href='{m['url']}'>@{html.escape(m['username'])}</a>{hp} ({f_str} followers) · T{tier}/S{score} · {m['date']}",
+                f"│ ❤️ {m['likes']} 🔁 {m['retweets']} 💬 {m.get('replies', 0)}",
                 f"│ <i>{text_clean}</i>" if text_clean else f"│ <i>[media only]</i>",
             ])
         lines.append("")
     else:
         lines.append(f"\n🐦 No notable X mentions found for ${ticker}\n")
+
+    if influencer_mentions:
+        lines.append(f"👀 <b>Watched influencer mentions:</b>")
+        for m in influencer_mentions[:6]:
+            f_count = m['followers']
+            f_str = f"{f_count/1_000_000:.1f}M" if f_count >= 1_000_000 else f"{f_count/1_000:.0f}K" if f_count >= 1_000 else str(f_count)
+            text_clean = re.sub(r'https?://t\.co/\S+', '', m['text']).strip().replace('\n', ' ').replace('  ', ' ')
+            text_clean = html.escape(text_clean)
+            if len(text_clean) > 220:
+                text_clean = text_clean[:217] + "..."
+            hp = " ★" if m.get("high_priority") else ""
+            lines.extend([
+                f"",
+                f"├ <a href='{m['url']}'>@{html.escape(m['username'])}</a>{hp} ({f_str}) · S{m.get('score', 0)} · {m['date']}",
+                f"│ <i>{text_clean}</i>" if text_clean else f"│ <i>[media only]</i>",
+            ])
+        lines.append("")
 
     if address:
         lines.extend([
