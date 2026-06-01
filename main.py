@@ -254,7 +254,7 @@ def build_trade_keyboard(token_address: str, symbol: str) -> dict:
     addr = token_address[:20]
     sym = symbol[:10]
     banana_url = f"https://t.me/BananaGun_bot?start={token_address}"
-    nitter_url = f"{NITTER_BASE}/search?q=%24{sym}"
+    nitter_url = f"{NITTER_BASE}/search?f=tweets&q=%24{sym}"
     return {
         "inline_keyboard": [
             [
