@@ -9,11 +9,12 @@ Monitors FIVE sources for new token launches on Base:
   5. DexScreener — catch-all via profiles/boosts/search (ApeStore, direct deploys)
 
 When a token passes market filters → alerts to Telegram + WhatsApp + Pushover.
-Telegram signals include inline buy/sell buttons (20% / 50% / 100%).
+Telegram signals include inline buttons (Banana Gun, Copy CA, Research X, Ticker X, Nitter).
 Auto-execution via Bankr Agent API when AUTO_EXECUTE=true.
 
 After a signal is sent, a 🧠 VERDICT (auto X-research) runs in the BACKGROUND
 and edits the message in place — signal latency is unchanged. See verdict.py.
+The verdict gathers SocialData facts AND has Grok investigate X live.
 
 Liquidity filter is SKIPPED for safe launchpads (Bankr, Clanker, Virtuals)
 because they have locked LP / bonding curves — no rug possible.
@@ -45,6 +46,7 @@ MIN_MCAP = int(os.getenv("MIN_MCAP", "50000"))
 MIN_VOLUME_24H = int(os.getenv("MIN_VOLUME_24H", "30000"))
 MIN_LIQUIDITY = int(os.getenv("MIN_LIQUIDITY", "30000"))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
+NITTER_BASE = os.getenv("NITTER_BASE", "https://nitter.net")
 
 # ─── Bankr Execution Config ───────────────────────────────────────────────────
 BANKR_EXECUTION_API_KEY = os.getenv("BANKR_EXECUTION_API_KEY", "")
@@ -252,6 +254,7 @@ def build_trade_keyboard(token_address: str, symbol: str) -> dict:
     addr = token_address[:20]
     sym = symbol[:10]
     banana_url = f"https://t.me/BananaGun_bot?start={token_address}"
+    nitter_url = f"{NITTER_BASE}/search?q=%24{sym}"
     return {
         "inline_keyboard": [
             [
@@ -263,6 +266,7 @@ def build_trade_keyboard(token_address: str, symbol: str) -> dict:
             ],
             [
                 {"text": "🔎 Ticker X", "callback_data": f"xtickerx:{sym}:{addr}"},
+                {"text": "🐦 Nitter", "url": nitter_url},
             ],
         ]
     }
@@ -831,7 +835,6 @@ GECKO_RATE_LIMIT = 25  # stay under 30/min with safety margin
 def _gecko_rate_ok() -> bool:
     """Check if we can make a GeckoTerminal call without hitting rate limit."""
     now = time.time()
-    # Purge calls older than 60s
     while _gecko_calls and _gecko_calls[0] < now - 60:
         _gecko_calls.pop(0)
     return len(_gecko_calls) < GECKO_RATE_LIMIT
@@ -857,12 +860,9 @@ async def _fetch_geckoterminal_api(session: aiohttp.ClientSession, token_address
                 return None
             data = await resp.json()
 
-        # GeckoTerminal returns token info — we need pool data for mcap/vol/liq
-        # Try the pools endpoint instead
         token_data = data.get("data", {})
         attrs = token_data.get("attributes", {})
 
-        # Now fetch pools for this token
         pools_url = f"{GECKOTERMINAL_API_URL}/networks/base/tokens/{token_address}/pools"
         params = {"page": 1}
         _gecko_calls.append(time.time())
@@ -877,7 +877,6 @@ async def _fetch_geckoterminal_api(session: aiohttp.ClientSession, token_address
         if not pools:
             return None
 
-        # Find the best pool by reserve (liquidity)
         best = None
         best_reserve = -1
         for pool in pools:
@@ -890,7 +889,6 @@ async def _fetch_geckoterminal_api(session: aiohttp.ClientSession, token_address
         if not best:
             return None
 
-        # Parse GeckoTerminal pool format
         mcap = float(best.get("market_cap_usd") or best.get("fdv_usd") or 0)
         vol_raw = best.get("volume_usd") or {}
         vol_24h = float(vol_raw.get("h24") or 0)
@@ -908,14 +906,13 @@ async def _fetch_geckoterminal_api(session: aiohttp.ClientSession, token_address
             "price_change_1h": float(price_changes.get("h1") or 0),
             "price_change_24h": float(price_changes.get("h24") or 0),
             "pair_url": f"https://www.geckoterminal.com/base/pools/{best.get('address', token_address)}",
-            "pair_created_at": 0,  # GeckoTerminal returns ISO date, convert if needed
+            "pair_created_at": 0,
             "token_name": token_name,
             "token_symbol": token_symbol,
             "dex_id": best.get("dex_id", ""),
             "_source": "geckoterminal",
         }
 
-        # Try to parse pool_created_at from ISO string
         created_str = best.get("pool_created_at", "")
         if created_str:
             try:
@@ -934,13 +931,7 @@ async def _fetch_geckoterminal_api(session: aiohttp.ClientSession, token_address
 
 
 async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str) -> dict | None:
-    """Fetch market data: DexScreener first, GeckoTerminal fallback.
-
-    GeckoTerminal is used when DexScreener returns:
-    - No data at all (not indexed yet)
-    - $0 liquidity (common with Uniswap V4 pairs)
-    - $0 mcap but token exists
-    """
+    """Fetch market data: DexScreener first, GeckoTerminal fallback."""
     token_address = token_address.lower()
 
     if token_address in gecko_cache:
@@ -949,29 +940,22 @@ async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str
         if time.time() - cached_time < ttl:
             return cached_result
 
-    # ── Primary: DexScreener ──
     result = await _fetch_dexscreener(session, token_address)
 
-    # ── Fallback: GeckoTerminal ──
-    # Trigger when DexScreener returns nothing OR has data gaps
     needs_fallback = False
     if result is None:
         needs_fallback = True
     elif result.get("liquidity", 0) == 0 and result.get("mcap", 0) > 0:
-        # DexScreener has the token but $0 liquidity — V4 indexing gap
         needs_fallback = True
     elif result.get("mcap", 0) == 0 and result.get("volume_24h", 0) == 0:
-        # DexScreener returned empty data
         needs_fallback = True
 
     if needs_fallback:
         gecko_result = await _fetch_geckoterminal_api(session, token_address)
         if gecko_result:
             if result is None:
-                # DexScreener had nothing — use GeckoTerminal entirely
                 result = gecko_result
             else:
-                # DexScreener had partial data — merge: prefer non-zero values
                 if gecko_result.get("liquidity", 0) > result.get("liquidity", 0):
                     result["liquidity"] = gecko_result["liquidity"]
                 if gecko_result.get("mcap", 0) > result.get("mcap", 0):
@@ -982,7 +966,6 @@ async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str
                     result["pair_created_at"] = gecko_result["pair_created_at"]
                 result["_source"] = "dexscreener+geckoterminal"
 
-    # Cache the result
     gecko_cache[token_address] = (time.time(), result)
     return result
 
@@ -991,12 +974,7 @@ MAX_TOKEN_AGE = int(os.getenv("MAX_TOKEN_AGE", str(4 * 3600)))
 
 
 def passes_market_filters(dex: dict | None, source: str = "") -> tuple[bool, str]:
-    """Check if token passes market filters.
-
-    For safe launchpads (bankr, clanker, virtuals) — skip liquidity check
-    because they have locked LP / bonding curves and can't rug.
-    Only mcap + volume need to pass.
-    """
+    """Check if token passes market filters."""
     if dex is None:
         return False, "no market data"
 
@@ -1022,7 +1000,6 @@ def passes_market_filters(dex: dict | None, source: str = "") -> tuple[bool, str
         failures.append(f"mcap ${mcap:,.0f} < ${MIN_MCAP:,}")
     if vol < MIN_VOLUME_24H:
         failures.append(f"vol ${vol:,.0f} < ${MIN_VOLUME_24H:,}")
-    # Only check liquidity for non-safe sources (DexScreener discoveries, unknown DEXes)
     if not is_safe and liq < MIN_LIQUIDITY:
         failures.append(f"liq ${liq:,.0f} < ${MIN_LIQUIDITY:,}")
 
@@ -1752,7 +1729,7 @@ async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, s
     alert_count += 1
 
     # ── Verdict runs in the BACKGROUND, then edits the message in place ──
-    # Signal latency is unchanged; the 🧠 block fills in ~3-8s later.
+    # Signal latency is unchanged; the 🧠 block fills in a few seconds later.
     if isinstance(message_id, int):
         asyncio.create_task(
             _attach_verdict(session, tg_text, keyboard, message_id, launch, source, symbol)
@@ -1761,7 +1738,8 @@ async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, s
 
 async def _attach_verdict(session: aiohttp.ClientSession, base_text: str, keyboard: dict,
                           message_id: int, launch: dict, source: str, symbol: str):
-    """Background task: auto-research the launch and edit the signal to append a 🧠 verdict."""
+    """Background task: auto-research the launch (SocialData + Grok live X search)
+    and edit the signal to append a 🧠 verdict."""
     try:
         address = launch["address"]
         handle = launch.get("x_username", "")
@@ -1771,7 +1749,7 @@ async def _attach_verdict(session: aiohttp.ClientSession, base_text: str, keyboa
             info = await resolve_deployer_x(session, address)
             handle = info.get("x_username", "")
 
-        verdict = await build_verdict(session, handle, symbol, launch.get("name", ""))
+        verdict = await build_verdict(session, handle, symbol, launch.get("name", ""), launch.get("address", ""))
         block = format_verdict_block(verdict)
         new_text = f"{base_text}\n\n{block}"
 
@@ -1914,7 +1892,7 @@ async def main():
                 f"{exec_note}"
                 f"{trade_note}"
                 f"{pushover_note}\n\n"
-                f"🧠 Auto-verdict: ON — signals get an X-research verdict a few seconds after firing\n\n"
+                f"🧠 Auto-verdict: ON — SocialData facts + Grok live X search, attached a few seconds after each signal\n\n"
                 f"Commands: /research · /block · /unblock · /blocklist · /status · /wallet",
             )
 
