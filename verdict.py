@@ -3,26 +3,28 @@ verdict.py — Auto-research & legitimacy scoring for Whale Alert Bot
 ===================================================================
 Runs AFTER a signal is sent (as a background task) and edits the
 Telegram message in-place to append a 🧠 VERDICT block — so signal
-latency is UNCHANGED. The signal lands instantly; the verdict fills
-in ~3-8s later by editing the same message.
+latency is UNCHANGED.
 
-Codifies the manual X-research workflow:
-  1. Deployer credibility — followers + bio (role / project affiliation)
-  2. Project page         — is there an X account named after the ticker?
-  3. Notable mentions     — 10K+ follower accounts talking about $TICKER
+HYBRID design:
+  • SocialData gathers the HARD FACTS from X (exact follower counts,
+    deployer bio, project-page existence, notable mentions).
+  • Grok then INVESTIGATES X LIVE (X Search enabled) — reading the
+    deployer account, the ticker, and any project account — and returns
+    the final verdict, using both its own X findings and the SocialData
+    facts (it's told the exact follower numbers are authoritative).
 
-An optional Grok (xAI) pass synthesizes the final verdict over the data
-gathered from SocialData. Falls back to a pure heuristic score if Grok
-is disabled, has no key, or the call fails.
+Falls back to a pure heuristic score if Grok is disabled / keyless / errors.
 
 Self-contained: reads its own env vars, no circular imports with main.py.
 
 Env vars:
-  SOCIALDATA_API_KEY   — required (already set for the bot)
-  XAI_API_KEY          — optional, enables the Grok verdict pass
-  GROK_MODEL           — default "grok-4" (set to whatever your MCP uses)
-  USE_GROK_VERDICT     — "true"/"false", default "true"
-  VERDICT_MIN_FOLLOWERS — notable-mention follower floor, default 10000
+  SOCIALDATA_API_KEY      — required (already set for the bot)
+  XAI_API_KEY             — enables the Grok investigation pass
+  GROK_MODEL              — default "grok-4.3"
+  USE_GROK_VERDICT        — "true"/"false", default "true"
+  GROK_LIVE_SEARCH        — "true"/"false", default "true" (lets Grok search X)
+  GROK_MAX_SEARCH_RESULTS — default 12 (caps X Search cost per verdict)
+  VERDICT_MIN_FOLLOWERS   — notable-mention follower floor, default 10000
 """
 
 import os
@@ -41,8 +43,10 @@ SOCIALDATA_SEARCH_URL = "https://api.socialdata.tools/twitter/search"
 
 XAI_API_KEY = os.getenv("XAI_API_KEY", "")
 XAI_API_URL = "https://api.x.ai/v1/chat/completions"
-GROK_MODEL = os.getenv("GROK_MODEL", "grok-4")
+GROK_MODEL = os.getenv("GROK_MODEL", "grok-4.3")
 USE_GROK_VERDICT = os.getenv("USE_GROK_VERDICT", "true").lower() == "true"
+GROK_LIVE_SEARCH = os.getenv("GROK_LIVE_SEARCH", "true").lower() == "true"
+GROK_MAX_SEARCH_RESULTS = int(os.getenv("GROK_MAX_SEARCH_RESULTS", "12"))
 
 MENTION_FOLLOWER_FLOOR = int(os.getenv("VERDICT_MIN_FOLLOWERS", "10000"))
 
@@ -59,11 +63,7 @@ _profile_cache: dict[str, dict | None] = {}
 # ─── SocialData: profile (followers + bio in ONE call) ────────────────────────
 
 async def get_x_profile(session: aiohttp.ClientSession, username: str) -> dict | None:
-    """Fetch an X profile: followers + bio + name + verified. One SocialData call.
-
-    The bio is FREE here — it comes back in the same response the bot already
-    uses for follower counts; we just stop throwing it away.
-    """
+    """Fetch an X profile: followers + bio + name + verified. One SocialData call."""
     username = (username or "").lstrip("@").strip().lower()
     if not username:
         return None
@@ -95,7 +95,7 @@ async def get_x_profile(session: aiohttp.ClientSession, username: str) -> dict |
                 log.warning(f"  ⚠️ SocialData rate limited on profile @{username}")
                 return None  # transient — don't cache
             else:
-                log.debug(f"get_x_profile @{username} → {resp.status}")
+                log.debug(f"get_x_profile @{username} -> {resp.status}")
     except Exception as e:
         log.debug(f"get_x_profile error @{username}: {e}")
         return None
@@ -107,11 +107,7 @@ async def get_x_profile(session: aiohttp.ClientSession, username: str) -> dict |
 # ─── SocialData: project-page detection ───────────────────────────────────────
 
 async def find_project_page(session: aiohttp.ClientSession, ticker: str, token_name: str = "") -> dict | None:
-    """Probe for a dedicated project X account named after the ticker / name.
-
-    Most legit launches (e.g. GITLAWB → @gitlawb) use a handle == ticker, so a
-    direct handle probe is cheaper and more reliable than a fuzzy user search.
-    """
+    """Probe for a dedicated project X account named after the ticker / name."""
     candidates: list[str] = []
     t = (ticker or "").lstrip("$").strip()
     if t:
@@ -162,10 +158,9 @@ async def get_notable_mentions(session: aiohttp.ClientSession, ticker: str, limi
     return mentions[:limit]
 
 
-# ─── Heuristic scoring ────────────────────────────────────────────────────────
+# ─── Heuristic scoring (baseline / fallback) ──────────────────────────────────
 
 def _bio_project_signal(bio: str) -> bool:
-    """Does the bio suggest a real builder / project affiliation?"""
     if not bio:
         return False
     low = bio.lower()
@@ -224,57 +219,78 @@ def _heuristic_score(deployer: dict | None, project: dict | None, mentions: list
     return score, label, emoji, reasons
 
 
-# ─── Grok (xAI) verdict pass ──────────────────────────────────────────────────
+# ─── Grok (xAI) — LIVE X investigation + verdict ──────────────────────────────
 
-async def _grok_judge(session: aiohttp.ClientSession, ticker: str, name: str,
-                      deployer: dict | None, project: dict | None, mentions: list) -> dict | None:
-    """Synthesize a verdict over the gathered data. Returns None if disabled/fails."""
+async def _grok_judge(session: aiohttp.ClientSession, ticker: str, name: str, address: str,
+                      deployer_handle: str, deployer: dict | None,
+                      project: dict | None, mentions: list) -> dict | None:
+    """Grok investigates X live (X Search) + judges. Returns None if disabled/fails."""
     if not (USE_GROK_VERDICT and XAI_API_KEY):
         return None
     try:
-        payload_data = {
+        known = {
             "ticker": ticker,
             "token_name": name,
-            "deployer": deployer or {},
-            "project_page": project or {},
-            "notable_mentions": [
+            "contract": address,
+            "deployer_handle": deployer_handle or (deployer or {}).get("handle", ""),
+            "deployer_data_from_tools": deployer or {},
+            "project_page_found_by_tools": project or {},
+            "notable_mentions_from_tools": [
                 {"handle": m["username"], "followers": m["followers"]} for m in mentions
             ],
         }
         system = (
-            "You are a crypto launch analyst screening new Base token launches for a fund. "
-            "Given deployer and project data, decide whether this is a low-effort spam launch "
-            "or a credible one. Credible signals: solid/large deployer following, a deployer who "
-            "is a real builder working on a project (per bio), or a dedicated project X account. "
-            "Return ONLY compact JSON: "
-            "{\"score\": <0-10 number>, \"label\": \"SOLID|MID|LIKELY SPAM\", "
-            "\"reason\": \"one short sentence\"}. No prose, no markdown fences."
+            "You are a crypto launch analyst with LIVE access to X (Twitter). A new token just "
+            "launched on Base. Investigate it on X and decide whether it's a low-effort spam launch "
+            "or a credible one.\n\n"
+            "Search X for:\n"
+            "1) The DEPLOYER account - are they a real builder, do they have a following, do they "
+            "work on a known project (check their bio/header)?\n"
+            "2) The TICKER $<ticker> - who is talking about it, and are they credible accounts?\n"
+            "3) Any official PROJECT account for this token.\n\n"
+            "You are also given structured data our own tools already pulled (exact follower counts, "
+            "bio, mentions). Treat those exact follower numbers as AUTHORITATIVE - prefer them over "
+            "your own estimates - but use your live X search to judge legitimacy, find the project "
+            "account, and read sentiment.\n\n"
+            "Return ONLY compact JSON: {\"score\": <0-10 number>, \"label\": "
+            "\"SOLID|MID|LIKELY SPAM\", \"reason\": \"one or two short sentences citing what you "
+            "actually found on X\"}. No markdown, no text outside the JSON."
         )
         body = {
             "model": GROK_MODEL,
             "messages": [
                 {"role": "system", "content": system},
-                {"role": "user", "content": json.dumps(payload_data)},
+                {"role": "user", "content": json.dumps(known)},
             ],
             "temperature": 0.1,
-            "max_tokens": 200,
+            "max_tokens": 500,
         }
+        if GROK_LIVE_SEARCH:
+            body["search_parameters"] = {
+                "mode": "on",
+                "sources": [{"type": "x"}],
+                "max_search_results": GROK_MAX_SEARCH_RESULTS,
+                "return_citations": False,
+            }
+
         headers = {"Authorization": f"Bearer {XAI_API_KEY}", "Content-Type": "application/json"}
         async with session.post(
             XAI_API_URL, json=body, headers=headers,
-            timeout=aiohttp.ClientTimeout(total=20),
+            timeout=aiohttp.ClientTimeout(total=45),  # live search + reasoning can be slow
         ) as resp:
             if resp.status != 200:
-                log.warning(f"  ⚠️ Grok verdict {resp.status} for ${ticker}")
+                err = await resp.text()
+                log.warning(f"  ⚠️ Grok verdict {resp.status} for ${ticker}: {err[:160]}")
                 return None
             data = await resp.json()
+
         content = data["choices"][0]["message"]["content"]
         content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip(), flags=re.MULTILINE).strip()
         parsed = json.loads(content)
         return {
             "score": round(float(parsed.get("score", 0)), 1),
             "label": str(parsed.get("label", "MID")).upper(),
-            "reason": str(parsed.get("reason", ""))[:160],
+            "reason": str(parsed.get("reason", ""))[:240],
         }
     except Exception as e:
         log.debug(f"Grok judge error ${ticker}: {e}")
@@ -284,17 +300,23 @@ async def _grok_judge(session: aiohttp.ClientSession, ticker: str, name: str,
 # ─── Orchestrator ─────────────────────────────────────────────────────────────
 
 async def build_verdict(session: aiohttp.ClientSession, deployer_handle: str,
-                        ticker: str, token_name: str = "") -> dict:
-    """Gather data + score. Never raises; always returns a usable dict."""
+                        ticker: str, token_name: str = "", address: str = "") -> dict:
+    """Gather SocialData facts + Grok live X investigation. Never raises."""
     ticker = (ticker or "?").lstrip("$")
+
+    # SocialData: the hard facts
     deployer = await get_x_profile(session, deployer_handle) if deployer_handle else None
     project = await find_project_page(session, ticker, token_name)
     mentions = await get_notable_mentions(session, ticker)
 
+    # Baseline heuristic (used if Grok is off/fails)
     score, label, emoji, reasons = _heuristic_score(deployer, project, mentions)
+    grok_used = False
 
-    grok = await _grok_judge(session, ticker, token_name, deployer, project, mentions)
+    # Grok: live X investigation + verdict (overrides heuristic)
+    grok = await _grok_judge(session, ticker, token_name, address, deployer_handle, deployer, project, mentions)
     if grok:
+        grok_used = True
         score = grok["score"]
         label = grok["label"]
         emoji = "🟢" if score >= 7 else "🟡" if score >= 4 else "🔴"
@@ -304,7 +326,8 @@ async def build_verdict(session: aiohttp.ClientSession, deployer_handle: str,
     return {
         "score": score, "label": label, "emoji": emoji, "reasons": reasons,
         "deployer": deployer, "project": project, "mentions": mentions,
-        "grok": grok is not None,
+        "grok": grok_used,
+        "grok_searched": grok_used and GROK_LIVE_SEARCH,
     }
 
 
@@ -324,7 +347,8 @@ def _esc(s: str) -> str:
 
 def format_verdict_block(v: dict) -> str:
     """Render the 🧠 VERDICT block appended to the signal message."""
-    lines = [f"🧠 <b>VERDICT: {v['emoji']} {v['label']}</b> ({v['score']}/10)"]
+    search_tag = " · 🔎X" if v.get("grok_searched") else ""
+    lines = [f"🧠 <b>VERDICT: {v['emoji']} {v['label']}</b> ({v['score']}/10){search_tag}"]
 
     d = v.get("deployer")
     if d:
@@ -341,7 +365,7 @@ def format_verdict_block(v: dict) -> str:
     if p:
         lines.append(f"├ 📄 Project: <a href='https://x.com/{p['handle']}'>@{p['handle']}</a> · {_fmt_followers(p['followers'])}")
     else:
-        lines.append("├ 📄 No project page found")
+        lines.append("├ 📄 No project page found by tools")
 
     m = v.get("mentions") or []
     if m:
