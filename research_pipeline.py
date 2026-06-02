@@ -18,6 +18,7 @@ AUTO_VERDICT_MAX_CONCURRENT = int(os.getenv("AUTO_VERDICT_MAX_CONCURRENT", "2"))
 SearchMentionsFn = Callable[[aiohttp.ClientSession, str, str, str], Awaitable[list[dict]]]
 SearchInfluencersFn = Callable[[aiohttp.ClientSession, str, str], Awaitable[list[dict]]]
 ResolveDeployerFn = Callable[[aiohttp.ClientSession, str], Awaitable[dict]]
+GetFollowersFn = Callable[[aiohttp.ClientSession, str], Awaitable[int | None]]
 FmtUsdFn = Callable[[float], str]
 
 _verdict_semaphore = asyncio.Semaphore(max(1, AUTO_VERDICT_MAX_CONCURRENT))
@@ -30,6 +31,7 @@ class ResearchDeps:
     search_mentions: SearchMentionsFn
     search_influencers: SearchInfluencersFn
     resolve_deployer: ResolveDeployerFn
+    get_followers: GetFollowersFn
     fmt_usd: FmtUsdFn
 
 
@@ -177,6 +179,17 @@ def _label(score: float) -> tuple[str, str]:
     return "WEAK", "🔴"
 
 
+async def _deployer_from_launch(session: aiohttp.ClientSession, launch: dict, deps: ResearchDeps) -> dict | None:
+    handle = (launch.get("x_username") or launch.get("creator_x") or "").strip().lstrip("@")
+    if not handle:
+        return None
+    return {
+        "x_username": handle,
+        "follower_count": await deps.get_followers(session, handle),
+        "source_method": "launch metadata",
+    }
+
+
 async def build_signal_verdict(
     session: aiohttp.ClientSession,
     launch: dict,
@@ -192,9 +205,9 @@ async def build_signal_verdict(
     async with _verdict_semaphore:
         symbol = (launch.get("symbol") or "").lstrip("$")
         token_name = launch.get("name", "") or symbol
-        deployer = None
+        deployer = await _deployer_from_launch(session, launch, deps)
         if address:
-            deployer = await deps.resolve_deployer(session, address)
+            deployer = deployer or await deps.resolve_deployer(session, address)
 
         mentions, influencer_mentions = await asyncio.gather(
             deps.search_mentions(session, symbol, token_name, address),

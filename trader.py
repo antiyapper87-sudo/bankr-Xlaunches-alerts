@@ -16,6 +16,11 @@ log = logging.getLogger("whale-alert")
 
 ALCHEMY_RPC_URL = os.getenv("ALCHEMY_RPC_URL", "")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
+ALLOW_UNSAFE_TRADING = os.getenv("ALLOW_UNSAFE_TRADING", "false").lower() == "true"
+UNSAFE_TRADING_ERROR = (
+    "On-chain trading disabled: set ALLOW_UNSAFE_TRADING=true only after "
+    "quote/minOut protection is implemented"
+)
 
 # Uniswap V3 SwapRouter02 on Base
 UNISWAP_ROUTER = Web3.to_checksum_address("0x2626664c2603336E57B271c5C0b26F421741e481")
@@ -105,6 +110,9 @@ async def buy_token(token_address: str, eth_percent: int) -> dict:
     Buy token_address using eth_percent% of wallet ETH balance.
     Returns dict with success, tx_hash, amount_eth, error.
     """
+    if not ALLOW_UNSAFE_TRADING:
+        return {"success": False, "error": UNSAFE_TRADING_ERROR}
+
     try:
         w3 = get_web3()
         account = get_wallet(w3)
@@ -146,7 +154,7 @@ async def buy_token(token_address: str, eth_percent: int) -> dict:
                     "sqrtPriceLimitX96": 0,
                 }
 
-                nonce = w3.eth.get_transaction_count(account.address)
+                nonce = w3.eth.get_transaction_count(account.address, "pending")
                 gas_price = w3.eth.gas_price
 
                 tx = router.functions.exactInputSingle(params).build_transaction({
@@ -190,6 +198,9 @@ async def sell_token(token_address: str, token_percent: int) -> dict:
     Sell token_percent% of bot wallet's token balance.
     Returns dict with success, tx_hash, amount_tokens, error.
     """
+    if not ALLOW_UNSAFE_TRADING:
+        return {"success": False, "error": UNSAFE_TRADING_ERROR}
+
     try:
         w3 = get_web3()
         account = get_wallet(w3)

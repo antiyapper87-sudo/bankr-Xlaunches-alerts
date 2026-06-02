@@ -48,6 +48,14 @@ AUTHORIZED_USER_IDS = {
     for user_id in os.getenv("AUTHORIZED_USER_IDS", "544999608").split(",")
     if user_id.strip()
 }
+TRADER_USER_IDS = {
+    user_id.strip()
+    for user_id in (
+        os.getenv("TRADER_USER_IDS", "")
+        or os.getenv("TRADER_USER_ID", "")
+    ).split(",")
+    if user_id.strip()
+}
 WHAPI_TOKEN = os.getenv("WHAPI_TOKEN", "")
 WHATSAPP_GROUP_ID = os.getenv("WHATSAPP_GROUP_ID", "")
 SOCIALDATA_API_KEY = os.getenv("SOCIALDATA_API_KEY", "")
@@ -70,6 +78,9 @@ PUSHOVER_API_TOKEN = os.getenv("PUSHOVER_API_TOKEN", "")
 
 # ─── Trader Config ────────────────────────────────────────────────────────────
 TRADING_ENABLED = os.getenv("TRADING_ENABLED", "false").lower() == "true"
+if TRADING_ENABLED and not TRADER_USER_IDS:
+    logging.getLogger("whale-alert").error("TRADING_ENABLED=true but TRADER_USER_IDS is empty — disabling trading")
+    TRADING_ENABLED = False
 ALCHEMY_RPC_URL = os.getenv("ALCHEMY_RPC_URL", "")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
 
@@ -265,11 +276,11 @@ async def execute_bankr_buy(session: aiohttp.ClientSession, token_address: str, 
 
 # ─── Telegram ─────────────────────────────────────────────────────────────────
 
-async def send_telegram(session: aiohttp.ClientSession, text: str, chat_id: str = "", reply_markup: dict = None) -> bool | int:
-    """Send a Telegram message. Returns message_id on success, False on failure."""
+async def send_telegram(session: aiohttp.ClientSession, text: str, chat_id: str = "", reply_markup: dict = None) -> int | None:
+    """Send a Telegram message. Returns message_id on success."""
     target = chat_id or TELEGRAM_CHAT_ID
     if not TELEGRAM_BOT_TOKEN or not target:
-        return False
+        return None
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": target,
@@ -283,14 +294,15 @@ async def send_telegram(session: aiohttp.ClientSession, text: str, chat_id: str 
         async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status == 200:
                 data = await resp.json()
-                return data.get("result", {}).get("message_id", True)
+                message_id = data.get("result", {}).get("message_id")
+                return message_id if isinstance(message_id, int) else None
             else:
                 body = await resp.text()
                 log.error(f"Telegram error {resp.status} (chat {target}): {body[:200]}")
-                return False
+                return None
     except Exception as e:
         log.error(f"Telegram send failed: {e}")
-        return False
+        return None
 
 
 async def edit_telegram_message(session: aiohttp.ClientSession, chat_id: str, message_id: int, text: str, reply_markup: dict = None) -> bool:
@@ -309,7 +321,11 @@ async def edit_telegram_message(session: aiohttp.ClientSession, chat_id: str, me
         payload["reply_markup"] = reply_markup
     try:
         async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            return resp.status == 200
+            if resp.status == 200:
+                return True
+            body = await resp.text()
+            log.warning(f"Telegram edit error {resp.status} (chat {chat_id}, msg {message_id}): {body[:240]}")
+            return False
     except Exception as e:
         log.error(f"Telegram edit failed: {e}")
         return False
@@ -390,6 +406,15 @@ def is_authorized_update(msg: dict) -> bool:
     return chat_id == TELEGRAM_CHAT_ID or user_id in AUTHORIZED_USER_IDS
 
 
+def is_trader_user(user_id: str) -> bool:
+    return bool(TRADER_USER_IDS) and user_id in TRADER_USER_IDS
+
+
+def is_fresh_telegram_message(msg: dict, max_age_sec: int = 60) -> bool:
+    msg_date = int(msg.get("date") or 0)
+    return bool(msg_date) and time.time() - msg_date <= max_age_sec
+
+
 async def set_bot_commands(session: aiohttp.ClientSession) -> bool:
     if not TELEGRAM_BOT_TOKEN:
         return False
@@ -403,6 +428,26 @@ async def set_bot_commands(session: aiohttp.ClientSession) -> bool:
             log.warning(f"setMyCommands failed {resp.status}: {body[:200]}")
     except Exception as e:
         log.warning(f"setMyCommands error: {e}")
+    return False
+
+
+async def delete_telegram_webhook(session: aiohttp.ClientSession, drop_pending_updates: bool = True) -> bool:
+    if not TELEGRAM_BOT_TOKEN:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook"
+    try:
+        async with session.post(
+            url,
+            json={"drop_pending_updates": drop_pending_updates},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            if resp.status == 200:
+                log.info("✅ Telegram webhook cleared; pending updates dropped")
+                return True
+            body = await resp.text()
+            log.warning(f"deleteWebhook failed {resp.status}: {body[:200]}")
+    except Exception as e:
+        log.warning(f"deleteWebhook error: {e}")
     return False
 
 
@@ -599,14 +644,18 @@ async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: 
         asyncio.create_task(do_ticker_search())
         return
 
-    TRADER_USER_ID = os.getenv("TRADER_USER_ID", "")
     user_id = str(callback_query.get("from", {}).get("id", ""))
-    if TRADER_USER_ID and user_id != TRADER_USER_ID:
+    if not is_trader_user(user_id):
         await answer_callback_query(session, callback_id, "⛔ Not authorized", show_alert=True)
         return
 
     if not TRADING_ENABLED:
         await answer_callback_query(session, callback_id, "⚠️ Trading not enabled. Set TRADING_ENABLED=true", show_alert=True)
+        return
+
+    callback_msg_date = callback_query.get("message", {}).get("date", 0)
+    if callback_msg_date and time.time() - int(callback_msg_date) > 60:
+        await answer_callback_query(session, callback_id, "Command expired. Send it again.", show_alert=True)
         return
 
     percent_str = second
@@ -726,6 +775,13 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                     await send_telegram(session, "No accounts blocked.", chat_id)
 
             elif cmd == "/buy":
+                user_id = str(msg.get("from", {}).get("id", ""))
+                if not is_trader_user(user_id):
+                    await send_telegram(session, "⛔ Not authorized for trading", chat_id=chat_id)
+                    continue
+                if not is_fresh_telegram_message(msg):
+                    await send_telegram(session, "Command expired. Send it again.", chat_id=chat_id)
+                    continue
                 parts = text.split()
                 if len(parts) != 3:
                     await send_telegram(session, "Usage: /buy 0xADDRESS 20\n(percent = 20, 50, or 100)", chat_id=chat_id)
@@ -744,11 +800,6 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                 if not TRADING_ENABLED:
                     await send_telegram(session, "⚠️ Trading not enabled. Set TRADING_ENABLED=true", chat_id=chat_id)
                     continue
-                TRADER_USER_ID = os.getenv("TRADER_USER_ID", "")
-                user_id = str(msg.get("from", {}).get("id", ""))
-                if TRADER_USER_ID and user_id != TRADER_USER_ID:
-                    await send_telegram(session, "⛔ Not authorized", chat_id=chat_id)
-                    continue
                 await send_telegram(session, f"⏳ Buying {percent}% ETH of <code>{token_addr}</code>...", chat_id=chat_id)
                 try:
                     from trader import buy_token
@@ -763,6 +814,13 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                     await send_telegram(session, f"❌ Buy error: {str(e)[:150]}", chat_id=chat_id)
 
             elif cmd == "/sell":
+                user_id = str(msg.get("from", {}).get("id", ""))
+                if not is_trader_user(user_id):
+                    await send_telegram(session, "⛔ Not authorized for trading", chat_id=chat_id)
+                    continue
+                if not is_fresh_telegram_message(msg):
+                    await send_telegram(session, "Command expired. Send it again.", chat_id=chat_id)
+                    continue
                 parts = text.split()
                 if len(parts) != 3:
                     await send_telegram(session, "Usage: /sell 0xADDRESS 50\n(percent = 20, 50, or 100)", chat_id=chat_id)
@@ -780,11 +838,6 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                     continue
                 if not TRADING_ENABLED:
                     await send_telegram(session, "⚠️ Trading not enabled. Set TRADING_ENABLED=true", chat_id=chat_id)
-                    continue
-                TRADER_USER_ID = os.getenv("TRADER_USER_ID", "")
-                user_id = str(msg.get("from", {}).get("id", ""))
-                if TRADER_USER_ID and user_id != TRADER_USER_ID:
-                    await send_telegram(session, "⛔ Not authorized", chat_id=chat_id)
                     continue
                 await send_telegram(session, f"⏳ Selling {percent}% of <code>{token_addr}</code>...", chat_id=chat_id)
                 try:
@@ -853,6 +906,10 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                 )
 
             elif cmd == "/wallet":
+                user_id = str(msg.get("from", {}).get("id", ""))
+                if not is_trader_user(user_id):
+                    await send_telegram(session, "⛔ Not authorized for trading wallet", chat_id)
+                    continue
                 if not TRADING_ENABLED:
                     await send_telegram(session, "⚠️ Trading not enabled.", chat_id)
                     continue
@@ -1041,15 +1098,25 @@ async def _fetch_dexscreener(session: aiohttp.ClientSession, token_address: str)
 # ─── GeckoTerminal rate limiter (30 calls/min free tier) ─────────────────────
 _gecko_calls: list[float] = []
 GECKO_RATE_LIMIT = 25  # stay under 30/min with safety margin
+GECKO_COOLDOWN_SEC = int(os.getenv("GECKO_COOLDOWN_SEC", "60"))
+_gecko_cooldown_until: float = 0
 
 
 def _gecko_rate_ok() -> bool:
     """Check if we can make a GeckoTerminal call without hitting rate limit."""
     now = time.time()
+    if now < _gecko_cooldown_until:
+        return False
     # Purge calls older than 60s
     while _gecko_calls and _gecko_calls[0] < now - 60:
         _gecko_calls.pop(0)
     return len(_gecko_calls) < GECKO_RATE_LIMIT
+
+
+def _mark_gecko_rate_limited() -> None:
+    global _gecko_cooldown_until
+    _gecko_cooldown_until = max(_gecko_cooldown_until, time.time() + GECKO_COOLDOWN_SEC)
+    log.warning(f"GeckoTerminal rate limited (429), cooling down {GECKO_COOLDOWN_SEC}s")
 
 
 async def _fetch_geckoterminal_api(session: aiohttp.ClientSession, token_address: str) -> dict | None:
@@ -1065,7 +1132,7 @@ async def _fetch_geckoterminal_api(session: aiohttp.ClientSession, token_address
 
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status == 429:
-                log.warning("GeckoTerminal rate limited (429)")
+                _mark_gecko_rate_limited()
                 return None
             if resp.status != 200:
                 log.debug(f"GeckoTerminal {resp.status} for {token_address[:10]}...")
@@ -1083,6 +1150,9 @@ async def _fetch_geckoterminal_api(session: aiohttp.ClientSession, token_address
         _gecko_calls.append(time.time())
 
         async with session.get(pools_url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status == 429:
+                _mark_gecko_rate_limited()
+                return None
             if resp.status != 200:
                 log.debug(f"GeckoTerminal pools {resp.status} for {token_address[:10]}...")
                 return None
@@ -1898,17 +1968,26 @@ def fmt_usd(val) -> str:
     return f"${val:.0f}"
 
 
+def h(value) -> str:
+    return html.escape(str(value or ""), quote=True)
+
+
+def clean_x_handle(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_]", "", str(value or "").strip().lstrip("@"))[:32]
+
+
 SOURCE_EMOJIS = {"bankr": "🏦", "clanker": "⚙️", "virtuals": "🤖", "dexscreener": "📊"}
 
 
 def format_signal_telegram(launch: dict, dex: dict | None, executed: bool = False, job_id: str = "") -> str:
-    source = launch["source"].upper()
-    name = launch["name"]
-    symbol = launch["symbol"]
+    source_key = launch["source"]
+    source = h(source_key.upper())
+    name = h(launch["name"])
+    symbol = h(str(launch["symbol"]).lstrip("$"))
     address = launch["address"]
-    x_username = launch.get("x_username", "")
-    tweet_url = launch.get("tweet_url", "")
-    source_emoji = SOURCE_EMOJIS.get(launch["source"], "📡")
+    x_username = clean_x_handle(launch.get("x_username", ""))
+    tweet_url = h(launch.get("tweet_url", ""))
+    source_emoji = SOURCE_EMOJIS.get(source_key, "📡")
 
     market_lines = ""
     age_line = ""
@@ -1926,7 +2005,7 @@ def format_signal_telegram(launch: dict, dex: dict | None, executed: bool = Fals
                 age_line = f"🕐 Launched: {age_seconds / 86400:.1f}d ago\n"
 
         liq_val = dex.get('liquidity', 0)
-        liq_note = " 🔓" if launch["source"] in SAFE_LAUNCHPADS else ""
+        liq_note = " 🔓" if source_key in SAFE_LAUNCHPADS else ""
         market_lines = (
             f"{age_line}"
             f"├ 💰 MCap: {fmt_usd(dex['mcap'])}\n"
@@ -1939,17 +2018,17 @@ def format_signal_telegram(launch: dict, dex: dict | None, executed: bool = Fals
     if x_username:
         deployer_line = f"👤 Deployer: <a href='https://x.com/{x_username}'>@{x_username}</a>\n"
 
-    if launch["source"] == "virtuals":
-        creator_x = launch.get("creator_x", "")
+    if source_key == "virtuals":
+        creator_x = clean_x_handle(launch.get("creator_x", ""))
         if creator_x and creator_x != x_username:
             deployer_line += f"👷 Creator: <a href='https://x.com/{creator_x}'>@{creator_x}</a>\n"
         holders = launch.get("holder_count", 0)
         if holders:
             deployer_line += f"👥 Holders: {holders:,}\n"
 
-    if launch["source"] == "dexscreener":
+    if source_key == "dexscreener":
         dex_id = launch.get("dex_id", "")
-        deployer_line += f"🏭 Via: {dex_id.title() if dex_id else 'Unknown DEX'}\n"
+        deployer_line += f"🏭 Via: {h(dex_id.title() if dex_id else 'Unknown DEX')}\n"
 
     execution_line = ""
     if executed:
@@ -1961,14 +2040,14 @@ def format_signal_telegram(launch: dict, dex: dict | None, executed: bool = Fals
         f"├ <a href='https://www.geckoterminal.com/base/tokens/{address}'>Gecko</a>",
         f"├ <a href='https://gmgn.ai/base/token/{address}'>GMGN</a>",
     ]
-    if launch["source"] == "clanker":
+    if source_key == "clanker":
         links.append(f"├ <a href='https://www.clanker.world/clanker/{address}'>Clanker</a>")
-    elif launch["source"] == "virtuals":
-        vid = launch.get("virtuals_id", "")
+    elif source_key == "virtuals":
+        vid = h(launch.get("virtuals_id", ""))
         if vid:
             links.append(f"├ <a href='https://app.virtuals.io/virtuals/{vid}'>Virtuals</a>")
-    elif launch["source"] == "dexscreener":
-        pair_url = launch.get("pair_url", "")
+    elif source_key == "dexscreener":
+        pair_url = h(launch.get("pair_url", ""))
         if pair_url:
             links.append(f"├ <a href='{pair_url}'>Chart</a>")
     if tweet_url:
@@ -2066,28 +2145,20 @@ async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, s
     addr_truncated = address[:20]
     _address_map[addr_truncated] = address
 
-    executed = False
-    job_id = ""
-    if AUTO_EXECUTE:
-        result = await execute_bankr_buy(session, address, symbol, source)
-        if isinstance(result, dict):
-            executed = result.get("success", False)
-            job_id = result.get("jobId", "")
-        else:
-            executed = bool(result)
-
-    tg_text = format_signal_telegram(launch, dex, executed=executed, job_id=job_id)
-    wa_text = format_alert_whatsapp(launch, dex, executed=executed)
+    tg_text = format_signal_telegram(launch, dex, executed=False, job_id="")
+    wa_text = format_alert_whatsapp(launch, dex, executed=False)
 
     log.info(
         f"  📡 {prefix}SIGNAL: [{source}] ${symbol} "
         f"MCap {fmt_usd(dex['mcap'])} Vol {fmt_usd(dex['volume_24h'])}"
         + (f" @{launch.get('x_username')}" if launch.get('x_username') else "")
-        + (" 💸 EXECUTED" if executed else "")
     )
 
     keyboard = build_trade_keyboard(address, symbol)
     message_id = await send_telegram(session, tg_text, reply_markup=keyboard)
+    if message_id is None:
+        log.error(f"  ❌ Telegram signal failed: [{source}] ${symbol} {address}")
+        return
 
     if WHAPI_TOKEN and WHATSAPP_GROUP_ID:
         await send_whatsapp(session, wa_text)
@@ -2101,10 +2172,33 @@ async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, s
     signaled_tokens.add(address)
     alert_count += 1
 
+    if AUTO_EXECUTE and isinstance(message_id, int):
+        asyncio.create_task(
+            attach_execution_result(session, TELEGRAM_CHAT_ID, message_id, tg_text, keyboard, launch, source, symbol)
+        )
+
     if AUTO_VERDICT_ENABLED and isinstance(message_id, int):
         asyncio.create_task(
             attach_signal_verdict(session, TELEGRAM_CHAT_ID, message_id, tg_text, keyboard, launch, dex, source, symbol)
         )
+
+
+async def attach_execution_result(
+    session: aiohttp.ClientSession,
+    chat_id: str,
+    message_id: int,
+    base_text: str,
+    keyboard: dict,
+    launch: dict,
+    source: str,
+    symbol: str,
+):
+    address = launch["address"]
+    executed = await execute_bankr_buy(session, address, symbol, source)
+    status = f"💸 <b>Auto-buy submitted</b> via Bankr" if executed else "⚠️ Auto-buy not submitted"
+    ok = await edit_telegram_message(session, chat_id, message_id, f"{base_text}\n\n{status}", reply_markup=keyboard)
+    if ok:
+        log.info(f"  💸 Execution status attached: [{source}] ${symbol} → {'submitted' if executed else 'skipped'}")
 
 
 async def attach_signal_verdict(
@@ -2122,6 +2216,7 @@ async def attach_signal_verdict(
         search_mentions=search_x_mentions,
         search_influencers=search_influencer_mentions,
         resolve_deployer=resolve_deployer_x,
+        get_followers=get_follower_count,
         fmt_usd=fmt_usd,
     )
     verdict = await build_signal_verdict_with_timeout(session, launch, dex, deps)
@@ -2205,6 +2300,7 @@ async def main():
     log.info("=" * 60)
 
     async with aiohttp.ClientSession() as session:
+        await delete_telegram_webhook(session, drop_pending_updates=True)
         await set_bot_commands(session)
 
         # DexScreener health check
