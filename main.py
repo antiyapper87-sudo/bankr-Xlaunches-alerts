@@ -30,6 +30,15 @@ from pathlib import Path
 from datetime import datetime, timezone
 from urllib.parse import quote
 
+from research_pipeline import (
+    AUTO_VERDICT_ENABLED,
+    AUTO_VERDICT_MAX_CONCURRENT,
+    AUTO_VERDICT_TIMEOUT_SEC,
+    ResearchDeps,
+    build_signal_verdict_with_timeout,
+    format_verdict_block,
+)
+
 # ─── Config from environment ──────────────────────────────────────────────────
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -818,6 +827,10 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                 exec_status = f"✅ ON (${BANKR_BUY_AMOUNT}/trade)" if AUTO_EXECUTE else "❌ OFF"
                 trade_status = "✅ ON" if TRADING_ENABLED else "❌ OFF"
                 pushover_status = "✅ ON" if PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN else "❌ OFF"
+                verdict_status = (
+                    f"✅ ON ({AUTO_VERDICT_TIMEOUT_SEC:.0f}s timeout, {AUTO_VERDICT_MAX_CONCURRENT} concurrent)"
+                    if AUTO_VERDICT_ENABLED else "❌ OFF"
+                )
                 await send_telegram(
                     session,
                     f"📡 <b>Signal Bot</b>\n\n"
@@ -834,6 +847,7 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                     f"• Auto-execute: {exec_status}\n"
                     f"• Executions: {execution_count}\n"
                     f"• Inline trading: {trade_status}\n"
+                    f"• Auto-verdict: {verdict_status}\n"
                     f"• Pushover alerts: {pushover_status}",
                     chat_id,
                 )
@@ -2072,7 +2086,11 @@ async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, s
         + (" 💸 EXECUTED" if executed else "")
     )
 
-    await send_alert_all(session, tg_text, wa_text, token_address=address, symbol=symbol)
+    keyboard = build_trade_keyboard(address, symbol)
+    message_id = await send_telegram(session, tg_text, reply_markup=keyboard)
+
+    if WHAPI_TOKEN and WHATSAPP_GROUP_ID:
+        await send_whatsapp(session, wa_text)
 
     dex_url = f"https://dexscreener.com/base/{address}"
     pushover_msg = f"${symbol} · MCap {fmt_usd(dex['mcap'])} · Vol {fmt_usd(dex['volume_24h'])}"
@@ -2082,6 +2100,46 @@ async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, s
 
     signaled_tokens.add(address)
     alert_count += 1
+
+    if AUTO_VERDICT_ENABLED and isinstance(message_id, int):
+        asyncio.create_task(
+            attach_signal_verdict(session, TELEGRAM_CHAT_ID, message_id, tg_text, keyboard, launch, dex, source, symbol)
+        )
+
+
+async def attach_signal_verdict(
+    session: aiohttp.ClientSession,
+    chat_id: str,
+    message_id: int,
+    base_text: str,
+    keyboard: dict,
+    launch: dict,
+    dex: dict | None,
+    source: str,
+    symbol: str,
+):
+    deps = ResearchDeps(
+        search_mentions=search_x_mentions,
+        search_influencers=search_influencer_mentions,
+        resolve_deployer=resolve_deployer_x,
+        fmt_usd=fmt_usd,
+    )
+    verdict = await build_signal_verdict_with_timeout(session, launch, dex, deps)
+    if not verdict:
+        log.warning(f"  ⚠️ Verdict skipped: [{source}] ${symbol}")
+        return
+
+    verdict_block = format_verdict_block(verdict)
+    new_text = f"{base_text}\n\n{verdict_block}"
+    if len(new_text) > 3900:
+        new_text = new_text[:3800] + "\n\n<i>Verdict truncated</i>"
+
+    ok = await edit_telegram_message(session, chat_id, message_id, new_text, reply_markup=keyboard)
+    score = verdict.get("score", {})
+    if ok:
+        log.info(f"  🧠 Verdict: [{source}] ${symbol} → {score.get('label')} ({score.get('value')}/10)")
+    else:
+        log.warning(f"  ⚠️ Verdict edit rejected: [{source}] ${symbol}")
 
 
 # ─── Seeding ──────────────────────────────────────────────────────────────────
@@ -2139,6 +2197,7 @@ async def main():
     log.info(f"  Authorized DMs: {', '.join(sorted(AUTHORIZED_USER_IDS)) if AUTHORIZED_USER_IDS else 'none'}")
     log.info(f"  WhatsApp      : {'✅' if WHAPI_TOKEN and WHATSAPP_GROUP_ID else '❌'}")
     log.info(f"  SocialData    : {'✅' if SOCIALDATA_API_KEY else '❌'}")
+    log.info(f"  Auto-verdict  : {'✅ ON' if AUTO_VERDICT_ENABLED else '❌ OFF'} ({AUTO_VERDICT_TIMEOUT_SEC:.0f}s, max {AUTO_VERDICT_MAX_CONCURRENT})")
     log.info(f"  Pushover      : {'✅' if PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN else '❌ NOT SET'}")
     log.info(f"  Auto-execute  : {'✅ ON — $' + str(BANKR_BUY_AMOUNT) + '/trade' if AUTO_EXECUTE else '❌ OFF'}")
     log.info(f"  Inline trading: {'✅ ON' if TRADING_ENABLED else '❌ OFF (set TRADING_ENABLED=true)'}")
@@ -2203,6 +2262,10 @@ async def main():
 
         trade_note = "\n💸 Inline trading: ✅ ON — tap buttons on signals to buy/sell" if TRADING_ENABLED else "\n💸 Inline trading: ❌ OFF"
         pushover_note = "\n🔔 Pushover: ✅ Emergency alerts ON" if PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN else "\n🔔 Pushover: ❌ OFF"
+        verdict_note = (
+            f"\n🧠 Auto-verdict: ✅ ON — deterministic research, AI stub"
+            if AUTO_VERDICT_ENABLED else "\n🧠 Auto-verdict: ❌ OFF"
+        )
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
             exec_note = f"\n💸 Auto-execute: ON (${BANKR_BUY_AMOUNT}/trade)" if AUTO_EXECUTE else "\n💸 Auto-execute: OFF"
             await send_telegram(
@@ -2215,7 +2278,8 @@ async def main():
                 f"Polling every {POLL_INTERVAL}s"
                 f"{exec_note}"
                 f"{trade_note}"
-                f"{pushover_note}\n\n"
+                f"{pushover_note}"
+                f"{verdict_note}\n\n"
                 f"Commands: /help · /research · /status · /wallets · /track",
             )
 
