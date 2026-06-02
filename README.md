@@ -24,10 +24,11 @@ optional deterministic auto-verdict block.
 - Visit `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates`
 - Find `"chat":{"id":` — that's your chat ID (use group ID for groups)
 
-### 3. Deploy on Railway
+### 3. Deploy
 - Push this repo to GitHub
-- Connect to Railway
+- Provision Postgres and Redis
 - Add environment variables (see below)
+- Run migrations before starting bot/workers
 
 ## Environment Variables
 
@@ -37,6 +38,12 @@ optional deterministic auto-verdict block.
 | `TELEGRAM_CHAT_ID` | ✅ | — | Chat/group ID for alerts |
 | `AUTHORIZED_USER_IDS` | ❌ | `544999608` | Comma-separated Telegram user IDs allowed to DM commands |
 | `SOCIALDATA_API_KEY` | ✅ | — | SocialData key for X follower and tweet research |
+| `APP_ENV` | ❌ | `local` | Use `production`/`staging` with Postgres |
+| `DATABASE_URL` | Required for service deploy | — | Postgres URL, e.g. `postgresql+asyncpg://...` |
+| `LOCAL_DATABASE_URL` | ❌ | `sqlite+aiosqlite:///data/bot.db` | Local SQLite fallback only |
+| `DATABASE_AUTO_CREATE` | ❌ | `true` local, `false` prod | Auto-create tables locally; production uses Alembic |
+| `REDIS_URL` | Required for workers | `redis://localhost:6379/0` | Redis connection for RQ |
+| `RQ_QUEUE_NAME` | ❌ | `launches` | RQ queue name |
 | `MIN_FOLLOWERS` | ❌ | `5000` | Minimum deployer follower count for launchpad filters |
 | `MIN_MCAP` | ❌ | `50000` | Minimum market cap |
 | `MIN_VOLUME_24H` | ❌ | `30000` | Minimum 24h volume |
@@ -67,3 +74,35 @@ Trading is fail-closed:
 pip install -r requirements.txt
 TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=xxx SOCIALDATA_API_KEY=xxx python main.py
 ```
+
+## Local Service Infra
+
+Start local Postgres and Redis:
+
+```bash
+docker compose up -d postgres redis
+cp .env.infra.example .env.infra
+set -a && source .env.infra && set +a
+alembic upgrade head
+python infra_check.py
+python main.py
+```
+
+Run a queue worker in another shell:
+
+```bash
+set -a && source .env.infra && set +a
+rq worker "${RQ_QUEUE_NAME:-launches}" --url "$REDIS_URL"
+```
+
+Production process shape is defined in `Procfile`:
+
+```text
+release: alembic upgrade head
+bot: python main.py
+worker: rq worker ${RQ_QUEUE_NAME:-launches} --url $REDIS_URL
+maintenance: python maintenance.py
+```
+
+Use exactly one `bot` process for Telegram long polling. Multiple `worker` processes are allowed.
+See `docs/infra_runbook.md` for the deployment checklist.
