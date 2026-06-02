@@ -123,6 +123,359 @@ main.py
   process bootstrap and Telegram command polling only
 ```
 
+## `database.py` Service-Scale Scenario
+
+`database.py` is mandatory in Phase 1. It is not just a place for ORM classes. It is the
+source-of-truth boundary that lets the bot grow from one Telegram group to 1000+ clients
+without rewriting persistence later.
+
+### Responsibilities
+
+`database.py` must own:
+
+- engine creation
+- session factory
+- base metadata
+- ORM models
+- transaction context manager
+- small repository functions for critical invariants
+- DB health check
+- local test DB initialization
+
+`database.py` must not own:
+
+- Telegram formatting
+- source polling
+- SocialData calls
+- DexScreener/GeckoTerminal calls
+- RQ worker bootstrap
+- business scoring logic
+
+### Local vs Production
+
+Phase 1 must support two modes through the same repository API:
+
+```text
+local/dev      SQLite + aiosqlite
+production     Postgres + asyncpg
+```
+
+Recommended URLs:
+
+```text
+LOCAL_DATABASE_URL=sqlite+aiosqlite:///data/bot.db
+DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/db
+```
+
+The code should choose by `APP_ENV`:
+
+```python
+def resolve_database_url(settings: Settings) -> str:
+    if settings.app_env in {"production", "staging"}:
+        return settings.database_url
+    return settings.local_database_url
+```
+
+### Engine And Session Pattern
+
+Use one async engine per process and one explicit session per unit of work.
+
+```python
+from contextlib import asynccontextmanager
+
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+from sqlalchemy.orm import DeclarativeBase
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+engine: AsyncEngine | None = None
+SessionLocal: async_sessionmaker[AsyncSession] | None = None
+
+
+def create_db_engine(database_url: str) -> AsyncEngine:
+    connect_args = {}
+    if database_url.startswith("sqlite"):
+        connect_args = {"check_same_thread": False}
+
+    return create_async_engine(
+        database_url,
+        pool_pre_ping=True,
+        pool_size=10,
+        max_overflow=20,
+        connect_args=connect_args,
+    )
+
+
+async def init_db(database_url: str) -> None:
+    global engine, SessionLocal
+    engine = create_db_engine(database_url)
+    SessionLocal = async_sessionmaker(
+        bind=engine,
+        expire_on_commit=False,
+        autoflush=False,
+    )
+
+
+@asynccontextmanager
+async def db_session():
+    if SessionLocal is None:
+        raise RuntimeError("Database is not initialized")
+
+    async with SessionLocal() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+```
+
+SQLite local mode should enable WAL:
+
+```python
+async def configure_sqlite(session: AsyncSession) -> None:
+    await session.execute(text("PRAGMA journal_mode=WAL"))
+    await session.execute(text("PRAGMA busy_timeout=5000"))
+```
+
+Production must not use `Base.metadata.create_all()`. Use Alembic migrations.
+
+### Required ORM Models
+
+Minimum Phase 1 service-scale models:
+
+```text
+Tenant
+User
+TenantMember
+TenantSettings
+Launch
+Verdict
+Signal
+SignalDelivery
+ProviderCooldown
+ApiBudgetEvent
+AuditEvent
+BotState
+```
+
+Do not postpone tenant models. They are required for 1000 clients and future monetization.
+
+### Repository API Contract
+
+The rest of the application should call repository functions, not raw ORM queries.
+
+Required functions:
+
+```python
+async def upsert_tenant(
+    db: AsyncSession,
+    *,
+    tenant_type: str,
+    external_id: str,
+    title: str | None = None,
+) -> Tenant:
+    ...
+
+
+async def upsert_launch(
+    db: AsyncSession,
+    *,
+    ca: str,
+    ticker: str,
+    name: str,
+    source: str,
+    raw_json: dict,
+    launched_at: datetime | None,
+    status: str,
+) -> tuple[Launch, bool]:
+    """Return (launch, inserted). inserted=False means CA already existed."""
+    ...
+
+
+async def queue_recheck(
+    db: AsyncSession,
+    *,
+    ca: str,
+    reason: str,
+    next_check_at: datetime,
+    no_data: bool,
+    market_json: dict | None = None,
+) -> None:
+    ...
+
+
+async def get_due_rechecks(
+    db: AsyncSession,
+    *,
+    now: datetime,
+    limit: int,
+) -> list[Launch]:
+    ...
+
+
+async def create_signal_if_absent(
+    db: AsyncSession,
+    *,
+    ca: str,
+    verdict_score: float | None,
+    verdict_label: str | None,
+) -> tuple[Signal, bool]:
+    """Return (signal, inserted). inserted=False means product signal already exists."""
+    ...
+
+
+async def create_delivery_if_absent(
+    db: AsyncSession,
+    *,
+    signal_id: int,
+    tenant_id: int,
+    channel: str,
+    destination_id: str,
+) -> tuple[SignalDelivery, bool]:
+    """Return (delivery, inserted). Unique on (signal_id, tenant_id, channel)."""
+    ...
+
+
+async def mark_delivery_sent(
+    db: AsyncSession,
+    *,
+    delivery_id: int,
+    message_id: str,
+) -> None:
+    ...
+
+
+async def mark_delivery_retry(
+    db: AsyncSession,
+    *,
+    delivery_id: int,
+    error: str,
+    next_retry_at: datetime,
+) -> None:
+    ...
+
+
+async def get_status_snapshot(db: AsyncSession) -> dict:
+    ...
+```
+
+### Idempotent Insert Pattern
+
+Postgres pattern:
+
+```python
+from sqlalchemy.dialects.postgresql import insert
+
+
+async def create_signal_if_absent(db: AsyncSession, *, ca: str, verdict_score: float | None, verdict_label: str | None):
+    stmt = (
+        insert(Signal)
+        .values(ca=ca.lower(), verdict_score=verdict_score, verdict_label=verdict_label)
+        .on_conflict_do_nothing(index_elements=["ca"])
+        .returning(Signal.id)
+    )
+    inserted_id = await db.scalar(stmt)
+    if inserted_id:
+        signal = await db.get(Signal, inserted_id)
+        return signal, True
+
+    signal = await db.scalar(select(Signal).where(Signal.ca == ca.lower()))
+    return signal, False
+```
+
+SQLite fallback can use `sqlite_insert(...).on_conflict_do_nothing(...)`.
+
+### Recheck Selection At Scale
+
+For Postgres workers, use row locking to avoid two workers processing the same recheck:
+
+```python
+stmt = (
+    select(Launch)
+    .where(
+        Launch.status == "queued_recheck",
+        Launch.next_check_at <= now,
+    )
+    .order_by(Launch.next_check_at.asc())
+    .limit(limit)
+    .with_for_update(skip_locked=True)
+)
+```
+
+SQLite local mode does not support `SKIP LOCKED`; local mode is for development only.
+
+### Fanout Scenario For 1000 Tenants
+
+When one token passes filters:
+
+1. `create_signal_if_absent(ca=...)`
+2. Load active tenants in pages.
+3. Apply tenant settings:
+   - enabled source
+   - `min_score`
+   - daily plan limit
+   - quiet hours
+4. Batch insert `signal_deliveries`.
+5. Delivery workers process pending deliveries with Telegram rate limits.
+
+Repository helper:
+
+```python
+async def create_delivery_batch(
+    db: AsyncSession,
+    *,
+    signal_id: int,
+    deliveries: list[dict],
+) -> int:
+    """Insert pending deliveries and return inserted count."""
+    ...
+```
+
+This is the core service-scale path. Do not send Telegram messages directly from scoring.
+Scoring creates a signal; delivery workers send it.
+
+### DB-Backed `/status`
+
+`/status` must not read process memory.
+
+Status snapshot should include:
+
+```python
+{
+    "tenants_active": int,
+    "launches_last_hour": int,
+    "signals_today": int,
+    "deliveries_pending": int,
+    "deliveries_retry": int,
+    "deliveries_failed": int,
+    "queued_rechecks": int,
+    "provider_cooldowns": list[str],
+}
+```
+
+### Retention Policy
+
+Prevent DB bloat from day one:
+
+```text
+raw_json for launches: keep 30-60 days
+api_budget_events: keep 14-30 days
+audit_events: keep 180 days
+signal_deliveries: keep forever or archive after 1 year
+verdicts: keep forever for backtesting, or archive old JSON blobs later
+```
+
+Add `maintenance.cleanup_old_rows` as a Phase 1 maintenance job.
+
 ## Data Model
 
 ### `tenants`
