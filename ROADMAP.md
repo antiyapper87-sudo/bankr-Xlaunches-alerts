@@ -16,7 +16,8 @@ watchlist, smart-money tracking и дальнейшую монетизацию.
 
 - Не добавлять ничего нового, пока не закрыта текущая фаза.
 - До конца Фазы 5 фокус только на Base.
-- Использовать SQLite как легкое локальное хранилище без внешней БД.
+- Для локального MVP можно использовать SQLite.
+- Для сервиса на 1000+ клиентов использовать managed Postgres + Redis/queue.
 - Каждую фазу заканчивать тестированием и 1-2 днями на багфиксы.
 - После каждой фазы обновлять `architecture.md`.
 - Не включать on-chain trading до отдельной безопасной реализации.
@@ -36,28 +37,58 @@ watchlist, smart-money tracking и дальнейшую монетизацию.
 - Установить зависимости:
 
 ```bash
-pip install sqlalchemy aiosqlite redis rq rq-scheduler
+pip install aiosqlite asyncpg redis arq
 ```
 
-- Использовать SQLite для persistence.
-- Использовать RQ для очередей.
+- Использовать SQLite только для local/dev режима.
+- Использовать managed Postgres для production persistence.
+- Использовать Redis-backed queue для production fanout/retries.
 - Создать `.env.example` со всеми новыми переменными.
 
 Результат: чистый старт для дальнейшей разработки.
 
-## Фаза 1: Core Stability & Persistence
+## Фаза 1: Service-Grade Core Stability & Persistence
 
-Оценка: 4-6 дней.
+Оценка: 10-15 дней.
 
 Статус: самая важная фаза.
 
-Цель: убрать in-memory проблемы, чтобы бот мог работать 24/7 без дублирования сигналов.
+Цель: убрать in-memory проблемы и заложить foundation для сервиса, который может
+одновременно обслуживать 1000+ клиентов/трейдеров без дублей, потери состояния и ручного
+операционного хаоса.
+
+Ключевое решение:
+
+- Для локального single-user деплоя допустим SQLite.
+- Для product/service деплоя сразу проектировать под Postgres.
+- Redis/queue нужен не для discovery, а для fanout, rate limits, retries и background jobs.
+- Trading остается выключенным.
 
 Задачи:
 
-- Внедрить SQLite.
+- Внедрить production persistence.
+- Локально: SQLite-compatible repository layer.
+- Production: managed Postgres.
 - Создать новый файл `database.py`.
+- Не завязывать бизнес-логику на конкретный драйвер БД.
 - Добавить таблицы:
+  - `tenants`
+    - `id`
+    - `type` (`telegram_user`, `telegram_group`, later `discord_server`)
+    - `external_id`
+    - `plan`
+    - `status`
+    - `created_at`
+  - `users`
+    - `id`
+    - `telegram_user_id`
+    - `username`
+    - `role`
+    - `created_at`
+  - `tenant_members`
+    - `tenant_id`
+    - `user_id`
+    - `role`
   - `launches`
     - `ca`
     - `ticker`
@@ -65,38 +96,124 @@ pip install sqlalchemy aiosqlite redis rq rq-scheduler
     - `launched_at`
     - `raw_data`
     - `status`
+    - `first_seen_at`
+    - `last_checked_at`
+    - `next_check_at`
+    - `check_count`
+    - `market_data`
   - `signals`
     - `ca`
+    - `tenant_id`
     - `verdict_score`
     - `verdict_text`
     - `sent_at`
     - `chat_id`
+    - `message_id`
+    - unique key: `(tenant_id, ca)`
+  - `signal_deliveries`
+    - `signal_id`
+    - `tenant_id`
+    - `channel`
+    - `status`
+    - `attempt_count`
+    - `last_error`
+    - `delivered_at`
   - `verdict_cache`
     - `ca`
     - `verdict_json`
     - `expires_at`
+  - `tenant_settings`
+    - `tenant_id`
+    - `min_score`
+    - `enabled_sources`
+    - `quiet_hours`
+    - `delivery_mode`
+  - `audit_events`
+    - `tenant_id`
+    - `event_type`
+    - `payload`
+    - `created_at`
 - Заменить `seen_tokens` на запросы к БД.
 - Заменить `signaled_tokens` на БД.
 - Заменить `recheck_queue` на БД.
-- Внедрить RQ:
-  - producer в `main.py`
-  - workers для enrichment
-  - workers для verdict
+- Разделить runtime на логические контуры:
+  - ingestion: Bankr/Clanker/Virtuals polling
+  - enrichment: market/social enrichment
+  - scoring: deterministic verdict
+  - fanout: доставка сигналов tenant/user/group targets
+  - commands: Telegram command handling
+- Внедрить очередь для production:
+  - локально можно оставить in-process async queue
+  - production: Redis Queue / Arq / Celery, выбрать один после адаптера
+  - не импортировать worker из `main.py`
+  - worker должен импортировать только чистые сервисы
 - Создать новый файл `worker.py`.
-- Добавить dynamic thresholds:
-  - каждые 10 минут пересчитывать медианы по последним 100 лаунчам.
+- Добавить delivery idempotency:
+  - один CA не может быть отправлен одному tenant дважды
+  - retries не должны создавать новые Telegram messages
+  - Telegram edit должен использовать сохраненный `message_id`
+- Добавить rate limiting:
+  - Telegram Bot API limits
+  - SocialData budget
+  - GeckoTerminal cooldown
+  - per-tenant daily signal limits
+- Добавить backpressure:
+  - bounded queues
+  - max concurrent enrichment jobs
+  - max concurrent verdict jobs
+  - degraded mode when APIs rate-limit
 - Добавить multi-source deduplication по CA.
+- Добавить observability:
+  - structured logs
+  - `/status` из БД
+  - `/health` или health log line
+  - counters: launches/min, signals/day, queue depth, delivery failures
+  - error budget по external API
+- Добавить `.env.example`:
+  - local SQLite mode
+  - production Postgres mode
+  - Redis URL
+  - Telegram/SocialData/API keys
+- Добавить smoke tests:
+  - DB schema init
+  - CA dedupe
+  - tenant delivery uniqueness
+  - restart no-duplicate scenario
+  - recheck survives restart
+
+Что НЕ включать в Фазу 1:
+
+- Solana.
+- On-chain trading.
+- Dynamic thresholds как active filter.
+- LLM scoring.
+- Stripe/subscriptions.
+- Discord.
+- ML/user feedback.
 
 Файлы:
 
 - `main.py`
 - `database.py`
 - `worker.py`
+- `services/ingestion.py`
+- `services/enrichment.py`
+- `services/scoring.py`
+- `services/delivery.py`
+- `services/tenants.py`
+- `.env.example`
+- `tests/`
 
 Метрика успеха:
 
 - 0 дублирующихся сигналов после рестарта.
+- Recheck queue переживает рестарт.
+- Один сигнал доставляется 1000 tenants без дублей.
+- Telegram fanout имеет retries и rate limiting.
+- 1000 клиентов могут иметь разные `min_score` / delivery settings.
 - Обработка 500+ лаунчей/час без падения.
+- 10k signal deliveries/day без ручного вмешательства.
+- `/status` показывает состояние из БД, а не из process memory.
 
 ## Фаза 2: Verdict 2.0 + Spoof Detection
 

@@ -17,7 +17,11 @@ Current target:
 
 Do not implement the pasted framework exactly as written.
 
-The right Phase 1 path is:
+There are now two valid Phase 1 tracks:
+
+### Track A: Personal Bot / Fast Local Deploy
+
+Use this only if the goal is a stable bot for one operator or a small private group.
 
 1. Add SQLite persistence first.
 2. Keep the bot as a single async process for the first deploy.
@@ -27,9 +31,20 @@ The right Phase 1 path is:
 6. Keep low-risk caches in memory.
 7. Deploy the stable single-process version.
 
-The pasted framework correctly identifies the persistence problem, but overreaches with
-Redis/RQ, dynamic thresholds, and worker splitting before the codebase has clean module
-boundaries.
+### Track B: Service For 1000+ Clients
+
+Use this if the goal is a paid product serving many traders/tenants.
+
+1. Use Postgres as source of truth.
+2. Add Redis/queue for fanout, retries and rate limiting.
+3. Add tenants, tenant settings and signal delivery ledger from day one.
+4. Keep launch ingestion, enrichment, scoring and delivery as separate import-safe services.
+5. Do not add LLM, billing, Discord, Solana or trading until delivery correctness is solved.
+
+The pasted framework correctly identifies the persistence problem, but still misses the
+main service-scale issue: tenant-specific delivery correctness. Redis/RQ alone does not
+make the bot a service. The required product primitive is `signal_deliveries` with
+idempotency per tenant.
 
 ## Fact Check: Current Holes
 
@@ -61,10 +76,13 @@ boundaries.
 
 ### SQLite
 
-Verdict: keep.
+Verdict: keep only for Track A and local development.
 
 SQLite is the right persistence layer for Phase 1. It gives durable state without external
 ops and is enough for the current source volume.
+
+For the 1000+ client service track, SQLite is not the production source of truth. Use
+Postgres for tenant state, signal deliveries and operational visibility.
 
 Required changes:
 
@@ -84,7 +102,7 @@ to debug and safer to deploy quickly.
 
 Decision:
 
-- use `aiosqlite` directly for Phase 1
+- use `aiosqlite` directly for Track A / local smoke tests
 - defer SQLAlchemy until the schema stabilizes or a dashboard/API needs ORM ergonomics
 
 ### Redis + RQ
@@ -478,9 +496,13 @@ Phase 1 is done only when:
 
 ## Final Recommendation
 
-Deploy the simpler SQLite-first architecture.
+For the current private bot, deploy the simpler SQLite-first architecture.
 
 The pasted framework is useful as a direction, but too heavy for the current codebase. The
 best production step is a durable single-process bot. Redis/RQ should be considered only
 after the source fetching, market enrichment, verdict pipeline, and Telegram sending are
 split into import-safe modules with stable function boundaries.
+
+For a real service with 1000+ clients, do not stop at SQLite-first. Use the service-grade
+Phase 1 plan in `docs/phase1_service_scale_plan.md`: Postgres, Redis/queue, tenant model,
+signal delivery ledger, idempotent fanout, retries, rate limits and DB-backed observability.
