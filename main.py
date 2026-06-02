@@ -467,14 +467,18 @@ def build_trade_keyboard(token_address: str, symbol: str) -> dict:
     return {
         "inline_keyboard": [
             [
-                {"text": "🍌 Buy on Banana Gun", "url": banana_url},
+                {"text": "🔎 X Research", "url": x_research_url},
             ],
             [
-                {"text": "🔎 X Research", "url": x_research_url},
+                {"text": "📊 Gecko", "url": f"https://www.geckoterminal.com/base/tokens/{token_address}"},
+                {"text": "📈 GMGN", "url": f"https://gmgn.ai/base/token/{token_address}"},
             ],
             [
                 {"text": "📋 Copy CA", "callback_data": f"copyca:0:{addr}"},
                 {"text": "🔎 Ticker X", "callback_data": f"xtickerx:{sym}:{addr}"},
+            ],
+            [
+                {"text": "🍌 Banana Gun", "url": banana_url},
             ],
         ]
     }
@@ -1676,12 +1680,19 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
             f"Try: /research 0x..."
         )
 
-    safe_name = (token_name or ticker).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-    lines = [f"🔍 <b>Research: {safe_name}</b> (${ticker})\n"]
+    safe_name = h(token_name or ticker)
+    safe_ticker = h(ticker)
+    lines = [f"🔍 <b>Research: {safe_name}</b> (${safe_ticker})\n"]
 
     if address:
         lines.append(f"📋 <code>{address}</code>\n")
         lines.append(f"🔎 <a href='{build_x_research_url(address, ticker)}'>X Research</a>\n")
+
+    lines.extend([
+        "🧠 <b>Quick take</b> <i>(stub)</i>",
+        f"└ {h(build_research_takeaway(dex, x_mentions, influencer_mentions))}",
+        "",
+    ])
 
     if dex:
         change_1h = dex.get("price_change_1h", 0)
@@ -1976,6 +1987,96 @@ def clean_x_handle(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_]", "", str(value or "").strip().lstrip("@"))[:32]
 
 
+def fmt_token_age(dex: dict | None) -> str:
+    if not dex:
+        return "n/a"
+    pair_created = dex.get("pair_created_at", 0)
+    if not pair_created:
+        return "n/a"
+    age_seconds = max(0, time.time() - (pair_created / 1000))
+    if age_seconds < 3600:
+        return f"{int(age_seconds / 60)}m"
+    if age_seconds < 86400:
+        return f"{age_seconds / 3600:.1f}h"
+    return f"{age_seconds / 86400:.1f}d"
+
+
+def build_signal_reason(launch: dict, dex: dict | None) -> str:
+    reasons: list[str] = []
+    source = launch.get("source", "")
+    if source in SAFE_LAUNCHPADS:
+        reasons.append(f"{source.title()} launchpad")
+    elif source:
+        reasons.append(f"{source.title()} discovery")
+
+    if dex:
+        mcap = float(dex.get("mcap") or 0)
+        volume = float(dex.get("volume_24h") or 0)
+        liquidity = float(dex.get("liquidity") or 0)
+        market_ok = mcap >= MIN_MCAP and volume >= MIN_VOLUME_24H
+        if source not in SAFE_LAUNCHPADS:
+            market_ok = market_ok and liquidity >= MIN_LIQUIDITY
+        if market_ok:
+            reasons.append("market filters passed")
+        if source in SAFE_LAUNCHPADS:
+            reasons.append("liq check skipped")
+
+    if launch.get("x_username") or launch.get("creator_x"):
+        reasons.append("deployer social found")
+
+    return "; ".join(reasons[:3]) if reasons else "Passed scan filters"
+
+
+def build_ai_summary_placeholder(launch: dict, dex: dict | None, verdict: dict | None = None) -> str:
+    source = launch.get("source", "scan").title()
+    age = fmt_token_age(dex)
+    if verdict:
+        score = verdict.get("score", {})
+        label = score.get("label", "PENDING")
+        reasons = score.get("reasons") or []
+        risks = score.get("risk_flags") or []
+        why = reasons[0] if reasons else "waiting for stronger social/market confirmation"
+        risk = risks[0] if risks else "no dominant risk flagged yet"
+        return (
+            f"🧠 <b>AI brief</b> <i>(draft)</i>\n"
+            f"├ Bias: {html.escape(str(label))} · {html.escape(str(why))}\n"
+            f"└ Risk: {html.escape(str(risk))}"
+        )
+
+    data_hint = "market data present" if dex else "market data pending"
+    return (
+        f"🧠 <b>AI brief</b> <i>(placeholder)</i>\n"
+        f"├ {source} token · age {html.escape(age)} · {data_hint}\n"
+        f"└ Next: check X quality, deployer history, holders/liquidity"
+    )
+
+
+def build_research_takeaway(dex: dict | None, x_mentions: list[dict], influencer_mentions: list[dict]) -> str:
+    if not dex and not x_mentions and not influencer_mentions:
+        return "No Base market or social signal found yet."
+    positives: list[str] = []
+    risks: list[str] = []
+    if dex:
+        passes, reason = passes_market_filters(dex)
+        if passes:
+            positives.append("market filters pass")
+        else:
+            risks.append(reason)
+    else:
+        risks.append("market data missing")
+
+    if influencer_mentions:
+        positives.append(f"{len(influencer_mentions)} watched mention(s)")
+    elif x_mentions:
+        positives.append(f"{len(x_mentions)} notable X mention(s)")
+    else:
+        risks.append("no notable X coverage")
+
+    left = "; ".join(positives[:2]) if positives else "weak confirmation"
+    right = "; ".join(risks[:2]) if risks else "no major deterministic risk flagged"
+    return f"{left}. Risk: {right}."
+
+
 SOURCE_EMOJIS = {"bankr": "🏦", "clanker": "⚙️", "virtuals": "🤖", "dexscreener": "📊"}
 
 
@@ -1989,80 +2090,77 @@ def format_signal_telegram(launch: dict, dex: dict | None, executed: bool = Fals
     tweet_url = h(launch.get("tweet_url", ""))
     source_emoji = SOURCE_EMOJIS.get(source_key, "📡")
 
-    market_lines = ""
-    age_line = ""
+    market_line = "Market: n/a"
+    momentum_line = ""
     if dex:
         change_1h = dex.get("price_change_1h", 0)
         change_emoji = "🟢" if change_1h >= 0 else "🔴"
-        pair_created = dex.get("pair_created_at", 0)
-        if pair_created:
-            age_seconds = time.time() - (pair_created / 1000)
-            if age_seconds < 3600:
-                age_line = f"🕐 Launched: {int(age_seconds / 60)}m ago\n"
-            elif age_seconds < 86400:
-                age_line = f"🕐 Launched: {age_seconds / 3600:.1f}h ago\n"
-            else:
-                age_line = f"🕐 Launched: {age_seconds / 86400:.1f}d ago\n"
-
         liq_val = dex.get('liquidity', 0)
-        liq_note = " 🔓" if source_key in SAFE_LAUNCHPADS else ""
-        market_lines = (
-            f"{age_line}"
-            f"├ 💰 MCap: {fmt_usd(dex['mcap'])}\n"
-            f"├ 📈 Vol: {fmt_usd(dex['volume_24h'])}\n"
-            f"├ 💧 Liq: {fmt_usd(liq_val)}{liq_note}\n"
-            f"└ {change_emoji} 1h: {change_1h:+.1f}%"
+        liq_note = " (safe source)" if source_key in SAFE_LAUNCHPADS else ""
+        market_line = (
+            f"MCap {fmt_usd(dex['mcap'])} · Vol {fmt_usd(dex['volume_24h'])} · "
+            f"Liq {fmt_usd(liq_val)}{liq_note}"
         )
+        momentum_line = f"{change_emoji} 1h {change_1h:+.1f}% · Age {fmt_token_age(dex)}"
 
-    deployer_line = ""
+    identity_bits = [f"{source_emoji} {source}"]
     if x_username:
-        deployer_line = f"👤 Deployer: <a href='https://x.com/{x_username}'>@{x_username}</a>\n"
+        identity_bits.append(f"<a href='https://x.com/{x_username}'>@{x_username}</a>")
 
+    extra_lines: list[str] = []
     if source_key == "virtuals":
         creator_x = clean_x_handle(launch.get("creator_x", ""))
         if creator_x and creator_x != x_username:
-            deployer_line += f"👷 Creator: <a href='https://x.com/{creator_x}'>@{creator_x}</a>\n"
+            extra_lines.append(f"Creator <a href='https://x.com/{creator_x}'>@{creator_x}</a>")
         holders = launch.get("holder_count", 0)
         if holders:
-            deployer_line += f"👥 Holders: {holders:,}\n"
+            extra_lines.append(f"Holders {holders:,}")
 
     if source_key == "dexscreener":
         dex_id = launch.get("dex_id", "")
-        deployer_line += f"🏭 Via: {h(dex_id.title() if dex_id else 'Unknown DEX')}\n"
+        extra_lines.append(f"Via {h(dex_id.title() if dex_id else 'Unknown DEX')}")
 
     execution_line = ""
     if executed:
-        execution_line = f"\n💸 <b>Auto-bought ${BANKR_BUY_AMOUNT}</b> via Bankr" + (f" (job: <code>{job_id}</code>)" if job_id else "") + "\n"
+        execution_line = f"\n💸 Auto-bought ${BANKR_BUY_AMOUNT} via Bankr" + (f" (job: <code>{job_id}</code>)" if job_id else "")
     elif AUTO_EXECUTE and not BANKR_EXECUTION_API_KEY:
-        execution_line = "\n⚠️ Auto-execute ON but no API key set\n"
+        execution_line = "\n⚠️ Auto-execute ON but no API key set"
 
     links = [
-        f"├ <a href='https://www.geckoterminal.com/base/tokens/{address}'>Gecko</a>",
-        f"├ <a href='https://gmgn.ai/base/token/{address}'>GMGN</a>",
+        f"<a href='https://www.geckoterminal.com/base/tokens/{address}'>Gecko</a>",
+        f"<a href='https://gmgn.ai/base/token/{address}'>GMGN</a>",
     ]
     if source_key == "clanker":
-        links.append(f"├ <a href='https://www.clanker.world/clanker/{address}'>Clanker</a>")
+        links.append(f"<a href='https://www.clanker.world/clanker/{address}'>Clanker</a>")
     elif source_key == "virtuals":
         vid = h(launch.get("virtuals_id", ""))
         if vid:
-            links.append(f"├ <a href='https://app.virtuals.io/virtuals/{vid}'>Virtuals</a>")
+            links.append(f"<a href='https://app.virtuals.io/virtuals/{vid}'>Virtuals</a>")
     elif source_key == "dexscreener":
         pair_url = h(launch.get("pair_url", ""))
         if pair_url:
-            links.append(f"├ <a href='{pair_url}'>Chart</a>")
+            links.append(f"<a href='{pair_url}'>Chart</a>")
     if tweet_url:
-        links.append(f"├ <a href='{tweet_url}'>📝 Tweet</a>")
-    links.append(f"└ <a href='https://app.uniswap.org/swap?chain=base&amp;outputCurrency={address}'>Uniswap</a>")
+        links.append(f"<a href='{tweet_url}'>Tweet</a>")
+    links.append(f"<a href='https://app.uniswap.org/swap?chain=base&amp;outputCurrency={address}'>Uniswap</a>")
+
+    details_line = " · ".join(identity_bits)
+    if extra_lines:
+        details_line += "\n" + " · ".join(extra_lines[:2])
 
     return (
-        f"📡 <b>SIGNAL</b> {source_emoji} {source}\n\n"
-        f"<b>{name}</b> (${symbol})\n"
-        f"{deployer_line}"
-        f"{market_lines}\n"
-        f"{execution_line}\n"
-        f"🔗 " + " · ".join(links) + "\n\n"
+        f"📡 <b>${symbol}</b> · {name}\n"
+        f"{details_line}\n\n"
+        f"📊 <b>Snapshot</b>\n"
+        f"├ {market_line}\n"
+        f"└ {momentum_line or 'Momentum n/a'}\n\n"
+        f"🎯 <b>Why surfaced</b>\n"
+        f"└ {h(build_signal_reason(launch, dex))}\n\n"
+        f"{build_ai_summary_placeholder(launch, dex)}"
+        f"{execution_line}\n\n"
+        f"🔗 " + " · ".join(links) + "\n"
         f"<code>{address}</code>\n"
-        f"💡 /research {address}"
+        f"/research {address}"
     )
 
 
@@ -2225,7 +2323,11 @@ async def attach_signal_verdict(
         return
 
     verdict_block = format_verdict_block(verdict)
-    new_text = f"{base_text}\n\n{verdict_block}"
+    placeholder = build_ai_summary_placeholder(launch, dex)
+    if placeholder in base_text:
+        new_text = base_text.replace(placeholder, verdict_block)
+    else:
+        new_text = f"{base_text}\n\n{verdict_block}"
     if len(new_text) > 3900:
         new_text = new_text[:3800] + "\n\n<i>Verdict truncated</i>"
 

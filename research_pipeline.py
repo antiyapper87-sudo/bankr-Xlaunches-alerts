@@ -280,32 +280,28 @@ def format_verdict_block(verdict: dict) -> str:
     value = score.get("value", 0)
     label = score.get("label", "WEAK")
     emoji = score.get("emoji", "🔴")
-    lines = [f"🧠 <b>VERDICT: {emoji} {html.escape(str(label))}</b> ({value}/10)"]
-
     reasons = score.get("reasons") or []
     risks = score.get("risk_flags") or []
+
+    lines = [f"🧠 <b>AI brief</b> <i>(deterministic)</i> · {emoji} {html.escape(str(label))} {value}/10"]
     if reasons:
-        lines.append("├ ✅ " + "; ".join(html.escape(str(r)) for r in reasons[:3]))
+        lines.append("├ Why: " + "; ".join(html.escape(str(r)) for r in reasons[:2]))
     if risks:
-        lines.append("├ ⚠️ " + "; ".join(html.escape(str(r)) for r in risks[:3]))
+        lines.append("├ Risk: " + "; ".join(html.escape(str(r)) for r in risks[:2]))
 
     social = verdict.get("social") or {}
     mentions = social.get("notable_mentions") or []
     watched = social.get("watched_influencer_mentions") or []
+    social_bits = []
     if mentions:
         top = mentions[0]
-        lines.append(
-            f"├ 🐦 Top X: @{html.escape(str(top.get('username', '')))} "
-            f"({_compact_num(top.get('followers') or 0)})"
-        )
+        social_bits.append(f"top @{html.escape(str(top.get('username', '')))} {_compact_num(top.get('followers') or 0)}")
     if watched:
         top_watched = watched[0]
-        lines.append(f"├ 👀 Watched: @{html.escape(str(top_watched.get('username', '')))}")
-
-    llm = verdict.get("llm") or {}
-    if llm.get("used"):
-        lines.append("└ 🤖 AI summary enabled")
+        social_bits.append(f"watched @{html.escape(str(top_watched.get('username', '')))}")
+    if social_bits:
+        lines.append("└ X: " + " · ".join(social_bits[:2]))
     else:
-        lines.append("└ 🤖 AI: stub")
+        lines.append("└ X: no strong social confirmation yet")
 
     return "\n".join(lines)
