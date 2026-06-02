@@ -35,6 +35,12 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def ensure_aware(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 class JSONCompat(TypeDecorator):
     impl = JSON
     cache_ok = True
@@ -609,7 +615,7 @@ async def store_verdict(
 async def get_cached_verdict(db: AsyncSession, ca: str, *, now: datetime | None = None) -> dict[str, Any] | None:
     now = now or utc_now()
     cache = await db.get(VerdictCache, normalize_ca(ca))
-    if not cache or cache.expires_at <= now:
+    if not cache or ensure_aware(cache.expires_at) <= now:
         return None
     return cache.verdict_json
 
@@ -627,7 +633,7 @@ async def set_provider_cooldown(db: AsyncSession, *, provider: str, cooldown_unt
 async def provider_available(db: AsyncSession, provider: str, *, now: datetime | None = None) -> bool:
     now = now or utc_now()
     row = await db.get(ProviderCooldown, provider)
-    return not row or row.cooldown_until <= now
+    return not row or ensure_aware(row.cooldown_until) <= now
 
 
 async def record_api_budget_event(

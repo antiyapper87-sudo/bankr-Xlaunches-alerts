@@ -14,7 +14,9 @@ from database import (
     init_db,
     mark_delivery_retry,
     mark_delivery_sending,
+    provider_available,
     queue_recheck,
+    set_provider_cooldown,
     upsert_launch,
     upsert_tenant,
     utc_now,
@@ -187,3 +189,19 @@ def test_signal_format_stays_under_telegram_limit():
     )
     assert len(text) < 4096
     assert "/research" in text
+
+
+@pytest.mark.asyncio
+async def test_provider_cooldown_datetime_survives_sqlite_roundtrip(db_url):
+    async with db_session() as db:
+        await set_provider_cooldown(
+            db,
+            provider="geckoterminal",
+            cooldown_until=utc_now() + timedelta(minutes=1),
+            reason="429",
+        )
+
+    await close_db()
+    await init_db(db_url, auto_create=False)
+    async with db_session() as db:
+        assert await provider_available(db, "geckoterminal") is False
