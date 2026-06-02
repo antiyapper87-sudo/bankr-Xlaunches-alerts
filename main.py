@@ -27,9 +27,32 @@ import json
 import time
 import html
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 
+from database import (
+    close_db,
+    db_session,
+    get_due_delivery_retries,
+    get_due_rechecks,
+    get_launch_status,
+    get_status_snapshot,
+    init_db,
+    mark_delivery_failed,
+    mark_delivery_retry,
+    mark_delivery_sent,
+    mark_delivery_sending,
+    mark_launch_status,
+    provider_available,
+    queue_recheck,
+    record_api_budget_event,
+    set_bot_state,
+    set_provider_cooldown,
+    signal_exists_for_tenant,
+    store_verdict,
+    upsert_launch,
+    utc_now,
+)
 from research_pipeline import (
     AUTO_VERDICT_ENABLED,
     AUTO_VERDICT_MAX_CONCURRENT,
@@ -38,6 +61,10 @@ from research_pipeline import (
     build_signal_verdict_with_timeout,
     format_verdict_block,
 )
+from services.delivery import prepare_tenant_delivery
+from services.observability import correlation_id, log_event
+from services.tenants import ensure_telegram_tenant
+from settings import resolve_database_url, settings
 
 # ─── Config from environment ──────────────────────────────────────────────────
 
@@ -103,8 +130,6 @@ log = logging.getLogger("whale-alert")
 
 # ─── State ────────────────────────────────────────────────────────────────────
 
-seen_tokens: set[str] = set()
-signaled_tokens: set[str] = set()
 follower_cache: dict[str, int | None] = {}
 gecko_cache: dict[str, tuple[float, dict | None]] = {}
 GECKO_CACHE_TTL_HIT = 120
@@ -112,13 +137,15 @@ GECKO_CACHE_TTL_MISS = 60
 last_update_id: int = 0
 alert_count: int = 0
 execution_count: int = 0
+default_tenant_db_id: int | None = None
 
 # ─── Recheck queue ────────────────────────────────────────────────────────────
 RECHECK_MAX_AGE = 3600
 RECHECK_INTERVAL = 300
 RECHECK_MAX_CHECKS = 12
 RECHECK_MAX_QUEUE = 300
-recheck_queue: dict[str, dict] = {}
+TELEGRAM_RETRY_BATCH = int(os.getenv("TELEGRAM_RETRY_BATCH", "20"))
+TELEGRAM_MAX_DELIVERY_ATTEMPTS = int(os.getenv("TELEGRAM_MAX_DELIVERY_ATTEMPTS", "3"))
 
 # ─── Blocklist ────────────────────────────────────────────────────────────────
 
@@ -888,13 +915,20 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                     f"✅ ON ({AUTO_VERDICT_TIMEOUT_SEC:.0f}s timeout, {AUTO_VERDICT_MAX_CONCURRENT} concurrent)"
                     if AUTO_VERDICT_ENABLED else "❌ OFF"
                 )
+                async with db_session() as db:
+                    db_status = await get_status_snapshot(db)
                 await send_telegram(
                     session,
                     f"📡 <b>Signal Bot</b>\n\n"
                     f"• Sources: Bankr + Clanker + Virtuals + DexScreener\n"
-                    f"• Tokens seen: {len(seen_tokens)}\n"
+                    f"• Active tenants: {db_status['tenants_active']}\n"
+                    f"• Launches total: {db_status['launches_total']}\n"
+                    f"• Launches signaled: {db_status['launches_signaled']}\n"
                     f"• Signals sent: {alert_count}\n"
-                    f"• Recheck queue: {len(recheck_queue)}\n"
+                    f"• DB signals: {db_status['signals_total']}\n"
+                    f"• Recheck queue: {db_status['queued_rechecks']}\n"
+                    f"• Deliveries pending/retry/failed: {db_status['deliveries_pending']}/{db_status['deliveries_retry']}/{db_status['deliveries_failed']}\n"
+                    f"• Provider cooldowns: {', '.join(db_status['provider_cooldowns']) or 'none'}\n"
                     f"• Blocked: {len(blocked_accounts)} accounts\n"
                     f"• Min MCap: ${MIN_MCAP:,}\n"
                     f"• Min Volume: ${MIN_VOLUME_24H:,}\n"
@@ -1000,6 +1034,9 @@ async def get_follower_count(session: aiohttp.ClientSession, username: str) -> i
         log.warning(f"@{username} → SOCIALDATA_API_KEY not set!")
         follower_cache[username] = None
         return None
+    if not await is_provider_available("socialdata"):
+        log.debug(f"@{username} → SocialData cooldown active")
+        return None
 
     count = None
     try:
@@ -1009,6 +1046,7 @@ async def get_follower_count(session: aiohttp.ClientSession, username: str) -> i
             "Accept": "application/json",
         }
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            await record_provider_response("socialdata", endpoint="twitter/user", status_code=resp.status, cooldown_seconds=120)
             if resp.status == 200:
                 data = await resp.json()
                 count = data.get("public_metrics", {}).get("followers_count")
@@ -1039,9 +1077,13 @@ async def get_follower_count(session: aiohttp.ClientSession, username: str) -> i
 
 async def _fetch_dexscreener(session: aiohttp.ClientSession, token_address: str) -> dict | None:
     """Fetch market data from DexScreener (primary source)."""
+    if not await is_provider_available("dexscreener"):
+        log.debug(f"DexScreener cooldown active, skipping {token_address[:10]}...")
+        return None
     try:
         url = f"{DEXSCREENER_API_URL}/token-pairs/v1/base/{token_address}"
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            await record_provider_response("dexscreener", endpoint="token-pairs/base", status_code=resp.status, cooldown_seconds=60)
             if resp.status == 404:
                 return None
             if resp.status == 429:
@@ -1125,6 +1167,9 @@ def _mark_gecko_rate_limited() -> None:
 
 async def _fetch_geckoterminal_api(session: aiohttp.ClientSession, token_address: str) -> dict | None:
     """Fetch market data from GeckoTerminal (fallback source). 30 calls/min free tier."""
+    if not await is_provider_available("geckoterminal"):
+        log.debug(f"GeckoTerminal cooldown active, skipping fallback for {token_address[:10]}...")
+        return None
     if not _gecko_rate_ok():
         log.debug(f"GeckoTerminal rate limit reached, skipping fallback for {token_address[:10]}...")
         return None
@@ -1135,6 +1180,7 @@ async def _fetch_geckoterminal_api(session: aiohttp.ClientSession, token_address
         _gecko_calls.append(time.time())
 
         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            await record_provider_response("geckoterminal", endpoint="token", status_code=resp.status, cooldown_seconds=GECKO_COOLDOWN_SEC)
             if resp.status == 429:
                 _mark_gecko_rate_limited()
                 return None
@@ -1154,6 +1200,7 @@ async def _fetch_geckoterminal_api(session: aiohttp.ClientSession, token_address
         _gecko_calls.append(time.time())
 
         async with session.get(pools_url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            await record_provider_response("geckoterminal", endpoint="pools", status_code=resp.status, cooldown_seconds=GECKO_COOLDOWN_SEC)
             if resp.status == 429:
                 _mark_gecko_rate_limited()
                 return None
@@ -1670,7 +1717,11 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
     influencer_mentions = await search_influencer_mentions(session, ticker, address)
     existing_urls = {m["url"] for m in x_mentions}
     influencer_mentions = [m for m in influencer_mentions if m["url"] not in existing_urls]
-    was_alerted = address.lower() in seen_tokens if address else False
+    launch_status = None
+    if address:
+        async with db_session() as db:
+            launch_status = await get_launch_status(db, address)
+    was_alerted = launch_status == "signaled"
 
     if not dex and not x_mentions and not influencer_mentions:
         return (
@@ -1713,7 +1764,9 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
         lines.append("⚠️ No market data found\n")
 
     if was_alerted:
-        lines.append("👀 Token seen by bot\n")
+        lines.append("📡 Token already signaled by scanner\n")
+    elif launch_status:
+        lines.append(f"🗂 Scanner status: <code>{h(launch_status)}</code>\n")
 
     if deployer_info:
         x_user = deployer_info.get("x_username", "")
@@ -2232,19 +2285,188 @@ def format_alert_whatsapp(launch: dict, dex: dict | None, executed: bool = False
     return "\n".join(lines)
 
 
+def parse_launch_datetime(launch: dict) -> datetime | None:
+    for key in ("created_at", "createdAt", "launched_at", "launchedAt"):
+        raw = launch.get(key)
+        if not raw:
+            continue
+        if isinstance(raw, (int, float)):
+            value = float(raw)
+            if value > 10_000_000_000:
+                value = value / 1000
+            return datetime.fromtimestamp(value, timezone.utc)
+        if isinstance(raw, str):
+            try:
+                return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+    return None
+
+
+async def persist_launch_seen(launch: dict, status: str = "new") -> tuple[bool, str]:
+    address = (launch.get("address") or "").lower()
+    if not address:
+        return False, ""
+    async with db_session() as db:
+        _, inserted = await upsert_launch(
+            db,
+            ca=address,
+            ticker=launch.get("symbol", ""),
+            name=launch.get("name", ""),
+            source=launch.get("source", ""),
+            raw_json=launch,
+            launched_at=parse_launch_datetime(launch),
+            status=status,
+        )
+    return inserted, address
+
+
+def recheck_delay_for(reason: str, no_data: bool = False) -> int:
+    if no_data:
+        return min(RECHECK_INTERVAL, 120)
+    return RECHECK_INTERVAL
+
+
+def seconds_since(dt: datetime | None) -> float:
+    if not dt:
+        return 0
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return max(0, (utc_now() - dt).total_seconds())
+
+
+async def is_provider_available(provider: str) -> bool:
+    async with db_session() as db:
+        return await provider_available(db, provider)
+
+
+async def record_provider_response(
+    provider: str,
+    *,
+    endpoint: str = "",
+    status_code: int | None = None,
+    cooldown_seconds: int = 60,
+    reason: str = "",
+) -> None:
+    async with db_session() as db:
+        await record_api_budget_event(
+            db,
+            provider=provider,
+            endpoint=endpoint,
+            status_code=status_code,
+        )
+        if status_code == 429:
+            await set_provider_cooldown(
+                db,
+                provider=provider,
+                cooldown_until=utc_now() + timedelta(seconds=cooldown_seconds),
+                reason=reason or "rate limited",
+            )
+
+
+async def persist_recheck(
+    address: str,
+    reason: str,
+    *,
+    no_data: bool,
+    dex: dict | None = None,
+) -> None:
+    async with db_session() as db:
+        await queue_recheck(
+            db,
+            ca=address,
+            reason=reason,
+            next_check_at=utc_now() + timedelta(seconds=recheck_delay_for(reason, no_data=no_data)),
+            no_data=no_data,
+            market_json=dex,
+            last_mcap=float((dex or {}).get("mcap") or 0) if dex else None,
+        )
+
+
+async def process_delivery_retries(session: aiohttp.ClientSession) -> int:
+    async with db_session() as db:
+        due = await get_due_delivery_retries(db, now=utc_now(), limit=TELEGRAM_RETRY_BATCH)
+
+    processed = 0
+    for delivery in due:
+        payload = delivery.payload_json or {}
+        text = payload.get("telegram_text")
+        reply_markup = payload.get("reply_markup")
+        if not text:
+            async with db_session() as db:
+                await mark_delivery_failed(db, delivery_id=delivery.id, error="missing delivery payload")
+            continue
+        if delivery.attempt_count >= TELEGRAM_MAX_DELIVERY_ATTEMPTS:
+            async with db_session() as db:
+                await mark_delivery_failed(db, delivery_id=delivery.id, error="max telegram delivery attempts reached")
+            continue
+
+        async with db_session() as db:
+            await mark_delivery_sending(db, delivery_id=delivery.id)
+
+        message_id = await send_telegram(
+            session,
+            text,
+            chat_id=delivery.destination_id,
+            reply_markup=reply_markup,
+        )
+        async with db_session() as db:
+            if message_id is not None:
+                await mark_delivery_sent(db, delivery_id=delivery.id, message_id=str(message_id))
+                processed += 1
+            else:
+                backoff = min(60 * (2 ** max(delivery.attempt_count, 0)), 900)
+                await mark_delivery_retry(
+                    db,
+                    delivery_id=delivery.id,
+                    error="telegram retry failed",
+                    next_retry_at=utc_now() + timedelta(seconds=backoff),
+                )
+    return processed
+
+
 # ─── Signal Handler ───────────────────────────────────────────────────────────
 
-async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, source: str, symbol: str, is_recheck: bool = False):
+async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, source: str, symbol: str, is_recheck: bool = False) -> bool:
     global alert_count
 
     address = launch["address"]
     prefix = "RECHECK " if is_recheck else ""
+    cid = correlation_id(source, address)
 
     addr_truncated = address[:20]
     _address_map[addr_truncated] = address
 
     tg_text = format_signal_telegram(launch, dex, executed=False, job_id="")
     wa_text = format_alert_whatsapp(launch, dex, executed=False)
+    keyboard = build_trade_keyboard(address, symbol)
+    delivery_payload = {
+        "telegram_text": tg_text,
+        "reply_markup": keyboard,
+        "ca": address,
+        "symbol": symbol,
+        "source": source,
+    }
+
+    if default_tenant_db_id is not None:
+        async with db_session() as db:
+            if await signal_exists_for_tenant(db, ca=address, tenant_id=default_tenant_db_id):
+                log.info(f"  📡 [{source}] ${symbol} already delivered for default tenant, skipping")
+                await mark_launch_status(db, ca=address, status="signaled", reason="already delivered", market_json=dex)
+                return False
+            _, delivery, delivery_inserted = await prepare_tenant_delivery(
+                db,
+                ca=address,
+                tenant_id=default_tenant_db_id,
+                chat_id=TELEGRAM_CHAT_ID,
+                payload_json=delivery_payload,
+            )
+            if not delivery_inserted:
+                log.info(f"  📡 [{source}] ${symbol} delivery row exists, skipping duplicate")
+                return False
+            delivery_id = delivery.id
+    else:
+        delivery_id = None
 
     log.info(
         f"  📡 {prefix}SIGNAL: [{source}] ${symbol} "
@@ -2252,11 +2474,28 @@ async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, s
         + (f" @{launch.get('x_username')}" if launch.get('x_username') else "")
     )
 
-    keyboard = build_trade_keyboard(address, symbol)
+    if delivery_id is not None:
+        async with db_session() as db:
+            await mark_delivery_sending(db, delivery_id=delivery_id)
+
     message_id = await send_telegram(session, tg_text, reply_markup=keyboard)
     if message_id is None:
         log.error(f"  ❌ Telegram signal failed: [{source}] ${symbol} {address}")
-        return
+        if delivery_id is not None:
+            async with db_session() as db:
+                await mark_delivery_retry(
+                    db,
+                    delivery_id=delivery_id,
+                    error="telegram send failed",
+                    next_retry_at=utc_now() + timedelta(minutes=1),
+                )
+        return False
+
+    if delivery_id is not None:
+        async with db_session() as db:
+            await mark_delivery_sent(db, delivery_id=delivery_id, message_id=str(message_id))
+            await mark_launch_status(db, ca=address, status="signaled", reason="telegram delivered", market_json=dex)
+            log_event("signal_sent", correlation_id=cid, ca=address, source=source, message_id=message_id)
 
     if WHAPI_TOKEN and WHATSAPP_GROUP_ID:
         await send_whatsapp(session, wa_text)
@@ -2267,7 +2506,6 @@ async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, s
         pushover_msg += f" · @{launch['x_username']}"
     await send_pushover(session, f"🐋 {source.upper()}: ${symbol}", pushover_msg, url=dex_url)
 
-    signaled_tokens.add(address)
     alert_count += 1
 
     if AUTO_EXECUTE and isinstance(message_id, int):
@@ -2279,6 +2517,8 @@ async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, s
         asyncio.create_task(
             attach_signal_verdict(session, TELEGRAM_CHAT_ID, message_id, tg_text, keyboard, launch, dex, source, symbol)
         )
+
+    return True
 
 
 async def attach_execution_result(
@@ -2322,6 +2562,14 @@ async def attach_signal_verdict(
         log.warning(f"  ⚠️ Verdict skipped: [{source}] ${symbol}")
         return
 
+    async with db_session() as db:
+        await store_verdict(
+            db,
+            ca=launch.get("address", ""),
+            verdict=verdict,
+            expires_at=utc_now() + timedelta(minutes=15),
+        )
+
     verdict_block = format_verdict_block(verdict)
     placeholder = build_ai_summary_placeholder(launch, dex)
     if placeholder in base_text:
@@ -2348,32 +2596,25 @@ async def seed_existing(session: aiohttp.ClientSession):
     virtuals = await fetch_virtuals(session)
 
     all_launches = bankr + clanker + virtuals
-    queued = 0
+    inserted = 0
 
     for launch in all_launches:
-        addr = launch["address"]
-        seen_tokens.add(addr)
-        if addr not in recheck_queue and len(recheck_queue) < RECHECK_MAX_QUEUE:
-            recheck_queue[addr] = {
-                "launch": launch,
-                "first_seen": time.time(),
-                "last_check": 0,
-                "checks": 0,
-                "no_data": True,
-            }
-            queued += 1
+        was_inserted, addr = await persist_launch_seen(launch, status="seeded")
+        inserted += int(was_inserted)
+        if was_inserted:
+            log_event("launch_seeded", correlation_id=correlation_id(launch.get("source", "?"), addr), ca=addr, source=launch.get("source", "?"))
 
     log.info(
-        f"📋 Seeded {len(seen_tokens)} tokens "
+        f"📋 Seeded {inserted} new DB rows "
         f"(Bankr: {len(bankr)}, Clanker: {len(clanker)}, Virtuals: {len(virtuals)}) "
-        f"— {queued} queued for recheck"
+        f"— existing rows skipped"
     )
 
 
 # ─── Main Loop ────────────────────────────────────────────────────────────────
 
 async def main():
-    global alert_count
+    global alert_count, default_tenant_db_id
 
     if not TELEGRAM_BOT_TOKEN:
         log.error("❌ TELEGRAM_BOT_TOKEN not set!")
@@ -2400,6 +2641,15 @@ async def main():
     log.info(f"  Inline trading: {'✅ ON' if TRADING_ENABLED else '❌ OFF (set TRADING_ENABLED=true)'}")
     log.info(f"  Bankr Exec Key: {'✅' if BANKR_EXECUTION_API_KEY else '❌ NOT SET'}")
     log.info("=" * 60)
+
+    await init_db(resolve_database_url(), auto_create=settings.database_auto_create)
+    async with db_session() as db:
+        if TELEGRAM_CHAT_ID:
+            tenant = await ensure_telegram_tenant(db, TELEGRAM_CHAT_ID, title="default alerts")
+            default_tenant_db_id = tenant.id
+            await set_bot_state(db, "default_tenant_id", str(tenant.id))
+        await set_bot_state(db, "last_start_at", utc_now().isoformat())
+    log.info(f"✅ Database initialized ({settings.app_env}, tenant={default_tenant_db_id})")
 
     async with aiohttp.ClientSession() as session:
         await delete_telegram_webhook(session, drop_pending_updates=True)
@@ -2484,28 +2734,32 @@ async def main():
         while True:
             try:
                 await handle_telegram_commands(session)
+                retried_deliveries = await process_delivery_retries(session)
+                if retried_deliveries:
+                    log.info(f"📨 Retried {retried_deliveries} Telegram deliveries")
 
                 bankr_launches = await fetch_bankr(session)
                 clanker_launches = await fetch_clanker(session)
                 virtuals_launches = await fetch_virtuals(session)
                 all_launches = bankr_launches + clanker_launches + virtuals_launches
 
-                for src_name, src_list in [("bankr", bankr_launches), ("clanker", clanker_launches), ("virtuals", virtuals_launches)]:
-                    src_new = sum(1 for l in src_list if l["address"] not in seen_tokens)
-                    if src_new == 0 and len(src_list) > 0:
-                        log.info(f"  [{src_name}] {len(src_list)} fetched, all already seen")
-
                 new_count = 0
                 signal_count = 0
                 no_data_count = 0
 
                 for launch in all_launches:
-                    address = launch["address"]
-                    if address in seen_tokens:
+                    address = (launch["address"] or "").lower()
+                    if not address:
                         continue
 
                     symbol = launch.get("symbol", "?")
                     source = launch.get("source", "?")
+                    inserted, _ = await persist_launch_seen(launch, status="new")
+                    if not inserted:
+                        continue
+
+                    cid = correlation_id(source, address)
+                    log_event("launch_seen", correlation_id=cid, ca=address, source=source, symbol=symbol)
 
                     if source == "dexscreener" and launch.get("_dex"):
                         dex = launch["_dex"]
@@ -2516,117 +2770,80 @@ async def main():
 
                     if not passes:
                         if "too old" in reason or "likely old" in reason:
-                            seen_tokens.add(address)
+                            async with db_session() as db:
+                                await mark_launch_status(db, ca=address, status="expired", reason=reason, market_json=dex)
                             log.debug(f"  [{source}] ${symbol} — {reason}, skip (permanent)")
                         elif reason == "no market data":
-                            seen_tokens.add(address)
                             no_data_count += 1
-                            if address not in recheck_queue and len(recheck_queue) < RECHECK_MAX_QUEUE:
-                                recheck_queue[address] = {
-                                    "launch": launch,
-                                    "first_seen": time.time(),
-                                    "last_check": time.time(),
-                                    "checks": 1,
-                                    "no_data": True,
-                                }
+                            await persist_recheck(address, reason, no_data=True, dex=dex)
                             log.debug(f"  [{source}] ${symbol} — no market data, recheck queue (short)")
                         else:
-                            seen_tokens.add(address)
                             new_count += 1
                             log.info(f"  [{source}] ${symbol} — {reason}, skip → recheck queue")
-                            if address not in recheck_queue and len(recheck_queue) < RECHECK_MAX_QUEUE:
-                                recheck_queue[address] = {
-                                    "launch": launch,
-                                    "first_seen": time.time(),
-                                    "last_check": time.time(),
-                                    "checks": 1,
-                                    "no_data": False,
-                                }
+                            await persist_recheck(address, reason, no_data=False, dex=dex)
                         continue
 
-                    seen_tokens.add(address)
                     new_count += 1
 
                     if launch["source"] == "virtuals":
                         launch["x_username"] = launch.get("creator_x", "") or launch.get("x_username", "")
 
-                    if address not in signaled_tokens:
-                        await send_signal(session, launch, dex, source, symbol, is_recheck=False)
+                    if await send_signal(session, launch, dex, source, symbol, is_recheck=False):
                         signal_count += 1
 
-                # ── Recheck Queue ──
-                now = time.time()
-                expired = []
-                eligible = []
+                # ── Persistent Recheck Queue ──
+                async with db_session() as db:
+                    due_rechecks = await get_due_rechecks(db, now=utc_now(), limit=RECHECK_MAX_QUEUE)
 
-                for addr, entry in recheck_queue.items():
-                    age = now - entry["first_seen"]
-                    since_last = now - entry["last_check"]
-                    is_no_data = entry.get("no_data", False)
+                expired_names = []
+                for entry in due_rechecks:
+                    addr = entry.ca
+                    launch = entry.raw_json
+                    symbol = launch.get("symbol", "?")
+                    source = launch.get("source", "?")
+                    is_no_data = bool(entry.no_data)
                     max_checks = 6 if is_no_data else RECHECK_MAX_CHECKS
                     max_age = 1800 if is_no_data else RECHECK_MAX_AGE
 
-                    if age > max_age or entry["checks"] >= max_checks:
-                        expired.append(addr)
-                    elif entry["checks"] >= 2 and entry.get("last_mcap", 0) < 1000:
-                        expired.append(addr)
-                    elif since_last >= RECHECK_INTERVAL:
-                        eligible.append(addr)
-
-                for addr in eligible:
-                    entry = recheck_queue[addr]
-                    launch = entry["launch"]
-                    symbol = launch.get("symbol", "?")
-                    source = launch.get("source", "?")
+                    if seconds_since(entry.first_seen_at) > max_age or entry.check_count >= max_checks:
+                        async with db_session() as db:
+                            await mark_launch_status(db, ca=addr, status="expired", reason="recheck expired", market_json=entry.market_json)
+                        expired_names.append(f"${symbol}[{source}/{'nd' if is_no_data else 'd'}]")
+                        continue
+                    if entry.check_count >= 2 and float(entry.last_mcap or 0) < 1000:
+                        async with db_session() as db:
+                            await mark_launch_status(db, ca=addr, status="expired", reason="low mcap after rechecks", market_json=entry.market_json)
+                        expired_names.append(f"${symbol}[{source}/low]")
+                        continue
 
                     gecko_cache.pop(addr, None)
                     dex = await fetch_geckoterminal(session, addr)
-                    entry["last_check"] = time.time()
-                    entry["checks"] += 1
-                    if dex:
-                        entry["last_mcap"] = dex.get("mcap", 0)
-
-                    if entry.get("no_data") and dex is not None:
-                        entry["no_data"] = False
-                        entry["first_seen"] = time.time()
-                        entry["checks"] = 1
 
                     passes, reason = passes_market_filters(dex, source=source)
                     if not passes:
                         if "too old" in reason or "likely old" in reason:
                             log.debug(f"  ♻️ [{source}] ${symbol} — {reason}, dropping")
-                            expired.append(addr)
+                            async with db_session() as db:
+                                await mark_launch_status(db, ca=addr, status="expired", reason=reason, market_json=dex)
+                            expired_names.append(f"${symbol}[{source}/old]")
                             continue
                         if reason != "no market data":
-                            log.info(f"  ♻️ [{source}] ${symbol} recheck #{entry['checks']} — {reason}, still waiting")
-                        continue
-
-                    if addr in signaled_tokens:
-                        log.info(f"  ♻️ [{source}] ${symbol} passed but already signaled, skipping")
-                        expired.append(addr)
+                            log.info(f"  ♻️ [{source}] ${symbol} recheck #{entry.check_count + 1} — {reason}, still waiting")
+                        await persist_recheck(addr, reason, no_data=(reason == "no market data"), dex=dex)
                         continue
 
                     if launch["source"] == "virtuals":
                         launch["x_username"] = launch.get("creator_x", "") or launch.get("x_username", "")
 
-                    await send_signal(session, launch, dex, source, symbol, is_recheck=True)
-                    signal_count += 1
-                    expired.append(addr)
+                    if await send_signal(session, launch, dex, source, symbol, is_recheck=True):
+                        signal_count += 1
 
-                if expired:
-                    dropped_names = []
-                    for addr in expired:
-                        entry = recheck_queue.get(addr)
-                        if entry:
-                            sym = entry["launch"].get("symbol", "?")
-                            src = entry["launch"].get("source", "?")
-                            nd = "nd" if entry.get("no_data") else "d"
-                            dropped_names.append(f"${sym}[{src}/{nd}]")
-                        recheck_queue.pop(addr, None)
-                    if dropped_names:
-                        log.info(f"  🗑️ Recheck expired ({len(dropped_names)}): {', '.join(dropped_names[:10])}{'...' if len(dropped_names) > 10 else ''}")
+                if expired_names:
+                    log.info(f"  🗑️ Recheck expired ({len(expired_names)}): {', '.join(expired_names[:10])}{'...' if len(expired_names) > 10 else ''}")
 
-                recheck_log = f", {len(recheck_queue)} in recheck queue" if recheck_queue else ""
+                async with db_session() as db:
+                    db_status = await get_status_snapshot(db)
+                recheck_log = f", {db_status['queued_rechecks']} in DB recheck queue" if db_status["queued_rechecks"] else ""
                 no_data_log = f", {no_data_count} no-data queued" if no_data_count else ""
                 log.info(f"🔍 {new_count} new launches processed, {signal_count} signals sent{no_data_log}{recheck_log}")
 
@@ -2636,5 +2853,12 @@ async def main():
             await asyncio.sleep(POLL_INTERVAL)
 
 
+async def run() -> None:
+    try:
+        await main()
+    finally:
+        await close_db()
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(run())

@@ -18,23 +18,43 @@ on-chain execution is fail-closed by default.
 | Async runtime | `asyncio` |
 | HTTP client | `aiohttp` |
 | Telegram integration | Telegram Bot HTTP API |
+| Persistence | SQLAlchemy 2 async ORM |
+| Local database | SQLite via `aiosqlite`, WAL enabled |
+| Production database target | Postgres via `asyncpg` |
+| Migrations | Alembic |
+| Queue foundation | Redis + RQ job skeleton |
+| Configuration | `pydantic-settings` + `.env.local` |
 | Optional on-chain wallet/trading | `web3.py` on Base |
 | Deployment process | `Procfile`: `worker: python main.py` |
 | Local run mode | detached `screen` session `bankr_alerts` with `.env.local` |
 
-Dependencies are intentionally small:
+Core dependencies:
 
 ```text
 aiohttp>=3.9.0
 web3>=6.0.0
+SQLAlchemy>=2.0.0
+aiosqlite>=0.20.0
+asyncpg>=0.29.0
+alembic>=1.13.0
+pydantic-settings>=2.2.0
+redis>=5.0.0
+rq>=2.0.0
 ```
 
 ## Repository Layout
 
 ```text
 main.py                       Main bot runtime, polling, commands, formatting, integrations
+database.py                   Async SQLAlchemy schema, engine/session, repository helpers
+settings.py                   Typed environment settings and DB URL resolution
 research_pipeline.py          Deterministic auto-verdict scoring and formatting
 trader.py                     Optional on-chain buy/sell helpers, disabled by default
+worker.py                     RQ-compatible enrichment worker skeleton
+maintenance.py                Retention cleanup job entrypoint
+services/                     Import-safe service boundaries for delivery, tenants, queueing, logs
+migrations/                   Alembic environment and initial service schema migration
+tests/                        Phase 1 smoke tests for persistence and delivery invariants
 README.md                     Setup and environment overview
 architecture.md               This architecture document
 Procfile                      Worker entrypoint for Railway-like deployments
@@ -71,12 +91,56 @@ Owns the running bot process:
 
 Key runtime state:
 
-- `seen_tokens`: tokens already observed this process.
-- `signaled_tokens`: tokens already alerted this process.
-- `recheck_queue`: candidates waiting for market data/filter pass.
+- `launches`: durable CA-level dedupe and recheck status in the database.
+- `signals`: one product-level signal row per CA.
+- `signal_deliveries`: tenant/channel delivery ledger with Telegram message ids, retry status and payload.
+- `tenants` / `tenant_settings`: Telegram user/group destinations and future plan/filter settings.
+- `provider_cooldowns`: DB-visible degraded state for external API 429s.
 - `follower_cache`: SocialData follower lookup cache.
 - `gecko_cache`: market data cache.
 - `_address_map`: maps shortened callback addresses to full contract addresses.
+
+`main.py` still owns the single-process local runtime, but product state is no longer
+owned by process memory. Restart-safe behavior is enforced through `database.py`
+repository helpers and uniqueness constraints.
+
+### `database.py`
+
+Owns the Phase 1 service foundation:
+
+- Async engine/session lifecycle.
+- SQLite local auto-create and WAL mode.
+- Postgres-compatible ORM schema.
+- Repository functions for tenant upsert, launch CA dedupe, persistent rechecks,
+  signal creation, per-tenant delivery dedupe, delivery retry state, provider cooldowns,
+  verdict cache, audit events and DB-backed status snapshots.
+
+Main models:
+
+```text
+Tenant, User, TenantMember, TenantSettings
+Launch, Verdict, VerdictCache
+Signal, SignalDelivery
+ProviderCooldown, ApiBudgetEvent, AuditEvent, BotState
+```
+
+Critical uniqueness:
+
+```text
+tenants(type, external_id)
+launches(ca)
+signals(ca)
+signal_deliveries(signal_id, tenant_id, channel)
+```
+
+### Services
+
+Import-safe modules under `services/` keep future workers from importing `main.py`:
+
+- `services.delivery`: single-tenant delivery preparation and 1000-tenant fanout row creation.
+- `services.tenants`: Telegram tenant bootstrap.
+- `services.queueing`: Redis/RQ queue helpers with deterministic job ids.
+- `services.observability`: JSON event logging and correlation ids.
 
 ### `research_pipeline.py`
 
@@ -228,7 +292,10 @@ For safe launchpads, liquidity filtering is skipped because the bot treats them 
 launchpad/bonding-curve sources. For DEX-discovered or unknown sources, liquidity is part
 of the filter.
 
-Tokens with missing or not-yet-sufficient market data are placed in `recheck_queue`.
+Tokens with missing or not-yet-sufficient market data are stored as `launches.status =
+queued_recheck` with `next_check_at`, `check_count`, `no_data` and the last market
+snapshot. This survives restarts and can be selected with Postgres `SKIP LOCKED` when
+recheck workers are split out.
 
 ## Telegram Commands
 
@@ -342,20 +409,24 @@ SLIPPAGE_BPS              default 1000, currently not enough protection by itsel
 ```mermaid
 flowchart TD
     A["main()"] --> B["Load env and log config"]
-    B --> C["Create aiohttp session"]
-    C --> D["Telegram deleteWebhook(drop_pending_updates=True)"]
-    D --> E["setMyCommands"]
-    E --> F["DexScreener health check"]
-    F --> G["seed_existing()"]
-    G --> H["poll loop"]
-    H --> I["handle_telegram_commands()"]
-    H --> J["fetch Bankr/Clanker/Virtuals"]
-    J --> K["fetch DexScreener/GeckoTerminal market data"]
-    K --> L["passes_market_filters()"]
-    L --> M["send_signal()"]
-    L --> N["recheck_queue"]
-    M --> O["Telegram message"]
-    O --> P["attach_signal_verdict() background task"]
+    B --> C["init_db() and ensure default tenant"]
+    C --> D["Create aiohttp session"]
+    D --> E["Telegram deleteWebhook(drop_pending_updates=True)"]
+    E --> F["setMyCommands"]
+    F --> G["DexScreener health check"]
+    G --> H["seed_existing() into launches"]
+    H --> I["poll loop"]
+    I --> J["handle_telegram_commands()"]
+    I --> K["process_delivery_retries()"]
+    I --> L["fetch Bankr/Clanker/Virtuals"]
+    L --> M["upsert launches by CA"]
+    M --> N["fetch DexScreener/GeckoTerminal market data"]
+    N --> O["passes_market_filters()"]
+    O --> P["send_signal()"]
+    O --> Q["launches.status = queued_recheck"]
+    P --> R["signal_deliveries row"]
+    R --> S["Telegram message"]
+    S --> T["attach_signal_verdict() background task"]
 ```
 
 ## Signal Flow
@@ -365,10 +436,13 @@ flowchart TD
     A["Launch candidate"] --> B["Normalize launch shape"]
     B --> C["Market enrichment"]
     C --> D{"Pass filters?"}
-    D -- "no / no data yet" --> E["Queue for recheck"]
-    D -- "yes" --> F["Build compact Telegram signal"]
-    F --> G["Send Telegram with research keyboard"]
-    G --> H["Mark signaled only if Telegram succeeded"]
+    D -- "no / no data yet" --> E["Persist queued_recheck with next_check_at"]
+    D -- "yes" --> F["Build compact Telegram signal payload"]
+    F --> G["Create signal + signal_delivery if absent"]
+    G --> H["Mark delivery sending"]
+    H --> I["Send Telegram with research keyboard"]
+    I --> J["Mark delivered with message_id or retry"]
+    J --> K["Mark launch signaled only if Telegram succeeded"]
     H --> I["Optional WhatsApp/Pushover"]
     H --> J["Background deterministic verdict"]
     J --> K["Edit message: replace AI placeholder"]

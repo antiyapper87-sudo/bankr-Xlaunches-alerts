@@ -15,6 +15,30 @@ Target capacity:
 
 Trading stays disabled. Solana, Discord, Stripe and LLM scoring stay out of Phase 1.
 
+## Implementation Status
+
+Implemented in the current repository:
+
+- `database.py` with async SQLAlchemy models, repository helpers, SQLite local mode and Postgres-ready schema.
+- Alembic initial migration in `migrations/versions/0001_initial_service_schema.py`.
+- Typed settings in `settings.py` and `.env.example`.
+- Durable launch CA dedupe, persistent rechecks and DB-backed `/status`.
+- Tenant, tenant settings, signal and signal delivery ledger models.
+- Idempotent default Telegram delivery path in `main.py`.
+- Delivery payload storage and retry processor for failed Telegram sends.
+- 1000-tenant fanout row creation in `services.delivery.prepare_signal_fanout`.
+- Provider 429 cooldown tracking in `provider_cooldowns` and `api_budget_events`.
+- RQ/Redis queue skeleton in `services.queueing.py` and `worker.py`.
+- Retention cleanup entrypoint in `maintenance.py`.
+- Smoke tests in `tests/test_phase1_persistence.py`.
+
+Still intentionally out of Phase 1:
+
+- LLM scoring beyond the existing AI-summary placeholder.
+- Dynamic thresholds as active production filters.
+- Billing, Discord, Solana and advanced wallet tracking.
+- Unsafe on-chain trading.
+
 ## Key Architecture Decision
 
 For a personal/local bot:
