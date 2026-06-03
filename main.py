@@ -1167,6 +1167,9 @@ def normalize_dexscreener_pair(best: dict, token_address: str) -> dict:
     price_change = best.get("priceChange") or {}
     base_token = best.get("baseToken") or {}
     quote_token = best.get("quoteToken") or {}
+    txns = best.get("txns") or {}
+    info = best.get("info") or {}
+    boosts = best.get("boosts") or {}
     token_meta = base_token
     if (base_token.get("address") or "").lower() != token_address.lower():
         token_meta = quote_token or base_token
@@ -1180,9 +1183,21 @@ def normalize_dexscreener_pair(best: dict, token_address: str) -> dict:
         "price_change_24h": float(price_change.get("h24") or 0),
         "pair_url": best.get("url", f"https://dexscreener.com/base/{token_address}"),
         "pair_created_at": best.get("pairCreatedAt", 0),
+        "pair_address": best.get("pairAddress", ""),
         "token_name": token_meta.get("name", ""),
         "token_symbol": token_meta.get("symbol", ""),
+        "base_token_address": base_token.get("address", ""),
+        "quote_token_address": quote_token.get("address", ""),
+        "quote_token_symbol": quote_token.get("symbol", ""),
         "dex_id": best.get("dexId", ""),
+        "txns_h1_buys": int((txns.get("h1") or {}).get("buys") or 0),
+        "txns_h1_sells": int((txns.get("h1") or {}).get("sells") or 0),
+        "txns_h24_buys": int((txns.get("h24") or {}).get("buys") or 0),
+        "txns_h24_sells": int((txns.get("h24") or {}).get("sells") or 0),
+        "boosts_active": int(boosts.get("active") or 0) if isinstance(boosts, dict) else 0,
+        "image_url": info.get("imageUrl", ""),
+        "websites": info.get("websites") or [],
+        "socials": info.get("socials") or [],
         "_source": "dexscreener",
     }
 
@@ -2315,26 +2330,26 @@ def build_signal_reason(launch: dict, dex: dict | None) -> str:
 
 def build_ai_summary_placeholder(launch: dict, dex: dict | None, verdict: dict | None = None) -> str:
     if verdict:
-        score = float(verdict.get("score") or 0) / 10
-        label = verdict.get("label", "PENDING")
-        reasons = verdict.get("reasons") or []
-        risks = verdict.get("risks") or []
-        why = reasons[0] if reasons else "waiting for stronger social/market confirmation"
-        risk = risks[0] if risks else "no dominant risk flagged"
-        return (
-            f"🧠 <b>AI brief</b> • <b>{h(label)}</b> ({score:.1f}/10)\n\n"
-            f"• <b>Type:</b> {h(((verdict.get('research') or {}).get('token_type')) or 'Memecoin / Utility')}\n"
-            f"• <b>Owner:</b> {h(((verdict.get('research') or {}).get('owner_note')) or 'Owner identity unresolved')}\n"
-            f"• <b>Product:</b> {h(((verdict.get('research') or {}).get('product_note')) or why)}\n"
-            f"• <b>Risk:</b> {h(risk)}"
+        return verdict.get("human_readable") or ""
+
+    market = "pending market read"
+    if dex:
+        market = (
+            f"MC {fmt_usd(float(dex.get('mcap') or 0))} · "
+            f"Vol {fmt_usd(float(dex.get('volume_24h') or 0))} · "
+            f"Liq {fmt_usd(float(dex.get('liquidity') or 0))}"
         )
+        age = fmt_token_age(dex)
+        if age != "n/a":
+            market += f" · Age {age}"
 
     return (
         "🧠 <b>AI brief</b> • Score pending\n\n"
-        "• <b>Type:</b> Memecoin / Utility\n"
+        f"• <b>Type:</b> pending classification\n"
         "• <b>Owner:</b> pending Base/X identity check\n"
+        f"• <b>Market:</b> {h(market)}\n"
         "• <b>Product:</b> pending narrative/product read\n"
-        "• <b>Risk:</b> pending spoof/liquidity checks"
+        "• <b>Risks:</b> pending spoof/liquidity checks"
     )
 
 
@@ -2682,15 +2697,37 @@ async def ensure_launch_for_analysis(session: aiohttp.ClientSession, ca: str) ->
     return launch, dex
 
 
+def command_market_line(result: dict) -> str:
+    verdict = result.get("verdict") or {}
+    research = verdict.get("research") or (result.get("research") or {}).get("processed_data") or {}
+    market = research.get("market") or {}
+    if not market:
+        return "Market: unavailable"
+    parts = [
+        f"MC {fmt_usd(float(market.get('mcap') or 0))}",
+        f"Vol {fmt_usd(float(market.get('volume_24h') or 0))}",
+        f"Liq {fmt_usd(float(market.get('liquidity') or 0))}",
+    ]
+    if market.get("age_minutes") is not None:
+        parts.append(f"Age {float(market['age_minutes']):.0f}m")
+    if market.get("dex_id"):
+        parts.append(str(market["dex_id"]))
+    return " · ".join(parts)
+
+
 def format_verdict2_report(result: dict) -> str:
     launch = result.get("launch") or {}
     verdict = result.get("verdict") or {}
     summary = result.get("summary") or {}
+    research = verdict.get("research") or {}
+    source_info = research.get("source") or {}
     human = verdict.get("human_readable") or "No verdict generated."
     ca = launch.get("ca", "")
     lines = [
-        f"🤖 <b>Verdict 2.0</b> · ${h(launch.get('symbol') or '')}",
+        f"🤖 <b>Verdict 2.0</b> · ${h(launch.get('symbol') or '')} · <b>{h(verdict.get('label') or '')}</b>",
         f"<code>{h(ca)}</code>",
+        f"Source: <b>{h(launch.get('source') or source_info.get('source') or 'unknown')}</b>",
+        h(command_market_line(result)),
         "",
         human,
     ]
@@ -2702,16 +2739,20 @@ def format_verdict2_report(result: dict) -> str:
 def format_spoof_report(result: dict) -> str:
     launch = result.get("launch") or {}
     signals = result.get("spoof_signals") or []
+    verdict = result.get("verdict") or {}
     lines = [
         f"🕵️ <b>Spoof Check</b> · ${h(launch.get('symbol') or '')}",
         f"<code>{h(launch.get('ca') or '')}</code>",
+        f"Verdict: <b>{h(verdict.get('label') or '')}</b> · {float(verdict.get('score') or 0) / 10:.1f}/10",
+        h(command_market_line(result)),
         "",
     ]
     if not signals:
         lines.append("No deterministic spoof signals found yet.")
     else:
         for signal in signals[:8]:
-            lines.append(f"• <b>{h(signal.get('severity'))}</b> · {h(signal.get('title'))}")
+            impact = float(signal.get("score_impact") or 0)
+            lines.append(f"• <b>{h(signal.get('severity'))}</b> -{impact:.0f} · {h(signal.get('title'))}")
             if signal.get("details"):
                 lines.append(f"  {h(signal.get('details'))}")
     return "\n".join(lines)[:3900]
@@ -2724,6 +2765,7 @@ def format_summary_report(result: dict) -> str:
     return (
         f"🧠 <b>AI Summary</b> <i>(stub)</i> · ${h(launch.get('symbol') or '')}\n"
         f"<code>{h(launch.get('ca') or '')}</code>\n\n"
+        f"{h(command_market_line(result))}\n\n"
         f"{h(summary.get('summary_text') or 'Summary unavailable')}\n\n"
         f"Verdict: <b>{h(verdict.get('label'))}</b> · {float(verdict.get('score') or 0) / 10:.1f}/10"
     )[:3900]

@@ -32,12 +32,32 @@ async def detect_spoof_signals(
     volume = float(dex.get("volume_24h") or 0)
     liquidity = float(dex.get("liquidity") or 0)
     change_1h = float(dex.get("price_change_1h") or 0)
+    txns_h1_buys = int(dex.get("txns_h1_buys") or 0)
+    txns_h1_sells = int(dex.get("txns_h1_sells") or 0)
+    txns_h24_buys = int(dex.get("txns_h24_buys") or 0)
+    txns_h24_sells = int(dex.get("txns_h24_sells") or 0)
+    pair_created_at = dex.get("pair_created_at") or 0
+    market = research_data.get("market") or {}
+    source_info = research_data.get("source") or {}
+    flags = set(research_data.get("flags") or [])
+    age_minutes = market.get("age_minutes")
+
+    if (mcap > 0 or volume > 0) and liquidity <= 0:
+        signals.append(
+            {
+                "signal_type": "missing_or_zero_liquidity",
+                "score_impact": 16.0,
+                "title": "Market data has cap/volume but no usable liquidity",
+                "details": "This can be an indexing gap, but it is unsafe for DEX-discovered tokens until liquidity is confirmed.",
+                "evidence_json": {"mcap": mcap, "volume_24h": volume, "liquidity": liquidity},
+            }
+        )
 
     if liquidity > 0 and volume / liquidity >= 3:
         signals.append(
             {
                 "signal_type": "fake_volume_risk",
-                "score_impact": 14.0,
+                "score_impact": 18.0 if volume / liquidity >= 8 else 14.0,
                 "title": "Volume is high relative to liquidity",
                 "details": "24h volume is more than 3x liquidity; this can be organic on fresh launches, but it is a common fake-volume pattern.",
                 "evidence_json": {"volume_24h": volume, "liquidity": liquidity, "ratio": round(volume / liquidity, 2)},
@@ -48,10 +68,32 @@ async def detect_spoof_signals(
         signals.append(
             {
                 "signal_type": "thin_liquidity_mcap_risk",
-                "score_impact": 9.0,
+                "score_impact": 14.0 if mcap / liquidity >= 15 else 9.0,
                 "title": "Market cap is stretched versus liquidity",
                 "details": "The token can move sharply because liquidity is thin relative to market cap.",
                 "evidence_json": {"mcap": mcap, "liquidity": liquidity, "ratio": round(mcap / liquidity, 2)},
+            }
+        )
+
+    if not pair_created_at and (mcap >= 75_000 or volume >= 50_000):
+        signals.append(
+            {
+                "signal_type": "missing_pair_age",
+                "score_impact": 7.0,
+                "title": "Pair age is missing on a non-trivial market",
+                "details": "Without pairCreatedAt the scanner cannot reliably prove this is a fresh launch.",
+                "evidence_json": {"mcap": mcap, "volume_24h": volume},
+            }
+        )
+
+    if age_minutes is not None and float(age_minutes) <= 20 and volume >= 75_000 and liquidity < 50_000:
+        signals.append(
+            {
+                "signal_type": "instant_volume_thin_depth",
+                "score_impact": 13.0,
+                "title": "Very fresh pair has fast volume but thin depth",
+                "details": "Large early volume inside the first 20 minutes with limited liquidity is often unstable.",
+                "evidence_json": {"age_minutes": age_minutes, "volume_24h": volume, "liquidity": liquidity},
             }
         )
 
@@ -63,6 +105,68 @@ async def detect_spoof_signals(
                 "title": "Sharp 1h move without deep volume",
                 "details": "Large short-term move with limited volume/depth can reverse quickly.",
                 "evidence_json": {"price_change_1h": change_1h, "volume_24h": volume, "liquidity": liquidity},
+            }
+        )
+
+    total_h1 = txns_h1_buys + txns_h1_sells
+    if total_h1 >= 20:
+        buy_share = txns_h1_buys / total_h1
+        if buy_share >= 0.88 or buy_share <= 0.12:
+            signals.append(
+                {
+                    "signal_type": "one_sided_h1_flow",
+                    "score_impact": 9.0,
+                    "title": "1h transaction flow is unusually one-sided",
+                    "details": "Extreme buy/sell imbalance can be organic, but it is a useful early spoof/wash-trading flag.",
+                    "evidence_json": {
+                        "txns_h1_buys": txns_h1_buys,
+                        "txns_h1_sells": txns_h1_sells,
+                        "buy_share": round(buy_share, 2),
+                    },
+                }
+            )
+
+    total_h24 = txns_h24_buys + txns_h24_sells
+    if total_h24 >= 40 and liquidity > 0 and volume / max(total_h24, 1) < 25 and volume / liquidity >= 2:
+        signals.append(
+            {
+                "signal_type": "many_low_value_trades",
+                "score_impact": 8.0,
+                "title": "Many low-value trades versus liquidity",
+                "details": "A high transaction count with low average volume and elevated volume/liquidity ratio can indicate wash-like activity.",
+                "evidence_json": {
+                    "txns_h24": total_h24,
+                    "avg_volume_per_txn": round(volume / max(total_h24, 1), 2),
+                    "volume_liquidity_ratio": round(volume / liquidity, 2),
+                },
+            }
+        )
+
+    if source_info.get("source") == "dexscreener" and (
+        source_info.get("source_method") == "boosts" or "paid_attention" in flags
+    ) and liquidity < 75_000:
+        signals.append(
+            {
+                "signal_type": "paid_attention_thin_liquidity",
+                "score_impact": 10.0,
+                "title": "Paid DexScreener attention with limited liquidity",
+                "details": "Boost/profile discovery is useful, but paid attention before strong liquidity should be treated cautiously.",
+                "evidence_json": {
+                    "source_method": source_info.get("source_method"),
+                    "liquidity": liquidity,
+                    "boosts_active": dex.get("boosts_active") or 0,
+                },
+            }
+        )
+
+    if not source_info.get("x_username") and source_info.get("source") in {"dexscreener", "bankr", "clanker"}:
+        signals.append(
+            {
+                "signal_type": "unresolved_owner_identity",
+                "score_impact": 5.0,
+                "title": "Owner/social identity is unresolved",
+                "details": "No X identity was resolved from launch metadata; this is not fatal, but it lowers confidence.",
+                "evidence_json": {"source": source_info.get("source"), "deployer_wallet": source_info.get("deployer_wallet")},
             }
         )
 

@@ -13,22 +13,30 @@ def build_stub_summary(verdict: dict[str, Any], *, language: str) -> str:
     symbol = token.get("symbol") or token.get("ca") or "token"
     label = verdict.get("label", "WAIT")
     score = float(verdict.get("score") or 0)
+    research = verdict.get("research") or {}
+    token_type = research.get("token_type") or "Unknown"
+    market = research.get("market") or {}
     reasons = verdict.get("reasons") or []
     risks = verdict.get("risks") or []
     reason = reasons[0] if reasons else "evidence is limited"
     risk = risks[0] if risks else "no major deterministic risk was detected"
+    market_line = (
+        f"MC ${float(market.get('mcap') or 0):,.0f}, "
+        f"Vol ${float(market.get('volume_24h') or 0):,.0f}, "
+        f"Liq ${float(market.get('liquidity') or 0):,.0f}"
+    )
     if language == "ru":
         return (
-            f"${symbol}: {label} ({score:.0f}/100). "
-            f"Главный плюс: {reason}. "
-            f"Главный риск: {risk}. "
-            "AI-модель пока не подключена; это честная deterministic summary по собранным данным."
+            f"${symbol}: {label}, {score / 10:.1f}/10. "
+            f"Тип: {token_type}. Рынок: {market_line}. "
+            f"Главный плюс: {reason}. Главный риск: {risk}. "
+            "Это deterministic AI-brief stub без внешней модели."
         )
     return (
-        f"${symbol}: {label} ({score:.0f}/100). "
-        f"Main positive: {reason}. "
-        f"Main risk: {risk}. "
-        "The AI model is not connected yet; this is a deterministic summary from collected evidence."
+        f"${symbol}: {label}, {score / 10:.1f}/10. "
+        f"Type: {token_type}. Market: {market_line}. "
+        f"Main positive: {reason}. Main risk: {risk}. "
+        "This is a deterministic AI-brief stub without an external model."
     )
 
 

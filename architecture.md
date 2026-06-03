@@ -142,8 +142,8 @@ Import-safe modules under `services/` keep future workers from importing `main.p
 - `services.queueing`: Redis/RQ queue helpers with deterministic job ids.
 - `services.observability`: JSON event logging and correlation ids.
 - `services.research_pipeline`: Phase 2 token research persistence and deterministic feature extraction.
-- `services.spoof_detector`: Phase 2 spoof/ticker-reuse/fake-volume heuristics.
-- `services.verdict_v2`: Phase 2 structured 0-100 verdict scoring.
+- `services.spoof_detector`: Phase 2 spoof/ticker-reuse/fake-volume, thin-liquidity, paid-attention and flow-imbalance heuristics.
+- `services.verdict_v2`: Phase 2 structured 0-100 verdict scoring and compact Telegram AI brief output.
 - `services.ai_summary`: AI-summary cache with a deterministic stub provider.
 - `services.token_intelligence`: Phase 2 aggregator for research, spoof signals, verdict and summary.
 
@@ -169,9 +169,20 @@ Telegram commands:
 The AI layer is intentionally not connected yet. The current summary is a deterministic
 stub built from collected evidence, so it does not make unsupported claims.
 
-### `research_pipeline.py`
+Current research evidence stored in `token_research.processed_data`:
 
-Builds deterministic research verdicts for signals:
+- normalized source metadata: source method, deployer wallet, X handle, website/tweet, description
+- normalized market snapshot: mcap, 24h volume, liquidity, age, pair URL/address, DEX, transaction flow
+- deterministic flags: DexScreener discovery, paid attention, unresolved owner, fresh pair, volume/liquidity and mcap/liquidity stretch
+- on-chain placeholders for wallet profile, bundle analysis and holder distribution
+
+### Legacy `research_pipeline.py`
+
+The root-level `research_pipeline.py` is the older social/X research module. Phase 2
+token intelligence is now orchestrated by `services.token_intelligence` and the
+`services/*` modules listed above.
+
+The legacy module still:
 
 - Scores market data, deployer identity, notable X mentions, and watched influencer mentions.
 - Uses a semaphore controlled by `AUTO_VERDICT_MAX_CONCURRENT`.
