@@ -123,6 +123,13 @@ DEXSCREENER_API_URL = "https://api.dexscreener.com"
 CLANKER_CHAIN_ID_BASE = 8453
 CLANKER_PAGE_SIZE = 10
 CLANKER_POLL_PAGES = int(os.getenv("CLANKER_POLL_PAGES", "5"))
+DEXSCREENER_DISCOVERY_ENABLED = os.getenv("DEXSCREENER_DISCOVERY_ENABLED", "true").lower() == "true"
+DEXSCREENER_DISCOVERY_LIMIT = int(os.getenv("DEXSCREENER_DISCOVERY_LIMIT", "40"))
+DEXSCREENER_DISCOVERY_ENDPOINTS = (
+    ("profiles", "/token-profiles/latest/v1"),
+    ("boosts", "/token-boosts/latest/v1"),
+    ("community_takeovers", "/community-takeovers/latest/v1"),
+)
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -1132,6 +1139,54 @@ async def get_follower_count(session: aiohttp.ClientSession, username: str) -> i
 
 # ─── DexScreener Market Data ──────────────────────────────────────────────────
 
+def choose_dexscreener_pair(pairs: list[dict], token_address: str) -> dict | None:
+    token_address = token_address.lower()
+    base_pairs = [
+        pair for pair in pairs
+        if ((pair.get("baseToken") or {}).get("address") or "").lower() == token_address
+    ]
+    candidate_pairs = base_pairs or [
+        pair for pair in pairs
+        if ((pair.get("quoteToken") or {}).get("address") or "").lower() == token_address
+    ] or pairs
+
+    best = None
+    best_liq = -1.0
+    for pair in candidate_pairs:
+        liq = float((pair.get("liquidity") or {}).get("usd") or 0)
+        if liq > best_liq:
+            best_liq = liq
+            best = pair
+    return best
+
+
+def normalize_dexscreener_pair(best: dict, token_address: str) -> dict:
+    mcap = float(best.get("marketCap") or best.get("fdv") or 0)
+    vol_24h = float((best.get("volume") or {}).get("h24") or 0)
+    liquidity = float((best.get("liquidity") or {}).get("usd") or 0)
+    price_change = best.get("priceChange") or {}
+    base_token = best.get("baseToken") or {}
+    quote_token = best.get("quoteToken") or {}
+    token_meta = base_token
+    if (base_token.get("address") or "").lower() != token_address.lower():
+        token_meta = quote_token or base_token
+
+    return {
+        "mcap": mcap,
+        "volume_24h": vol_24h,
+        "liquidity": liquidity,
+        "price_usd": best.get("priceUsd", "0"),
+        "price_change_1h": float(price_change.get("h1") or 0),
+        "price_change_24h": float(price_change.get("h24") or 0),
+        "pair_url": best.get("url", f"https://dexscreener.com/base/{token_address}"),
+        "pair_created_at": best.get("pairCreatedAt", 0),
+        "token_name": token_meta.get("name", ""),
+        "token_symbol": token_meta.get("symbol", ""),
+        "dex_id": best.get("dexId", ""),
+        "_source": "dexscreener",
+    }
+
+
 async def _fetch_dexscreener(session: aiohttp.ClientSession, token_address: str) -> dict | None:
     """Fetch market data from DexScreener (primary source)."""
     if not await is_provider_available("dexscreener"):
@@ -1162,43 +1217,11 @@ async def _fetch_dexscreener(session: aiohttp.ClientSession, token_address: str)
         if not pairs:
             return None
 
-        base_pairs = [
-            pair for pair in pairs
-            if ((pair.get("baseToken") or {}).get("address") or "").lower() == token_address
-        ]
-        candidate_pairs = base_pairs or pairs
-
-        best = None
-        best_liq = -1
-        for pair in candidate_pairs:
-            liq = float((pair.get("liquidity") or {}).get("usd") or 0)
-            if liq > best_liq:
-                best_liq = liq
-                best = pair
-
+        best = choose_dexscreener_pair(pairs, token_address)
         if not best:
             return None
 
-        mcap = float(best.get("marketCap") or best.get("fdv") or 0)
-        vol_24h = float((best.get("volume") or {}).get("h24") or 0)
-        liquidity = float((best.get("liquidity") or {}).get("usd") or 0)
-        price_change = best.get("priceChange") or {}
-        base_token = best.get("baseToken") or {}
-
-        return {
-            "mcap": mcap,
-            "volume_24h": vol_24h,
-            "liquidity": liquidity,
-            "price_usd": best.get("priceUsd", "0"),
-            "price_change_1h": float(price_change.get("h1") or 0),
-            "price_change_24h": float(price_change.get("h24") or 0),
-            "pair_url": best.get("url", f"https://dexscreener.com/base/{token_address}"),
-            "pair_created_at": best.get("pairCreatedAt", 0),
-            "token_name": base_token.get("name", ""),
-            "token_symbol": base_token.get("symbol", ""),
-            "dex_id": best.get("dexId", ""),
-            "_source": "dexscreener",
-        }
+        return normalize_dexscreener_pair(best, token_address)
     except Exception as e:
         log.debug(f"DexScreener error for {token_address[:10]}...: {e}")
         return None
@@ -2038,6 +2061,138 @@ async def fetch_clanker(session: aiohttp.ClientSession) -> list[dict]:
     return normalized
 
 
+# ─── DexScreener Discovery API ────────────────────────────────────────────────
+
+def extract_x_username_from_links(links: list[dict] | None) -> str:
+    for link in links or []:
+        url = (link.get("url") or "").strip()
+        if "twitter.com/" not in url and "x.com/" not in url:
+            continue
+        match = re.search(r'(?:twitter\.com|x\.com)/(@?\w{1,15})', url)
+        if not match:
+            continue
+        candidate = match.group(1).lstrip("@")
+        if candidate.lower() not in ("home", "explore", "search", "settings", "i"):
+            return candidate
+    return ""
+
+
+def extract_website_from_links(links: list[dict] | None) -> str:
+    for link in links or []:
+        url = (link.get("url") or "").strip()
+        link_type = (link.get("type") or "").lower()
+        if not url or link_type in {"twitter", "telegram", "discord"}:
+            continue
+        if "x.com/" in url or "twitter.com/" in url or "t.me/" in url:
+            continue
+        return url
+    return ""
+
+
+async def fetch_dexscreener_bulk_market(session: aiohttp.ClientSession, addresses: list[str]) -> dict[str, dict]:
+    if not addresses:
+        return {}
+    if not await is_provider_available("dexscreener"):
+        return {}
+
+    market_by_ca: dict[str, dict] = {}
+    for i in range(0, len(addresses), 30):
+        batch = addresses[i:i + 30]
+        url = f"{DEXSCREENER_API_URL}/tokens/v1/base/{','.join(batch)}"
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                await record_provider_response("dexscreener", endpoint="tokens/base", status_code=resp.status, cooldown_seconds=60)
+                if resp.status == 429:
+                    log.warning("DexScreener bulk token lookup rate limited, backing off...")
+                    break
+                if resp.status != 200:
+                    log.debug(f"DexScreener bulk token lookup returned {resp.status}")
+                    continue
+                raw = await resp.json()
+        except Exception as e:
+            log.debug(f"DexScreener bulk token lookup error: {e}")
+            continue
+
+        pairs = raw if isinstance(raw, list) else raw.get("pairs", []) if isinstance(raw, dict) else []
+        for address in batch:
+            token_pairs = [
+                pair for pair in pairs
+                if ((pair.get("baseToken") or {}).get("address") or "").lower() == address
+                or ((pair.get("quoteToken") or {}).get("address") or "").lower() == address
+            ]
+            best = choose_dexscreener_pair(token_pairs, address)
+            if best:
+                market_by_ca[address] = normalize_dexscreener_pair(best, address)
+    return market_by_ca
+
+
+async def fetch_dexscreener_discoveries(session: aiohttp.ClientSession) -> list[dict]:
+    """Fetch Base token discoveries from DexScreener latest profile/boost streams."""
+    if not DEXSCREENER_DISCOVERY_ENABLED:
+        return []
+    if not await is_provider_available("dexscreener"):
+        log.debug("DexScreener cooldown active, skipping discovery")
+        return []
+
+    by_address: dict[str, dict] = {}
+    try:
+        for source_method, path in DEXSCREENER_DISCOVERY_ENDPOINTS:
+            url = f"{DEXSCREENER_API_URL}{path}"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                await record_provider_response("dexscreener", endpoint=source_method, status_code=resp.status, cooldown_seconds=60)
+                if resp.status == 429:
+                    log.warning(f"DexScreener {source_method} rate limited, skipping discovery")
+                    break
+                if resp.status != 200:
+                    log.debug(f"DexScreener {source_method} returned {resp.status}")
+                    continue
+                raw = await resp.json()
+
+            rows = raw if isinstance(raw, list) else raw.get("data", []) if isinstance(raw, dict) else []
+            for item in rows:
+                if (item.get("chainId") or "").lower() != "base":
+                    continue
+                address = (item.get("tokenAddress") or "").lower()
+                if not is_base_contract(address) or address in by_address:
+                    continue
+                links = item.get("links") or []
+                by_address[address] = {
+                    "source": "dexscreener",
+                    "address": address,
+                    "name": "",
+                    "symbol": "?",
+                    "x_username": extract_x_username_from_links(links),
+                    "tweet_url": "",
+                    "website_url": extract_website_from_links(links),
+                    "image_uri": item.get("icon") or "",
+                    "description": item.get("description") or "",
+                    "pair_url": item.get("url") or f"https://dexscreener.com/base/{address}",
+                    "source_method": source_method,
+                    "created_at": item.get("date") or item.get("claimDate") or "",
+                }
+                if len(by_address) >= DEXSCREENER_DISCOVERY_LIMIT:
+                    break
+            if len(by_address) >= DEXSCREENER_DISCOVERY_LIMIT:
+                break
+
+        addresses = list(by_address)
+        market_by_ca = await fetch_dexscreener_bulk_market(session, addresses)
+        for address, dex in market_by_ca.items():
+            launch = by_address[address]
+            launch["_dex"] = dex
+            launch["name"] = dex.get("token_name") or launch.get("name") or "Unknown"
+            launch["symbol"] = dex.get("token_symbol") or launch.get("symbol") or "?"
+            if dex.get("pair_created_at") and not launch.get("created_at"):
+                launch["created_at"] = dex["pair_created_at"]
+
+        launches = list(by_address.values())
+        log.info(f"DexScreener: {len(launches)} Base discoveries fetched")
+        return launches
+    except Exception as e:
+        log.error(f"DexScreener discovery error: {e}")
+        return []
+
+
 # ─── Virtuals API ─────────────────────────────────────────────────────────────
 
 async def fetch_virtuals(session: aiohttp.ClientSession) -> list[dict]:
@@ -2782,9 +2937,10 @@ async def seed_existing(session: aiohttp.ClientSession):
     log.info("📋 Seeding existing tokens...")
     bankr = await fetch_bankr(session)
     clanker = await fetch_clanker(session)
+    dexscreener = await fetch_dexscreener_discoveries(session)
     virtuals = await fetch_virtuals(session)
 
-    all_launches = bankr + clanker + virtuals
+    all_launches = bankr + clanker + dexscreener + virtuals
     inserted = 0
 
     for launch in all_launches:
@@ -2795,7 +2951,7 @@ async def seed_existing(session: aiohttp.ClientSession):
 
     log.info(
         f"📋 Seeded {inserted} new DB rows "
-        f"(Bankr: {len(bankr)}, Clanker: {len(clanker)}, Virtuals: {len(virtuals)}) "
+        f"(Bankr: {len(bankr)}, Clanker: {len(clanker)}, DexScreener: {len(dexscreener)}, Virtuals: {len(virtuals)}) "
         f"— existing rows skipped"
     )
 
@@ -2929,8 +3085,9 @@ async def main():
 
                 bankr_launches = await fetch_bankr(session)
                 clanker_launches = await fetch_clanker(session)
+                dexscreener_launches = await fetch_dexscreener_discoveries(session)
                 virtuals_launches = await fetch_virtuals(session)
-                all_launches = bankr_launches + clanker_launches + virtuals_launches
+                all_launches = bankr_launches + clanker_launches + dexscreener_launches + virtuals_launches
 
                 new_count = 0
                 signal_count = 0
@@ -2954,6 +3111,10 @@ async def main():
                         dex = launch["_dex"]
                     else:
                         dex = await fetch_geckoterminal(session, address)
+                    if source == "dexscreener" and dex:
+                        launch["name"] = dex.get("token_name") or launch.get("name") or "Unknown"
+                        launch["symbol"] = dex.get("token_symbol") or launch.get("symbol") or "?"
+                        symbol = launch["symbol"]
 
                     passes, reason = passes_market_filters(dex, source=source)
 

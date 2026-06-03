@@ -199,12 +199,17 @@ Current safety posture:
 | --- | --- | --- |
 | Bankr | `https://api.bankr.bot/token-launches` | Primary Base launchpad source |
 | Clanker | `https://www.clanker.world/api/tokens` | Base launchpad source |
+| DexScreener | `https://api.dexscreener.com/token-profiles/latest/v1`, `token-boosts/latest/v1`, `community-takeovers/latest/v1` | Base DEX discovery source |
 | Virtuals | `https://api2.virtuals.io/api/virtuals` | Virtuals agent launches |
 
 Bankr currently exposes the 50 most recent launches; `offset` is not treated as a
 reliable pagination contract. Clanker uses offset pagination with `limit=10`,
 `sortBy=deployed-at`, `sort=desc`, `includeUser=true`, `includeMarket=false`, and
 `chainId=8453` for Base.
+DexScreener discovery is filtered to `chainId=base`, deduped by token CA, then enriched
+with `https://api.dexscreener.com/tokens/v1/base/{tokenAddresses}` in batches of up to 30.
+Unlike Bankr/Clanker/Virtuals, DexScreener is not a safe launchpad source, so liquidity
+filtering stays enabled.
 
 ### Market Data
 

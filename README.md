@@ -1,6 +1,6 @@
 # Bankr X Launches Alerts
 
-Monitors early Base token launches from Bankr, Clanker, Virtuals and DEX market data.
+Monitors early Base token launches from Bankr, Clanker, DexScreener and Virtuals.
 Alerts Telegram with market context, X research links, watched-influencer signals and an
 optional deterministic auto-verdict block.
 
@@ -50,6 +50,8 @@ optional deterministic auto-verdict block.
 | `MIN_VOLUME_24H` | ❌ | `30000` | Minimum 24h volume |
 | `MIN_LIQUIDITY` | ❌ | `30000` | Minimum liquidity for non-safe DEX-sourced launches |
 | `POLL_INTERVAL` | ❌ | `30` | Seconds between API polls |
+| `DEXSCREENER_DISCOVERY_ENABLED` | ❌ | `true` | Poll DexScreener latest Base profiles/boosts/CTOs as a launch source |
+| `DEXSCREENER_DISCOVERY_LIMIT` | ❌ | `40` | Max DexScreener Base discoveries per poll |
 | `AUTO_VERDICT_ENABLED` | ❌ | `false` | Attach deterministic research verdicts to signal messages |
 | `AUTO_VERDICT_TIMEOUT_SEC` | ❌ | `12` | Max time spent building one verdict |
 | `AUTO_VERDICT_MAX_CONCURRENT` | ❌ | `2` | Max concurrent verdict jobs |
