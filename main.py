@@ -35,6 +35,7 @@ from database import (
     db_session,
     get_due_delivery_retries,
     get_due_rechecks,
+    get_launch,
     get_launch_status,
     get_status_snapshot,
     init_db,
@@ -64,6 +65,7 @@ from research_pipeline import (
 from services.delivery import prepare_tenant_delivery
 from services.observability import correlation_id, log_event
 from services.tenants import ensure_telegram_tenant
+from services.token_intelligence import analyze_token_intelligence
 from settings import resolve_database_url, settings
 
 # ─── Config from environment ──────────────────────────────────────────────────
@@ -384,6 +386,9 @@ BOT_COMMANDS = [
     {"command": "status", "description": "Runtime status"},
     {"command": "research", "description": "Research ticker or Base CA"},
     {"command": "r", "description": "Short alias for research"},
+    {"command": "verdict2", "description": "Run Verdict 2.0 for Base CA"},
+    {"command": "spoof-check", "description": "Run spoof checks for Base CA"},
+    {"command": "summary", "description": "AI summary stub for Base CA"},
     {"command": "test", "description": "Send a test signal"},
     {"command": "wallets", "description": "List tracked wallets"},
     {"command": "track", "description": "Track wallet: /track 0x... label"},
@@ -404,6 +409,9 @@ def build_help_text() -> str:
         "<b>Research</b>\n"
         "• <code>/research $TICKER</code> — token research\n"
         "• <code>/research 0xCONTRACT</code> — CA research on Base\n"
+        "• <code>/verdict2 0xCONTRACT</code> — Verdict 2.0\n"
+        "• <code>/spoof-check 0xCONTRACT</code> — spoof/risk checks\n"
+        "• <code>/summary 0xCONTRACT</code> — cached AI summary stub\n"
         "• <code>/r $TICKER</code> — short research alias\n"
         "• Signal buttons: X Research, Ticker X, Copy CA\n\n"
         "<b>Wallet tracking</b>\n"
@@ -425,6 +433,10 @@ def build_help_text() -> str:
 def command_name(text: str) -> str:
     head = text.split(maxsplit=1)[0].lower()
     return head.split("@", 1)[0]
+
+
+def is_base_contract(value: str) -> bool:
+    return bool(re.fullmatch(r"0x[a-fA-F0-9]{40}", str(value or "").strip()))
 
 
 def is_authorized_update(msg: dict) -> bool:
@@ -942,6 +954,48 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                     f"• Pushover alerts: {pushover_status}",
                     chat_id,
                 )
+
+            elif cmd == "/verdict2":
+                parts = text.split(maxsplit=1)
+                ca = parts[1].strip() if len(parts) == 2 else ""
+                if not is_base_contract(ca):
+                    await send_telegram(session, "Usage: /verdict2 0xCONTRACT", chat_id)
+                    continue
+                await send_telegram(session, f"🤖 Running Verdict 2.0 for <code>{ca.lower()}</code>...", chat_id)
+                try:
+                    result = await analyze_ca_for_command(session, ca, requested_by="telegram_verdict2", include_summary=True)
+                    await send_telegram(session, format_verdict2_report(result), chat_id)
+                except Exception as e:
+                    log.error(f"Verdict2 command failed for {ca}: {e}", exc_info=True)
+                    await send_telegram(session, f"❌ Verdict 2.0 failed: {h(str(e)[:160])}", chat_id)
+
+            elif cmd == "/spoof-check":
+                parts = text.split(maxsplit=1)
+                ca = parts[1].strip() if len(parts) == 2 else ""
+                if not is_base_contract(ca):
+                    await send_telegram(session, "Usage: /spoof-check 0xCONTRACT", chat_id)
+                    continue
+                await send_telegram(session, f"🕵️ Running spoof checks for <code>{ca.lower()}</code>...", chat_id)
+                try:
+                    result = await analyze_ca_for_command(session, ca, requested_by="telegram_spoof", include_summary=False)
+                    await send_telegram(session, format_spoof_report(result), chat_id)
+                except Exception as e:
+                    log.error(f"Spoof command failed for {ca}: {e}", exc_info=True)
+                    await send_telegram(session, f"❌ Spoof check failed: {h(str(e)[:160])}", chat_id)
+
+            elif cmd == "/summary":
+                parts = text.split(maxsplit=1)
+                ca = parts[1].strip() if len(parts) == 2 else ""
+                if not is_base_contract(ca):
+                    await send_telegram(session, "Usage: /summary 0xCONTRACT", chat_id)
+                    continue
+                await send_telegram(session, f"🧠 Building summary for <code>{ca.lower()}</code>...", chat_id)
+                try:
+                    result = await analyze_ca_for_command(session, ca, requested_by="telegram_summary", include_summary=True)
+                    await send_telegram(session, format_summary_report(result), chat_id)
+                except Exception as e:
+                    log.error(f"Summary command failed for {ca}: {e}", exc_info=True)
+                    await send_telegram(session, f"❌ Summary failed: {h(str(e)[:160])}", chat_id)
 
             elif cmd == "/wallet":
                 user_id = str(msg.get("from", {}).get("id", ""))
@@ -2081,26 +2135,27 @@ def build_signal_reason(launch: dict, dex: dict | None) -> str:
 
 
 def build_ai_summary_placeholder(launch: dict, dex: dict | None, verdict: dict | None = None) -> str:
-    source = launch.get("source", "scan").title()
-    age = fmt_token_age(dex)
     if verdict:
-        score = verdict.get("score", {})
-        label = score.get("label", "PENDING")
-        reasons = score.get("reasons") or []
-        risks = score.get("risk_flags") or []
+        score = float(verdict.get("score") or 0) / 10
+        label = verdict.get("label", "PENDING")
+        reasons = verdict.get("reasons") or []
+        risks = verdict.get("risks") or []
         why = reasons[0] if reasons else "waiting for stronger social/market confirmation"
-        risk = risks[0] if risks else "no dominant risk flagged yet"
+        risk = risks[0] if risks else "no dominant risk flagged"
         return (
-            f"🧠 <b>AI brief</b> <i>(draft)</i>\n"
-            f"├ Bias: {html.escape(str(label))} · {html.escape(str(why))}\n"
-            f"└ Risk: {html.escape(str(risk))}"
+            f"🧠 <b>AI brief</b> • <b>{h(label)}</b> ({score:.1f}/10)\n\n"
+            f"• <b>Type:</b> {h(((verdict.get('research') or {}).get('token_type')) or 'Memecoin / Utility')}\n"
+            f"• <b>Owner:</b> {h(((verdict.get('research') or {}).get('owner_note')) or 'Owner identity unresolved')}\n"
+            f"• <b>Product:</b> {h(((verdict.get('research') or {}).get('product_note')) or why)}\n"
+            f"• <b>Risk:</b> {h(risk)}"
         )
 
-    data_hint = "market data present" if dex else "market data pending"
     return (
-        f"🧠 <b>AI brief</b> <i>(placeholder)</i>\n"
-        f"├ {source} token · age {html.escape(age)} · {data_hint}\n"
-        f"└ Next: check X quality, deployer history, holders/liquidity"
+        "🧠 <b>AI brief</b> • Score pending\n\n"
+        "• <b>Type:</b> Memecoin / Utility\n"
+        "• <b>Owner:</b> pending Base/X identity check\n"
+        "• <b>Product:</b> pending narrative/product read\n"
+        "• <b>Risk:</b> pending spoof/liquidity checks"
     )
 
 
@@ -2425,6 +2480,96 @@ async def process_delivery_retries(session: aiohttp.ClientSession) -> int:
     return processed
 
 
+async def ensure_launch_for_analysis(session: aiohttp.ClientSession, ca: str) -> tuple[dict, dict | None]:
+    ca = ca.lower()
+    dex = await fetch_geckoterminal(session, ca)
+    launch = {
+        "source": "manual",
+        "address": ca,
+        "name": (dex or {}).get("token_name") or ca[:10],
+        "symbol": (dex or {}).get("token_symbol") or ca[:6],
+        "x_username": "",
+        "tweet_url": "",
+        "image_uri": "",
+    }
+    async with db_session() as db:
+        existing = await get_launch(db, ca)
+    if existing:
+        return existing.raw_json or launch, dex or existing.market_json
+    await persist_launch_seen(launch, status="manual_research")
+    if dex:
+        async with db_session() as db:
+            await mark_launch_status(db, ca=ca, status="manual_research", reason="manual analysis", market_json=dex)
+    return launch, dex
+
+
+def format_verdict2_report(result: dict) -> str:
+    launch = result.get("launch") or {}
+    verdict = result.get("verdict") or {}
+    summary = result.get("summary") or {}
+    human = verdict.get("human_readable") or "No verdict generated."
+    ca = launch.get("ca", "")
+    lines = [
+        f"🤖 <b>Verdict 2.0</b> · ${h(launch.get('symbol') or '')}",
+        f"<code>{h(ca)}</code>",
+        "",
+        human,
+    ]
+    if summary:
+        lines.extend(["", f"📝 <b>Summary stub</b>\n{h(summary.get('summary_text', ''))}"])
+    return "\n".join(lines)[:3900]
+
+
+def format_spoof_report(result: dict) -> str:
+    launch = result.get("launch") or {}
+    signals = result.get("spoof_signals") or []
+    lines = [
+        f"🕵️ <b>Spoof Check</b> · ${h(launch.get('symbol') or '')}",
+        f"<code>{h(launch.get('ca') or '')}</code>",
+        "",
+    ]
+    if not signals:
+        lines.append("No deterministic spoof signals found yet.")
+    else:
+        for signal in signals[:8]:
+            lines.append(f"• <b>{h(signal.get('severity'))}</b> · {h(signal.get('title'))}")
+            if signal.get("details"):
+                lines.append(f"  {h(signal.get('details'))}")
+    return "\n".join(lines)[:3900]
+
+
+def format_summary_report(result: dict) -> str:
+    launch = result.get("launch") or {}
+    summary = result.get("summary") or {}
+    verdict = result.get("verdict") or {}
+    return (
+        f"🧠 <b>AI Summary</b> <i>(stub)</i> · ${h(launch.get('symbol') or '')}\n"
+        f"<code>{h(launch.get('ca') or '')}</code>\n\n"
+        f"{h(summary.get('summary_text') or 'Summary unavailable')}\n\n"
+        f"Verdict: <b>{h(verdict.get('label'))}</b> · {float(verdict.get('score') or 0) / 10:.1f}/10"
+    )[:3900]
+
+
+async def analyze_ca_for_command(
+    session: aiohttp.ClientSession,
+    ca: str,
+    *,
+    requested_by: str,
+    include_summary: bool = True,
+    language: str = "en",
+) -> dict:
+    launch, dex = await ensure_launch_for_analysis(session, ca)
+    async with db_session() as db:
+        return await analyze_token_intelligence(
+            db,
+            ca=ca,
+            dex=dex,
+            requested_by=requested_by,
+            include_summary=include_summary,
+            language=language,
+        )
+
+
 # ─── Signal Handler ───────────────────────────────────────────────────────────
 
 async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, source: str, symbol: str, is_recheck: bool = False) -> bool:
@@ -2550,41 +2695,61 @@ async def attach_signal_verdict(
     source: str,
     symbol: str,
 ):
-    deps = ResearchDeps(
-        search_mentions=search_x_mentions,
-        search_influencers=search_influencer_mentions,
-        resolve_deployer=resolve_deployer_x,
-        get_followers=get_follower_count,
-        fmt_usd=fmt_usd,
-    )
-    verdict = await build_signal_verdict_with_timeout(session, launch, dex, deps)
-    if not verdict:
-        log.warning(f"  ⚠️ Verdict skipped: [{source}] ${symbol}")
+    address = launch.get("address", "")
+    try:
+        async with db_session() as db:
+            if not await get_launch(db, address):
+                await upsert_launch(
+                    db,
+                    ca=address,
+                    ticker=launch.get("symbol", ""),
+                    name=launch.get("name", ""),
+                    source=launch.get("source", source),
+                    raw_json=launch,
+                    launched_at=parse_launch_datetime(launch),
+                    status="signaled",
+                )
+            result = await analyze_token_intelligence(
+                db,
+                ca=address,
+                dex=dex,
+                requested_by="signal_auto_verdict",
+                include_summary=True,
+                language="en",
+            )
+    except Exception as e:
+        log.warning(f"  ⚠️ Verdict 2.0 skipped: [{source}] ${symbol}: {e}")
         return
 
-    async with db_session() as db:
-        await store_verdict(
-            db,
-            ca=launch.get("address", ""),
-            verdict=verdict,
-            expires_at=utc_now() + timedelta(minutes=15),
-        )
-
-    verdict_block = format_verdict_block(verdict)
+    verdict = result.get("verdict") or {}
+    verdict_block = verdict.get("human_readable") or build_ai_summary_placeholder(
+        launch,
+        dex,
+        {
+            "score": verdict.get("score", 0),
+            "label": verdict.get("label", "WAIT"),
+            "reasons": verdict.get("reasons", []),
+            "risks": verdict.get("risks", []),
+            "research": (result.get("research") or {}).get("processed_data") or {},
+        },
+    )
     placeholder = build_ai_summary_placeholder(launch, dex)
-    if placeholder in base_text:
-        new_text = base_text.replace(placeholder, verdict_block)
-    else:
-        new_text = f"{base_text}\n\n{verdict_block}"
+    new_text = (
+        base_text.replace(placeholder, verdict_block)
+        if placeholder in base_text
+        else f"{base_text}\n\n{verdict_block}"
+    )
     if len(new_text) > 3900:
-        new_text = new_text[:3800] + "\n\n<i>Verdict truncated</i>"
+        new_text = new_text[:3800] + "\n\n<i>Verdict 2.0 truncated</i>"
 
     ok = await edit_telegram_message(session, chat_id, message_id, new_text, reply_markup=keyboard)
-    score = verdict.get("score", {})
     if ok:
-        log.info(f"  🧠 Verdict: [{source}] ${symbol} → {score.get('label')} ({score.get('value')}/10)")
+        log.info(
+            f"  🧠 Verdict 2.0: [{source}] ${symbol} → "
+            f"{verdict.get('label')} ({float(verdict.get('score') or 0) / 10:.1f}/10)"
+        )
     else:
-        log.warning(f"  ⚠️ Verdict edit rejected: [{source}] ${symbol}")
+        log.warning(f"  ⚠️ Verdict 2.0 edit rejected: [{source}] ${symbol}")
 
 
 # ─── Seeding ──────────────────────────────────────────────────────────────────

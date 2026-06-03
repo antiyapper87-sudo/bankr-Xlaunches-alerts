@@ -141,6 +141,33 @@ Import-safe modules under `services/` keep future workers from importing `main.p
 - `services.tenants`: Telegram tenant bootstrap.
 - `services.queueing`: Redis/RQ queue helpers with deterministic job ids.
 - `services.observability`: JSON event logging and correlation ids.
+- `services.research_pipeline`: Phase 2 token research persistence and deterministic feature extraction.
+- `services.spoof_detector`: Phase 2 spoof/ticker-reuse/fake-volume heuristics.
+- `services.verdict_v2`: Phase 2 structured 0-100 verdict scoring.
+- `services.ai_summary`: AI-summary cache with a deterministic stub provider.
+- `services.token_intelligence`: Phase 2 aggregator for research, spoof signals, verdict and summary.
+
+### Phase 2 Intelligence Layer
+
+Phase 2 adds persistent research and verdict tables without replacing Phase 1 delivery
+state:
+
+```text
+token_research       idempotent research pipeline status and evidence
+historical_launches  ticker/deployer history for spoof and reuse checks
+spoof_signals        persisted deterministic spoof/risk signals
+verdict_v2           versioned structured verdicts with 0-100 score
+ai_summaries         cached human summaries; provider is currently stub
+```
+
+Telegram commands:
+
+- `/verdict2 0xCONTRACT`
+- `/spoof-check 0xCONTRACT`
+- `/summary 0xCONTRACT`
+
+The AI layer is intentionally not connected yet. The current summary is a deterministic
+stub built from collected evidence, so it does not make unsupported claims.
 
 ### `research_pipeline.py`
 

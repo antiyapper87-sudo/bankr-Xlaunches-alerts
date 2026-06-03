@@ -15,7 +15,9 @@ async def check_database() -> dict[str, str]:
     try:
         async with db_session() as db:
             await db.execute(text("select 1"))
-        return {"database": "ok"}
+            for table in ("token_research", "verdict_v2", "spoof_signals", "ai_summaries"):
+                await db.execute(text(f"select 1 from {table} limit 0"))
+        return {"database": "ok", "phase2_schema": "ok"}
     finally:
         await close_db()
 

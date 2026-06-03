@@ -237,6 +237,9 @@ class BotState(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
 
 
+from models import AISummary, HistoricalLaunch, SpoofSignal, TokenResearch, VerdictV2  # noqa: E402
+
+
 engine: AsyncEngine | None = None
 SessionLocal: async_sessionmaker[AsyncSession] | None = None
 
@@ -350,6 +353,68 @@ async def launch_exists(db: AsyncSession, ca: str) -> bool:
 
 async def get_launch_status(db: AsyncSession, ca: str) -> str | None:
     return await db.scalar(select(Launch.status).where(Launch.ca == normalize_ca(ca)))
+
+
+async def get_launch(db: AsyncSession, ca: str) -> Launch | None:
+    return await db.get(Launch, normalize_ca(ca))
+
+
+async def upsert_historical_launch(
+    db: AsyncSession,
+    *,
+    launch: Launch,
+    deployer: str | None = None,
+    final_status: str | None = None,
+) -> HistoricalLaunch:
+    ca = normalize_ca(launch.ca)
+    row = await db.scalar(select(HistoricalLaunch).where(HistoricalLaunch.ca == ca))
+    raw = launch.raw_json or {}
+    market = launch.market_json or {}
+    if row is None:
+        row = HistoricalLaunch(
+            ca=ca,
+            ticker=(launch.ticker or "").lstrip("$").upper(),
+            name=launch.name,
+            source=launch.source,
+            deployer=deployer or raw.get("x_username") or raw.get("creator_x"),
+            launched_at=launch.launched_at,
+            first_seen_at=launch.first_seen_at,
+            final_status=final_status or launch.status,
+            max_mcap=float(market.get("mcap") or launch.last_mcap or 0),
+            max_volume=float(market.get("volume_24h") or 0),
+            raw_json=raw,
+        )
+        db.add(row)
+        await db.flush()
+        return row
+    row.ticker = (launch.ticker or row.ticker or "").lstrip("$").upper()
+    row.name = launch.name or row.name
+    row.source = launch.source or row.source
+    row.deployer = deployer or row.deployer or raw.get("x_username") or raw.get("creator_x")
+    row.final_status = final_status or launch.status
+    row.max_mcap = max(float(market.get("mcap") or launch.last_mcap or 0), float(row.max_mcap or 0))
+    row.max_volume = max(float(market.get("volume_24h") or 0), float(row.max_volume or 0))
+    row.raw_json = raw
+    row.updated_at = utc_now()
+    return row
+
+
+async def get_ticker_history(db: AsyncSession, *, ticker: str, since: datetime | None = None, limit: int = 25) -> list[HistoricalLaunch]:
+    ticker = (ticker or "").lstrip("$").upper()
+    stmt = select(HistoricalLaunch).where(HistoricalLaunch.ticker == ticker)
+    if since is not None:
+        stmt = stmt.where(HistoricalLaunch.first_seen_at >= since)
+    stmt = stmt.order_by(HistoricalLaunch.first_seen_at.desc()).limit(limit)
+    return list(await db.scalars(stmt))
+
+
+async def get_recent_launches_by_ticker(db: AsyncSession, *, ticker: str, since: datetime | None = None, limit: int = 25) -> list[Launch]:
+    ticker = (ticker or "").lstrip("$").upper()
+    stmt = select(Launch).where(func.upper(Launch.ticker) == ticker)
+    if since is not None:
+        stmt = stmt.where(Launch.first_seen_at >= since)
+    stmt = stmt.order_by(Launch.first_seen_at.desc()).limit(limit)
+    return list(await db.scalars(stmt))
 
 
 async def queue_recheck(
@@ -618,6 +683,230 @@ async def get_cached_verdict(db: AsyncSession, ca: str, *, now: datetime | None 
     if not cache or ensure_aware(cache.expires_at) <= now:
         return None
     return cache.verdict_json
+
+
+async def start_token_research(
+    db: AsyncSession,
+    *,
+    ca: str,
+    source: str = "",
+    requested_by: str = "pipeline",
+) -> tuple[TokenResearch, bool]:
+    ca = normalize_ca(ca)
+    stmt = select(TokenResearch).where(TokenResearch.ca == ca, TokenResearch.requested_by == requested_by)
+    row = await db.scalar(stmt)
+    if row:
+        if row.status in {"completed", "in_progress"}:
+            return row, False
+        row.status = "in_progress"
+        row.error = None
+        row.started_at = utc_now()
+        row.updated_at = utc_now()
+        return row, False
+    row = TokenResearch(
+        ca=ca,
+        source=source or None,
+        requested_by=requested_by,
+        status="in_progress",
+        started_at=utc_now(),
+        raw_data={},
+        processed_data={},
+    )
+    db.add(row)
+    await db.flush()
+    return row, True
+
+
+async def complete_token_research(
+    db: AsyncSession,
+    *,
+    research_id: int,
+    raw_data: dict[str, Any],
+    processed_data: dict[str, Any],
+) -> TokenResearch | None:
+    row = await db.get(TokenResearch, research_id)
+    if not row:
+        return None
+    row.status = "completed"
+    row.raw_data = raw_data
+    row.processed_data = processed_data
+    row.completed_at = utc_now()
+    row.updated_at = utc_now()
+    row.error = None
+    return row
+
+
+async def fail_token_research(db: AsyncSession, *, research_id: int, error: str) -> None:
+    row = await db.get(TokenResearch, research_id)
+    if not row:
+        return
+    row.status = "failed"
+    row.error = error[:2000]
+    row.updated_at = utc_now()
+
+
+async def get_latest_token_research(db: AsyncSession, ca: str) -> TokenResearch | None:
+    stmt = (
+        select(TokenResearch)
+        .where(TokenResearch.ca == normalize_ca(ca))
+        .order_by(TokenResearch.created_at.desc())
+        .limit(1)
+    )
+    return await db.scalar(stmt)
+
+
+async def upsert_spoof_signal(
+    db: AsyncSession,
+    *,
+    ca: str,
+    signal_type: str,
+    severity: str,
+    score_impact: float,
+    title: str,
+    details: str = "",
+    evidence_json: dict[str, Any] | None = None,
+    detector_version: str = "spoof-detector-v1",
+) -> SpoofSignal:
+    ca = normalize_ca(ca)
+    stmt = select(SpoofSignal).where(
+        SpoofSignal.ca == ca,
+        SpoofSignal.signal_type == signal_type,
+        SpoofSignal.detector_version == detector_version,
+    )
+    row = await db.scalar(stmt)
+    if row:
+        row.severity = severity
+        row.score_impact = score_impact
+        row.title = title[:160]
+        row.details = details[:2000] if details else None
+        row.evidence_json = evidence_json or {}
+        return row
+    row = SpoofSignal(
+        ca=ca,
+        signal_type=signal_type,
+        severity=severity,
+        score_impact=score_impact,
+        title=title[:160],
+        details=details[:2000] if details else None,
+        evidence_json=evidence_json or {},
+        detector_version=detector_version,
+    )
+    db.add(row)
+    await db.flush()
+    return row
+
+
+async def list_spoof_signals(db: AsyncSession, ca: str) -> list[SpoofSignal]:
+    stmt = (
+        select(SpoofSignal)
+        .where(SpoofSignal.ca == normalize_ca(ca))
+        .order_by(SpoofSignal.created_at.desc())
+    )
+    return list(await db.scalars(stmt))
+
+
+async def create_verdict_v2(
+    db: AsyncSession,
+    *,
+    ca: str,
+    research_id: int | None,
+    score: float,
+    label: str,
+    score_json: dict[str, Any],
+    verdict_json: dict[str, Any],
+    human_readable: str,
+    version: str = "verdict-v2.0",
+) -> VerdictV2:
+    row = VerdictV2(
+        ca=normalize_ca(ca),
+        research_id=research_id,
+        score=score,
+        label=label,
+        score_json=score_json,
+        verdict_json=verdict_json,
+        human_readable=human_readable,
+        version=version,
+        status="completed",
+    )
+    db.add(row)
+    await db.flush()
+    return row
+
+
+async def get_latest_verdict_v2(db: AsyncSession, ca: str) -> VerdictV2 | None:
+    stmt = (
+        select(VerdictV2)
+        .where(VerdictV2.ca == normalize_ca(ca))
+        .order_by(VerdictV2.created_at.desc())
+        .limit(1)
+    )
+    return await db.scalar(stmt)
+
+
+async def upsert_ai_summary(
+    db: AsyncSession,
+    *,
+    ca: str,
+    language: str,
+    summary_text: str,
+    summary_json: dict[str, Any],
+    verdict_v2_id: int | None = None,
+    provider: str = "stub",
+    model: str = "stub-v1",
+    expires_at: datetime | None = None,
+) -> AISummary:
+    ca = normalize_ca(ca)
+    stmt = select(AISummary).where(
+        AISummary.ca == ca,
+        AISummary.language == language,
+        AISummary.provider == provider,
+        AISummary.model == model,
+    )
+    row = await db.scalar(stmt)
+    if row:
+        row.verdict_v2_id = verdict_v2_id
+        row.summary_text = summary_text
+        row.summary_json = summary_json
+        row.expires_at = expires_at
+        row.updated_at = utc_now()
+        return row
+    row = AISummary(
+        ca=ca,
+        verdict_v2_id=verdict_v2_id,
+        language=language,
+        provider=provider,
+        model=model,
+        summary_text=summary_text,
+        summary_json=summary_json,
+        expires_at=expires_at,
+    )
+    db.add(row)
+    await db.flush()
+    return row
+
+
+async def get_cached_ai_summary(
+    db: AsyncSession,
+    *,
+    ca: str,
+    language: str = "en",
+    provider: str = "stub",
+    model: str = "stub-v1",
+    now: datetime | None = None,
+) -> AISummary | None:
+    now = now or utc_now()
+    stmt = select(AISummary).where(
+        AISummary.ca == normalize_ca(ca),
+        AISummary.language == language,
+        AISummary.provider == provider,
+        AISummary.model == model,
+    )
+    row = await db.scalar(stmt)
+    if not row:
+        return None
+    if row.expires_at and ensure_aware(row.expires_at) <= now:
+        return None
+    return row
 
 
 async def set_provider_cooldown(db: AsyncSession, *, provider: str, cooldown_until: datetime, reason: str = "") -> None:

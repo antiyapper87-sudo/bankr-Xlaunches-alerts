@@ -58,6 +58,8 @@ Check infra connectivity:
 python infra_check.py
 ```
 
+`infra_check.py` also verifies that Phase 2 tables exist after migrations.
+
 ## Process Model
 
 Recommended production processes:

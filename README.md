@@ -11,6 +11,7 @@ optional deterministic auto-verdict block.
 3. Filters by market cap, volume, liquidity and source-specific safety rules.
 4. Sends Telegram alerts with X Research, Ticker X, Copy CA and chart/trading links.
 5. Optionally attaches deterministic research verdicts in the background.
+6. Builds Phase 2 Verdict 2.0 research, spoof checks and AI-summary stubs for Base CAs.
 
 ## Setup
 
@@ -59,6 +60,17 @@ optional deterministic auto-verdict block.
 | `PRIVATE_KEY` | Required for wallet/trading | — | Trading wallet private key |
 | `AUTO_EXECUTE` | ❌ | `false` | Bankr API auto-buy after a Telegram signal is sent |
 | `BANKR_EXECUTION_API_KEY` | Required for auto-execute | — | Bankr execution API key |
+
+Phase 2 research commands:
+
+```text
+/verdict2 0xCONTRACT
+/spoof-check 0xCONTRACT
+/summary 0xCONTRACT
+```
+
+The AI summary provider is currently a deterministic stub. It is intentionally not wired to
+an external AI model yet.
 
 Trading is fail-closed:
 
