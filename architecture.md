@@ -201,6 +201,11 @@ Current safety posture:
 | Clanker | `https://www.clanker.world/api/tokens` | Base launchpad source |
 | Virtuals | `https://api2.virtuals.io/api/virtuals` | Virtuals agent launches |
 
+Bankr currently exposes the 50 most recent launches; `offset` is not treated as a
+reliable pagination contract. Clanker uses offset pagination with `limit=10`,
+`sortBy=deployed-at`, `sort=desc`, `includeUser=true`, `includeMarket=false`, and
+`chainId=8453` for Base.
+
 ### Market Data
 
 | Source | Endpoint | Usage |

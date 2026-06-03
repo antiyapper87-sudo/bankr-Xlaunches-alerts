@@ -120,6 +120,9 @@ VIRTUALS_API_URL = "https://api2.virtuals.io/api/virtuals"
 GECKOTERMINAL_API_URL = "https://api.geckoterminal.com/api/v2"
 SOCIALDATA_API_URL = "https://api.socialdata.tools/twitter/user"
 DEXSCREENER_API_URL = "https://api.dexscreener.com"
+CLANKER_CHAIN_ID_BASE = 8453
+CLANKER_PAGE_SIZE = 10
+CLANKER_POLL_PAGES = int(os.getenv("CLANKER_POLL_PAGES", "5"))
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -1159,9 +1162,15 @@ async def _fetch_dexscreener(session: aiohttp.ClientSession, token_address: str)
         if not pairs:
             return None
 
+        base_pairs = [
+            pair for pair in pairs
+            if ((pair.get("baseToken") or {}).get("address") or "").lower() == token_address
+        ]
+        candidate_pairs = base_pairs or pairs
+
         best = None
         best_liq = -1
-        for pair in pairs:
+        for pair in candidate_pairs:
             liq = float((pair.get("liquidity") or {}).get("usd") or 0)
             if liq > best_liq:
                 best_liq = liq
@@ -1916,27 +1925,20 @@ async def fetch_bankr(session: aiohttp.ClientSession) -> list[dict]:
     }
     normalized = []
     try:
-        all_launches = []
-        for page_offset in [0, 50, 100]:
-            params = {"offset": page_offset, "limit": 50}
-            async with session.get(BANKR_API_URL, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status != 200:
-                    if page_offset == 0:
-                        log.warning(f"Bankr API returned {resp.status}")
-                        return []
-                    break
-                data = await resp.json()
+        async with session.get(BANKR_API_URL, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                log.warning(f"Bankr API returned {resp.status}")
+                return []
+            data = await resp.json()
 
-            launches = data.get("launches", data if isinstance(data, list) else [])
-            all_launches.extend(launches)
-            if len(launches) < 50:
-                break
-
+        all_launches = data.get("launches", data if isinstance(data, list) else [])
         log.info(f"Bankr: {len(all_launches)} launches fetched")
 
         for launch in all_launches:
             address = (launch.get("tokenAddress") or "").lower()
             if not address:
+                continue
+            if (launch.get("chain") or "base").lower() != "base":
                 continue
             deployer = launch.get("deployer", {}) or {}
             x_username = deployer.get("xUsername", "")
@@ -1946,9 +1948,12 @@ async def fetch_bankr(session: aiohttp.ClientSession) -> list[dict]:
                 "name": launch.get("tokenName", "Unknown"),
                 "symbol": launch.get("tokenSymbol", "?"),
                 "x_username": x_username or "",
+                "deployer_wallet": deployer.get("walletAddress", ""),
+                "status": launch.get("status", ""),
                 "tweet_url": launch.get("tweetUrl", ""),
                 "image_uri": launch.get("imageUri", ""),
-                "created_at": launch.get("createdAt") or launch.get("launchedAt") or "",
+                "website_url": launch.get("websiteUrl", ""),
+                "created_at": launch.get("createdAt") or launch.get("launchedAt") or launch.get("timestamp") or "",
             })
     except Exception as e:
         log.error(f"Bankr fetch error: {e}")
@@ -1961,15 +1966,31 @@ async def fetch_clanker(session: aiohttp.ClientSession) -> list[dict]:
     normalized = []
     try:
         all_tokens = []
-        for page in [1, 2]:
-            params = {"sort": "desc", "page": page, "pageSize": 50}
+        seen_addresses = set()
+        for offset in range(0, max(1, CLANKER_POLL_PAGES) * CLANKER_PAGE_SIZE, CLANKER_PAGE_SIZE):
+            params = {
+                "limit": CLANKER_PAGE_SIZE,
+                "offset": offset,
+                "includeMarket": "false",
+                "includeUser": "true",
+                "sort": "desc",
+                "sortBy": "deployed-at",
+                "chainId": CLANKER_CHAIN_ID_BASE,
+            }
             async with session.get(CLANKER_API_URL, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if resp.status != 200:
+                    if offset == 0:
+                        log.warning(f"Clanker API returned {resp.status}")
                     break
                 data = await resp.json()
             tokens = data.get("data", data if isinstance(data, list) else [])
-            all_tokens.extend(tokens)
-            if len(tokens) < 10:
+            for token in tokens:
+                address = (token.get("contract_address") or token.get("address") or "").lower()
+                if not address or address in seen_addresses:
+                    continue
+                seen_addresses.add(address)
+                all_tokens.append(token)
+            if len(tokens) < CLANKER_PAGE_SIZE:
                 break
 
         log.info(f"Clanker: {len(all_tokens)} launches fetched")
@@ -1978,9 +1999,11 @@ async def fetch_clanker(session: aiohttp.ClientSession) -> list[dict]:
             address = (token.get("contract_address") or token.get("address") or "").lower()
             if not address:
                 continue
+            if int(token.get("chain_id") or CLANKER_CHAIN_ID_BASE) != CLANKER_CHAIN_ID_BASE:
+                continue
 
             x_username = ""
-            social_urls = token.get("socialMediaUrls", []) or []
+            social_urls = token.get("socialMediaUrls") or token.get("socialLinks") or []
             if isinstance(social_urls, list):
                 for url in social_urls:
                     if isinstance(url, str) and ("twitter.com/" in url or "x.com/" in url):
@@ -2005,9 +2028,10 @@ async def fetch_clanker(session: aiohttp.ClientSession) -> list[dict]:
                 "name": token.get("name", "Unknown"),
                 "symbol": token.get("symbol", token.get("ticker", "?")),
                 "x_username": x_username or "",
+                "deployer_wallet": token.get("msg_sender", ""),
                 "tweet_url": "",
-                "image_uri": "",
-                "created_at": token.get("created_at") or token.get("createdAt") or "",
+                "image_uri": token.get("img_url", ""),
+                "created_at": token.get("deployed_at") or token.get("created_at") or token.get("createdAt") or "",
             })
     except Exception as e:
         log.error(f"Clanker fetch error: {e}")
@@ -2341,7 +2365,7 @@ def format_alert_whatsapp(launch: dict, dex: dict | None, executed: bool = False
 
 
 def parse_launch_datetime(launch: dict) -> datetime | None:
-    for key in ("created_at", "createdAt", "launched_at", "launchedAt"):
+    for key in ("created_at", "createdAt", "launched_at", "launchedAt", "deployed_at", "deployedAt", "timestamp"):
         raw = launch.get(key)
         if not raw:
             continue
