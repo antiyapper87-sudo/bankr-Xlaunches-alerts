@@ -2001,6 +2001,16 @@ async def fetch_bankr(session: aiohttp.ClientSession) -> list[dict]:
 # ─── Clanker API ──────────────────────────────────────────────────────────────
 
 async def fetch_clanker(session: aiohttp.ClientSession) -> list[dict]:
+    if not await is_provider_available("clanker"):
+        log.debug("Clanker cooldown active, skipping source")
+        return []
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Referer": "https://www.clanker.world/clankers/chain/base",
+        "Origin": "https://www.clanker.world",
+    }
     normalized = []
     try:
         all_tokens = []
@@ -2015,7 +2025,14 @@ async def fetch_clanker(session: aiohttp.ClientSession) -> list[dict]:
                 "sortBy": "deployed-at",
                 "chainId": CLANKER_CHAIN_ID_BASE,
             }
-            async with session.get(CLANKER_API_URL, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            async with session.get(CLANKER_API_URL, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                await record_provider_response(
+                    "clanker",
+                    endpoint="tokens",
+                    status_code=resp.status,
+                    cooldown_seconds=300 if resp.status == 403 else 60,
+                    reason="vercel challenge" if resp.status == 403 else "",
+                )
                 if resp.status != 200:
                     if offset == 0:
                         log.warning(f"Clanker API returned {resp.status}")
@@ -2604,12 +2621,12 @@ async def record_provider_response(
             endpoint=endpoint,
             status_code=status_code,
         )
-        if status_code == 429:
+        if status_code in {403, 429}:
             await set_provider_cooldown(
                 db,
                 provider=provider,
                 cooldown_until=utc_now() + timedelta(seconds=cooldown_seconds),
-                reason=reason or "rate limited",
+                reason=reason or ("access challenge" if status_code == 403 else "rate limited"),
             )
 
 
