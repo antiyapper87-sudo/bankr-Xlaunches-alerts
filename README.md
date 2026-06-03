@@ -65,7 +65,7 @@ Phase 2 research commands:
 
 ```text
 /verdict2 0xCONTRACT
-/spoof-check 0xCONTRACT
+/spoof_check 0xCONTRACT
 /summary 0xCONTRACT
 ```
 

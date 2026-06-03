@@ -163,7 +163,7 @@ ai_summaries         cached human summaries; provider is currently stub
 Telegram commands:
 
 - `/verdict2 0xCONTRACT`
-- `/spoof-check 0xCONTRACT`
+- `/spoof_check 0xCONTRACT`
 - `/summary 0xCONTRACT`
 
 The AI layer is intentionally not connected yet. The current summary is a deterministic

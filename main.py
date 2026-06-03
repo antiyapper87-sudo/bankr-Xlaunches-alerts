@@ -387,7 +387,7 @@ BOT_COMMANDS = [
     {"command": "research", "description": "Research ticker or Base CA"},
     {"command": "r", "description": "Short alias for research"},
     {"command": "verdict2", "description": "Run Verdict 2.0 for Base CA"},
-    {"command": "spoof-check", "description": "Run spoof checks for Base CA"},
+    {"command": "spoof_check", "description": "Run spoof checks for Base CA"},
     {"command": "summary", "description": "AI summary stub for Base CA"},
     {"command": "test", "description": "Send a test signal"},
     {"command": "wallets", "description": "List tracked wallets"},
@@ -410,7 +410,7 @@ def build_help_text() -> str:
         "• <code>/research $TICKER</code> — token research\n"
         "• <code>/research 0xCONTRACT</code> — CA research on Base\n"
         "• <code>/verdict2 0xCONTRACT</code> — Verdict 2.0\n"
-        "• <code>/spoof-check 0xCONTRACT</code> — spoof/risk checks\n"
+        "• <code>/spoof_check 0xCONTRACT</code> — spoof/risk checks\n"
         "• <code>/summary 0xCONTRACT</code> — cached AI summary stub\n"
         "• <code>/r $TICKER</code> — short research alias\n"
         "• Signal buttons: X Research, Ticker X, Copy CA\n\n"
@@ -969,11 +969,11 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                     log.error(f"Verdict2 command failed for {ca}: {e}", exc_info=True)
                     await send_telegram(session, f"❌ Verdict 2.0 failed: {h(str(e)[:160])}", chat_id)
 
-            elif cmd == "/spoof-check":
+            elif cmd in ("/spoof-check", "/spoof_check"):
                 parts = text.split(maxsplit=1)
                 ca = parts[1].strip() if len(parts) == 2 else ""
                 if not is_base_contract(ca):
-                    await send_telegram(session, "Usage: /spoof-check 0xCONTRACT", chat_id)
+                    await send_telegram(session, "Usage: /spoof_check 0xCONTRACT", chat_id)
                     continue
                 await send_telegram(session, f"🕵️ Running spoof checks for <code>{ca.lower()}</code>...", chat_id)
                 try:
