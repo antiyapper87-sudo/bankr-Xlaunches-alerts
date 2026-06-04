@@ -1251,10 +1251,10 @@ def test_x_signal_hybrid_summary_shows_ca_and_ticker_context():
     )
     block = format_research_social_block("SUM", [], [], social_evidence=evidence, address=token_ca)
 
-    assert "CA proof:" in block
-    assert "none" in block
-    assert "Ticker context:" in block
-    assert "narrative exists, but attribution to this CA is not confirmed" in block
+    assert "CA proof:" not in block
+    assert "Ticker context:" not in block
+    assert "Takeaway:" not in block
+    assert "Thesis:" in block
 
 
 @pytest.mark.asyncio

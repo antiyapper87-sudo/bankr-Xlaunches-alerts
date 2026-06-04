@@ -4365,8 +4365,7 @@ def build_ai_summary_placeholder(launch: dict, dex: dict | None, verdict: dict |
         f"• <b>Product:</b> {h(narrative.product[:220])}\n"
         f"• <b>Why value:</b> {h(narrative.why_it_matters[:220])}\n"
         f"• <b>Focus:</b> {h(focus)}\n"
-        f"• <b>Risks:</b> {h('; '.join(risks[:2]))}\n"
-        f"• <b>Confidence:</b> {h(narrative.confidence)}"
+        f"• <b>Risks:</b> {h('; '.join(risks[:2]))}"
     )
 
 
@@ -4519,7 +4518,6 @@ def format_research_ai_brief(
         score = min(score, 6.8)
     score = min(10.0, score)
     thesis_line = thesis if thesis else product[:180]
-    confidence = (project_narrative or {}).get("confidence") or "LOW"
     lore_context = (project_narrative or {}).get("key_lore_context") or ""
     risk_label = research_risk_label(score, risks, social_evidence)
     recommendation = research_recommendation(score, social_evidence, risks)
@@ -4534,7 +4532,6 @@ def format_research_ai_brief(
         + f"• <b>Thesis:</b> {h(compact_sentence_text(thesis_line, limit=360))}\n"
         + (f"• <b>Key Lore / Context:</b> {h(compact_sentence_text(lore_context, limit=320))}\n" if lore_context else "")
         + f"• <b>Risks:</b> {h('; '.join(risks[:2]) if risks else 'no major deterministic risk detected')}"
-        + f"\n• <b>Confidence:</b> {h(confidence)}"
     )
 
 
@@ -4688,27 +4685,7 @@ def format_research_social_block(
     if evidence_tweets:
         remember_xsignal_evidence(address, social_evidence)
         thesis = hide_contract_mentions((social_evidence or {}).get("thesis") or "", address)
-        trust = (social_evidence or {}).get("trust_summary") or {}
-        ca_count = int(trust.get("ca_confirmed") or 0)
-        pair_count = int(trust.get("pair_confirmed") or 0)
-        project_count = int(trust.get("project_confirmed") or 0)
-        ticker_context = int(trust.get("ticker_strong") or 0) + int(trust.get("ticker_only") or 0)
         lines = ["🐦 <b>X signal</b>"]
-        if address:
-            ca_label = f"{ca_count} contract-linked tweet(s)" if ca_count else "none"
-            context_label = f"{ticker_context} ticker-context tweet(s)" if ticker_context else "none"
-            lines.append(f"\n<b>CA proof:</b> {h(ca_label)}")
-            if pair_count:
-                lines.append(f"<b>Pair proof:</b> {pair_count} screener-linked tweet(s)")
-            if project_count:
-                lines.append(f"<b>Project account:</b> {project_count} official-context tweet(s)")
-            lines.append(f"<b>Ticker context:</b> {h(context_label)}")
-            if ca_count or pair_count or project_count:
-                lines.append("<b>Takeaway:</b> primary evidence exists; ticker context is supporting only.")
-            elif ticker_context:
-                lines.append("<b>Takeaway:</b> narrative exists, but attribution to this CA is not confirmed.")
-            else:
-                lines.append("<b>Takeaway:</b> no useful X narrative passed filters yet.")
         if thesis:
             lines.append(f"\n<b>Thesis:</b> {h(thesis[:520])}")
         visible_tweets = xsignal_visible_tweets(social_evidence)

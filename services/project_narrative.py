@@ -489,10 +489,6 @@ def format_project_narrative_block(narrative: dict[str, Any] | ProjectNarrative 
     data = narrative.to_dict() if isinstance(narrative, ProjectNarrative) else (narrative or {})
     if not data:
         return ""
-    sources = data.get("evidence_sources") or []
-    evidence = " + ".join(sources[:3]) if sources else "not confirmed"
-    if data.get("is_ticker_only_evidence"):
-        evidence += " (ticker-only)"
     return (
         f"• <b>Product:</b> {html.escape(clean_text(data.get('product'), limit=520))}\n"
         f"• <b>Why value:</b> {html.escape(clean_text(data.get('why_it_matters'), limit=300))}\n"
@@ -500,5 +496,4 @@ def format_project_narrative_block(narrative: dict[str, Any] | ProjectNarrative 
             f"• <b>Key Lore / Context:</b> {html.escape(clean_text(data.get('key_lore_context'), limit=300))}\n"
             if data.get("key_lore_context") else ""
         )
-        + f"• <b>Confidence:</b> {html.escape(str(data.get('confidence') or 'LOW'))} · {html.escape(evidence)}"
     )

@@ -499,8 +499,7 @@ def build_human_readable(
         f"• <b>Product:</b> {esc(product_line)}\n"
         f"• <b>Thesis:</b> {esc(thesis_line)}\n"
         + (f"• <b>Key Lore / Context:</b> {esc(lore_context)}\n" if lore_context else "")
-        + f"• <b>Risks:</b> {esc(risk_text)}\n"
-        f"• <b>Confidence:</b> {esc(confidence)}"
+        + f"• <b>Risks:</b> {esc(risk_text)}"
         + (f"\n• <b>Social Score:</b> {social_score}/100" if social_score else "")
     )
 
