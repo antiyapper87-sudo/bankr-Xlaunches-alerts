@@ -115,6 +115,7 @@ from services.fomo import (
     format_fomo_holders_card,
 )
 from services.observability import correlation_id, log_event
+from services.outcome_tracker import schedule_initial_outcome
 from services.project_narrative import (
     extract_project_narrative,
     narrative_token_type,
@@ -481,6 +482,7 @@ ADMIN_COMMANDS = {
     "/block",
     "/unblock",
     "/blocklist",
+    "/verdict3",
     "/track",
     "/untrack",
     "/wallets",
@@ -1650,6 +1652,36 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                         await send_telegram(session, f"❌ <b>Verdict failed</b>\n{h(str(e)[:160])}", chat_id)
 
                 track_background_command(f"verdict2 {ca.lower()}", do_verdict2())
+
+            elif cmd == "/verdict3":
+                parts = text.split(maxsplit=1)
+                ca = parts[1].strip() if len(parts) == 2 else ""
+                if not is_base_contract(ca):
+                    await send_telegram(session, "🧠 <b>Verdict 3.0 shadow</b>\n<code>/verdict3 0x...</code>", chat_id)
+                    continue
+                await send_telegram(session, f"🧠 <b>Verdict 3 shadow queued</b>\n<code>{ca.lower()}</code>", chat_id)
+
+                async def do_verdict3():
+                    try:
+                        result = await analyze_ca_for_command(session, ca, requested_by="telegram_verdict3", include_summary=False)
+                        verdict_v3 = result.get("verdict_v3") or {}
+                        await send_telegram(
+                            session,
+                            safe_join_blocks(
+                                [
+                                    "🧪 <b>Shadow mode</b> · not used for production scoring",
+                                    verdict_v3.get("human_readable") or "Verdict 3 unavailable.",
+                                ],
+                                limit=3900,
+                                truncation_note="Verdict 3 output truncated.",
+                            ),
+                            chat_id,
+                        )
+                    except Exception as e:
+                        log.error(f"Verdict3 command failed for {ca}: {e}", exc_info=True)
+                        await send_telegram(session, f"❌ <b>Verdict 3 failed</b>\n{h(str(e)[:160])}", chat_id)
+
+                track_background_command(f"verdict3 {ca.lower()}", do_verdict3())
 
             elif cmd in ("/spoof-check", "/spoof_check"):
                 parts = text.split(maxsplit=1)
@@ -5832,6 +5864,17 @@ async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, s
 
     async with db_session() as db:
         await mark_launch_status(db, ca=address, status="signaled", reason="telegram delivered", market_json=dex, raw_json=launch)
+        try:
+            await schedule_initial_outcome(
+                db,
+                chain="base",
+                token_id=address,
+                launch=launch,
+                dex=dex,
+                initial_label="SIGNAL",
+            )
+        except Exception as exc:
+            log.warning(f"  ⚠️ Outcome schedule skipped for {address[:10]}...: {exc}")
         log_event(
             "signal_sent",
             correlation_id=cid,

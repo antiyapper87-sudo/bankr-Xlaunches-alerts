@@ -13,9 +13,11 @@ from database import (
     get_launch,
     list_recent_wallet_events_for_ca,
     start_token_research,
+    upsert_chain_token_identity,
     upsert_historical_launch,
     utc_now,
 )
+from services.lore_extraction import extract_and_store_project_lore
 from services.project_narrative import extract_project_narrative, narrative_token_type
 
 
@@ -246,6 +248,23 @@ async def run_research_pipeline(
         dex = dex or launch.market_json or {}
         market = build_market_snapshot(dex)
         source_info = build_source_snapshot(launch)
+        await upsert_chain_token_identity(
+            db,
+            chain="base",
+            token_id=launch.ca,
+            ticker=launch.ticker or "",
+            name=launch.name or "",
+            launch_source=launch.source,
+            source_method=source_info.get("source_method") or "",
+            deployer_wallet=source_info.get("deployer_wallet") or "",
+            creator_handle=source_info.get("x_username") or "",
+            pair_address=(dex or {}).get("pair_address") or "",
+            first_seen_at=launch.first_seen_at,
+            source_created_at=launch.launched_at,
+            reliable_created_at=bool(launch.launched_at),
+            source_confidence="medium" if launch.launched_at else "low",
+            raw_refs_json={"launch_ca": launch.ca, "source": launch.source},
+        )
         deployer_key = deployer_key_from_source(source_info)
         await upsert_historical_launch(db, launch=launch, deployer=deployer_key or None)
         deployer_history_rows = await get_deployer_history(
@@ -287,12 +306,30 @@ async def run_research_pipeline(
             },
             flags=flags,
         )
+        project_lore = await extract_and_store_project_lore(
+            db,
+            chain="base",
+            token_id=launch.ca,
+            ticker=launch.ticker or "",
+            name=launch.name or "",
+            launch={**(launch.raw_json or {}), "source": launch.source},
+            dex=dex,
+            social_evidence={
+                "qualified_tweets": social_confirmation.get("qualified_tweets"),
+                "thesis": social_confirmation.get("evidence_thesis"),
+                "value_assessment": social_confirmation.get("value_assessment"),
+                "top_tweets": social_confirmation.get("evidence_tweets") or [],
+                "primary_tweets": (launch.raw_json or {}).get("social_confirmation", {}).get("social_evidence", {}).get("primary_tweets") or [],
+                "ticker_context_tweets": (launch.raw_json or {}).get("social_confirmation", {}).get("social_evidence", {}).get("ticker_context_tweets") or [],
+            },
+        )
         processed = {
             "schema": "token-research-v2.1",
             "symbol": (launch.ticker or "").lstrip("$"),
             "name": launch.name or "",
             "source": source_info,
             "project_narrative": project_narrative.to_dict(),
+            "project_lore": project_lore,
             "token_type": narrative_token_type(project_narrative, classify_token_type(launch, dex)),
             "owner_note": infer_owner_note(launch),
             "product_note": project_narrative.product or infer_product_note(launch, dex),

@@ -312,14 +312,24 @@ class TelegramCallbackRef(Base):
 
 
 from models import (  # noqa: E402
+    AgentMemory,
     AISummary,
+    ChainTokenIdentity,
+    DevWalletProfile,
     HistoricalLaunch,
+    LoreEvidence,
+    NarrativePattern,
+    PatternMemory,
+    ProjectLore,
+    SocialAccountPattern,
     SpoofSignal,
+    TokenOutcome,
     TokenResearch,
     TrackedWallet,
     UserFeedback,
     UserWatchlist,
     VerdictV2,
+    VerdictV3,
     WalletEvent,
 )
 
@@ -1256,6 +1266,394 @@ async def get_latest_token_research(db: AsyncSession, ca: str) -> TokenResearch 
         select(TokenResearch)
         .where(TokenResearch.ca == normalize_ca(ca))
         .order_by(TokenResearch.created_at.desc())
+        .limit(1)
+    )
+    return await db.scalar(stmt)
+
+
+def identity_key(chain: str, token_id: str) -> str:
+    return f"{str(chain or '').strip().lower()}:{str(token_id or '').strip().lower()}"
+
+
+async def upsert_chain_token_identity(
+    db: AsyncSession,
+    *,
+    chain: str,
+    token_id: str,
+    ticker: str = "",
+    name: str = "",
+    launch_source: str = "",
+    source_method: str = "",
+    deployer_wallet: str = "",
+    creator_handle: str = "",
+    pair_address: str = "",
+    first_seen_at: datetime | None = None,
+    source_created_at: datetime | None = None,
+    reliable_created_at: bool = False,
+    source_confidence: str = "low",
+    raw_refs_json: dict[str, Any] | None = None,
+) -> ChainTokenIdentity:
+    chain = str(chain or "base").strip().lower()
+    token_id = normalize_ca(token_id) if chain in {"base", "ethereum", "bnb"} else str(token_id or "").strip()
+    key = identity_key(chain, token_id)
+    row = await db.scalar(select(ChainTokenIdentity).where(ChainTokenIdentity.identity_key == key))
+    now = utc_now()
+    if row:
+        row.ticker = (ticker or row.ticker or "").lstrip("$")[:64]
+        row.name = (name or row.name or "")[:256]
+        row.launch_source = launch_source or row.launch_source
+        row.source_method = source_method or row.source_method
+        row.deployer_wallet = deployer_wallet or row.deployer_wallet
+        row.creator_handle = creator_handle or row.creator_handle
+        row.pair_address = pair_address or row.pair_address
+        row.source_created_at = source_created_at or row.source_created_at
+        row.reliable_created_at = bool(row.reliable_created_at or reliable_created_at)
+        row.source_confidence = source_confidence or row.source_confidence
+        refs = dict(row.raw_refs_json or {})
+        refs.update(raw_refs_json or {})
+        row.raw_refs_json = refs
+        row.updated_at = now
+        return row
+    row = ChainTokenIdentity(
+        chain=chain,
+        token_id=token_id,
+        identity_key=key,
+        ticker=(ticker or "").lstrip("$")[:64],
+        name=(name or "")[:256],
+        launch_source=launch_source or None,
+        source_method=source_method or None,
+        deployer_wallet=deployer_wallet or None,
+        creator_handle=creator_handle or None,
+        pair_address=pair_address or None,
+        first_seen_at=first_seen_at or now,
+        source_created_at=source_created_at,
+        reliable_created_at=bool(reliable_created_at),
+        source_confidence=source_confidence or "low",
+        raw_refs_json=raw_refs_json or {},
+    )
+    db.add(row)
+    await db.flush()
+    return row
+
+
+async def get_chain_token_identity(db: AsyncSession, *, chain: str, token_id: str) -> ChainTokenIdentity | None:
+    return await db.scalar(select(ChainTokenIdentity).where(ChainTokenIdentity.identity_key == identity_key(chain, token_id)))
+
+
+async def create_or_update_token_outcome(
+    db: AsyncSession,
+    *,
+    chain: str,
+    token_id: str,
+    launch_source: str = "",
+    ticker: str = "",
+    deployer_wallet: str = "",
+    pair_address: str = "",
+    first_seen_at: datetime | None = None,
+    signal_id: int | None = None,
+    initial_verdict_version: str = "",
+    initial_score: float | None = None,
+    initial_label: str = "",
+    next_check_at: datetime | None = None,
+    snapshot_key: str = "",
+    snapshot_json: dict[str, Any] | None = None,
+    final_outcome_label: str = "",
+    evidence_json: dict[str, Any] | None = None,
+    status: str = "tracking",
+) -> TokenOutcome:
+    chain = str(chain or "base").strip().lower()
+    token_id = normalize_ca(token_id) if chain in {"base", "ethereum", "bnb"} else str(token_id or "").strip()
+    key = identity_key(chain, token_id)
+    row = await db.scalar(select(TokenOutcome).where(TokenOutcome.identity_key == key))
+    if row is None:
+        row = TokenOutcome(
+            chain=chain,
+            token_id=token_id,
+            identity_key=key,
+            signal_id=signal_id,
+            initial_verdict_version=initial_verdict_version or None,
+            initial_score=initial_score,
+            initial_label=initial_label or None,
+            launch_source=launch_source or None,
+            ticker=(ticker or "").lstrip("$")[:64],
+            deployer_wallet=deployer_wallet or None,
+            pair_address=pair_address or None,
+            first_seen_at=first_seen_at or utc_now(),
+            evidence_json=evidence_json or {},
+            next_check_at=next_check_at,
+            status=status,
+        )
+        db.add(row)
+        await db.flush()
+    else:
+        row.launch_source = launch_source or row.launch_source
+        row.ticker = (ticker or row.ticker or "").lstrip("$")[:64]
+        row.deployer_wallet = deployer_wallet or row.deployer_wallet
+        row.pair_address = pair_address or row.pair_address
+        row.signal_id = signal_id or row.signal_id
+        row.initial_verdict_version = initial_verdict_version or row.initial_verdict_version
+        row.initial_score = initial_score if initial_score is not None else row.initial_score
+        row.initial_label = initial_label or row.initial_label
+        row.next_check_at = next_check_at or row.next_check_at
+        row.status = status or row.status
+        if evidence_json:
+            merged = dict(row.evidence_json or {})
+            merged.update(evidence_json)
+            row.evidence_json = merged
+    if snapshot_key and snapshot_json:
+        attr = f"snapshot_{snapshot_key}_json"
+        if hasattr(row, attr):
+            setattr(row, attr, snapshot_json)
+        row.last_checked_at = utc_now()
+    if final_outcome_label:
+        row.final_outcome_label = final_outcome_label
+    await db.flush()
+    return row
+
+
+async def list_due_token_outcomes(db: AsyncSession, *, now: datetime, limit: int = 50) -> list[TokenOutcome]:
+    stmt = (
+        select(TokenOutcome)
+        .where(TokenOutcome.status == "tracking", TokenOutcome.next_check_at <= now)
+        .order_by(TokenOutcome.next_check_at.asc())
+        .limit(limit)
+    )
+    if db.bind and db.bind.dialect.name == "postgresql":
+        stmt = stmt.with_for_update(skip_locked=True)
+    return list(await db.scalars(stmt))
+
+
+async def upsert_project_lore(
+    db: AsyncSession,
+    *,
+    chain: str,
+    token_id: str,
+    lore: dict[str, Any],
+    extraction_version: str = "lore-v1",
+) -> ProjectLore:
+    key = identity_key(chain, token_id)
+    row = await db.scalar(
+        select(ProjectLore).where(
+            ProjectLore.identity_key == key,
+            ProjectLore.extraction_version == extraction_version,
+        )
+    )
+    now = utc_now()
+    payload = {
+        "chain": str(chain or "base").strip().lower(),
+        "token_id": normalize_ca(token_id) if str(chain or "base").strip().lower() in {"base", "ethereum", "bnb"} else str(token_id or "").strip(),
+        "identity_key": key,
+        "category": lore.get("project_category") or lore.get("category") or "Unknown",
+        "utility": lore.get("utility") or "",
+        "mechanics": lore.get("product_mechanics") or lore.get("mechanics") or "",
+        "target_users": lore.get("target_users") or "",
+        "meme_lore_hook": lore.get("meme_lore_hook") or "",
+        "founder_identity": lore.get("founder_or_dev_identity") or lore.get("founder_identity") or "",
+        "community_quality": lore.get("community_quality") or "",
+        "narrative_summary": lore.get("narrative_summary") or "Product narrative is not confirmed.",
+        "why_it_matters": lore.get("why_it_matters") or "No durable value case is confirmed yet.",
+        "lore_bullets_json": lore.get("lore_bullets") or lore.get("lore_bullets_json") or [],
+        "attribution_type": lore.get("attribution_type") or lore.get("official_vs_unofficial") or "unknown",
+        "attribution_confidence": str(lore.get("ca_attribution_confidence") or lore.get("attribution_confidence") or "LOW").upper(),
+        "ca_confirmed_evidence_count": int(lore.get("ca_confirmed_evidence_count") or 0),
+        "project_confirmed_evidence_count": int(lore.get("project_confirmed_evidence_count") or 0),
+        "ticker_context_evidence_count": int(lore.get("ticker_context_evidence_count") or 0),
+        "evidence_refs_json": lore.get("evidence") or lore.get("evidence_refs") or [],
+        "extraction_version": extraction_version,
+    }
+    if row:
+        for field, value in payload.items():
+            setattr(row, field, value)
+        row.updated_at = now
+        return row
+    row = ProjectLore(created_at=now, updated_at=now, **payload)
+    db.add(row)
+    await db.flush()
+    return row
+
+
+async def get_latest_project_lore(db: AsyncSession, *, chain: str, token_id: str) -> ProjectLore | None:
+    stmt = (
+        select(ProjectLore)
+        .where(ProjectLore.identity_key == identity_key(chain, token_id))
+        .order_by(ProjectLore.created_at.desc())
+        .limit(1)
+    )
+    return await db.scalar(stmt)
+
+
+async def upsert_agent_memory(
+    db: AsyncSession,
+    *,
+    memory_key: str,
+    memory_type: str,
+    subject_type: str,
+    subject_id: str,
+    insight: str,
+    chain: str | None = None,
+    normalized_json: dict[str, Any] | None = None,
+    polarity: str = "neutral",
+    confidence: float = 0.0,
+    evidence_count: int = 0,
+    expires_at: datetime | None = None,
+) -> AgentMemory:
+    row = await db.scalar(select(AgentMemory).where(AgentMemory.memory_key == memory_key))
+    now = utc_now()
+    if row:
+        row.memory_type = memory_type
+        row.subject_type = subject_type
+        row.subject_id = subject_id
+        row.insight = insight
+        row.chain = chain or row.chain
+        row.normalized_json = normalized_json or row.normalized_json or {}
+        row.polarity = polarity
+        row.confidence = float(confidence or 0)
+        row.evidence_count = int(evidence_count or 0)
+        row.expires_at = expires_at
+        row.last_seen_at = now
+        return row
+    row = AgentMemory(
+        memory_key=memory_key,
+        memory_type=memory_type,
+        chain=chain,
+        subject_type=subject_type,
+        subject_id=subject_id,
+        insight=insight,
+        normalized_json=normalized_json or {},
+        polarity=polarity,
+        confidence=float(confidence or 0),
+        evidence_count=int(evidence_count or 0),
+        expires_at=expires_at,
+        first_seen_at=now,
+        last_seen_at=now,
+    )
+    db.add(row)
+    await db.flush()
+    return row
+
+
+async def get_relevant_memories(
+    db: AsyncSession,
+    *,
+    subject_type: str,
+    subject_id: str,
+    min_confidence: float = 0.65,
+    limit: int = 10,
+) -> list[AgentMemory]:
+    now = utc_now()
+    stmt = (
+        select(AgentMemory)
+        .where(
+            AgentMemory.subject_type == subject_type,
+            AgentMemory.subject_id == subject_id,
+            AgentMemory.status == "active",
+            AgentMemory.confidence >= min_confidence,
+            ((AgentMemory.expires_at.is_(None)) | (AgentMemory.expires_at > now)),
+        )
+        .order_by(AgentMemory.confidence.desc(), AgentMemory.last_seen_at.desc())
+        .limit(limit)
+    )
+    return list(await db.scalars(stmt))
+
+
+async def upsert_pattern_memory(
+    db: AsyncSession,
+    *,
+    pattern_key: str,
+    pattern_type: str,
+    entity_key: str,
+    chain: str | None = None,
+    sample_size: int = 0,
+    success_count: int = 0,
+    failure_count: int = 0,
+    rug_count: int = 0,
+    pump_count: int = 0,
+    score_adjustment: float = 0.0,
+    confidence: float = 0.0,
+    evidence_json: dict[str, Any] | None = None,
+) -> PatternMemory:
+    row = await db.scalar(select(PatternMemory).where(PatternMemory.pattern_key == pattern_key))
+    now = utc_now()
+    if row is None:
+        row = PatternMemory(pattern_key=pattern_key, pattern_type=pattern_type, entity_key=entity_key)
+        db.add(row)
+        await db.flush()
+    row.pattern_type = pattern_type
+    row.entity_key = entity_key
+    row.chain = chain
+    row.sample_size = int(sample_size or 0)
+    row.success_count = int(success_count or 0)
+    row.failure_count = int(failure_count or 0)
+    row.rug_count = int(rug_count or 0)
+    row.pump_count = int(pump_count or 0)
+    row.score_adjustment = float(score_adjustment or 0)
+    row.confidence = float(confidence or 0)
+    row.evidence_json = evidence_json or {}
+    row.last_observed_at = now
+    return row
+
+
+async def create_verdict_v3(
+    db: AsyncSession,
+    *,
+    chain: str,
+    token_id: str,
+    input_hash: str,
+    score: float,
+    label: str,
+    confidence: str,
+    output_json: dict[str, Any],
+    human_readable: str,
+    provider: str = "deterministic",
+    model: str = "verdict-v3-shadow",
+    version: str = "3.0",
+    expires_at: datetime | None = None,
+) -> VerdictV3:
+    chain = str(chain or "base").strip().lower()
+    token_id = normalize_ca(token_id) if chain in {"base", "ethereum", "bnb"} else str(token_id or "").strip()
+    key = identity_key(chain, token_id)
+    row = await db.scalar(
+        select(VerdictV3).where(
+            VerdictV3.identity_key == key,
+            VerdictV3.input_hash == input_hash,
+            VerdictV3.version == version,
+        )
+    )
+    if row:
+        row.score = score
+        row.label = label
+        row.confidence = confidence
+        row.output_json = output_json
+        row.human_readable = human_readable
+        row.provider = provider
+        row.model = model
+        row.expires_at = expires_at
+        return row
+    row = VerdictV3(
+        chain=chain,
+        token_id=token_id,
+        identity_key=key,
+        input_hash=input_hash,
+        score=score,
+        label=label,
+        confidence=confidence,
+        output_json=output_json,
+        human_readable=human_readable,
+        provider=provider,
+        model=model,
+        version=version,
+        expires_at=expires_at,
+    )
+    db.add(row)
+    await db.flush()
+    return row
+
+
+async def get_latest_verdict_v3(db: AsyncSession, *, chain: str, token_id: str) -> VerdictV3 | None:
+    stmt = (
+        select(VerdictV3)
+        .where(VerdictV3.identity_key == identity_key(chain, token_id))
+        .order_by(VerdictV3.created_at.desc())
         .limit(1)
     )
     return await db.scalar(stmt)

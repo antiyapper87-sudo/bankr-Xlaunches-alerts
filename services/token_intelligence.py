@@ -9,6 +9,7 @@ from services.ai_summary import get_or_create_ai_summary
 from services.research_pipeline import run_research_pipeline
 from services.spoof_detector import detect_spoof_signals
 from services.verdict_v2 import build_verdict_v2
+from services.verdict_v3 import build_verdict_v3
 
 
 async def analyze_token_intelligence(
@@ -43,6 +44,11 @@ async def analyze_token_intelligence(
         launch=launch.raw_json or {},
         dex=dex or launch.market_json,
     )
+    verdict_v3 = await build_verdict_v3(
+        db,
+        ca=launch.ca,
+        launch=launch.raw_json or {},
+    )
     summary = None
     if include_summary:
         summary = await get_or_create_ai_summary(
@@ -58,6 +64,7 @@ async def analyze_token_intelligence(
             "ca": launch.ca,
             "requested_by": requested_by,
             "verdict_id": verdict.get("id"),
+            "verdict_v3_id": verdict_v3.get("id"),
             "score": verdict.get("score"),
             "label": verdict.get("label"),
             "social_score": (((research.get("processed_data") or {}).get("social") or {}).get("social_score")),
@@ -74,5 +81,6 @@ async def analyze_token_intelligence(
         "research": research,
         "spoof_signals": spoof,
         "verdict": verdict,
+        "verdict_v3": verdict_v3,
         "summary": summary,
     }
