@@ -479,6 +479,45 @@ def test_watch_ticker_search_prefers_exact_base_symbol():
     assert main.choose_gecko_search_pool([noisy, exact], "$veil") is exact
 
 
+def gecko_pool(symbol: str, token_ca: str, *, mcap: int, volume: int, liquidity: int) -> dict:
+    return {
+        "attributes": {
+            "name": f"{symbol} / WETH",
+            "market_cap_usd": str(mcap),
+            "volume_usd": {"h24": str(volume)},
+            "reserve_in_usd": str(liquidity),
+        },
+        "relationships": {"base_token": {"data": {"id": f"base_{token_ca}"}}},
+    }
+
+
+def test_watch_ticker_candidates_require_market_filters():
+    import main
+
+    weak = gecko_pool("VEIL", ca(46), mcap=80_000, volume=70_000, liquidity=10_000)
+    strong = gecko_pool("VEIL", ca(47), mcap=80_000, volume=70_000, liquidity=70_000)
+
+    assert main.pool_passes_watch_filters(weak) is False
+    assert main.pool_passes_watch_filters(strong) is True
+    assert main.choose_gecko_search_pool([weak, strong], "$veil") is strong
+
+
+def test_watch_ambiguous_message_lists_ca_candidates():
+    import main
+
+    candidates = [
+        {"address": ca(48), "symbol": "VEIL", "name": "Veil One", "mcap": 90_000, "volume_24h": 80_000, "liquidity": 70_000},
+        {"address": ca(49), "symbol": "VEIL", "name": "Veil Two", "mcap": 120_000, "volume_24h": 90_000, "liquidity": 75_000},
+    ]
+
+    message = main.format_watch_ambiguous_message("$veil", candidates)
+
+    assert "Multiple Base tokens" in message
+    assert ca(48) in message
+    assert ca(49) in message
+    assert "/watch 0x..." in message
+
+
 def socialdata_tweet(
     *,
     tweet_id: int,

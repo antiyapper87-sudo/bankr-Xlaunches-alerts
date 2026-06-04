@@ -1623,6 +1623,8 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                             chat_id,
                             reply_markup=build_watch_item_keyboard(item, launch),
                         )
+                    except WatchTargetAmbiguous as e:
+                        await send_telegram(session, format_watch_ambiguous_message(e.query, e.candidates), chat_id)
                     except Exception as e:
                         log.error(f"Watch command failed for {watch_query}: {e}", exc_info=True)
                         await send_telegram(session, f"❌ <b>Watch failed</b>\n{h(str(e)[:160])}", chat_id)
@@ -3365,6 +3367,13 @@ def clean_watch_query(value: str) -> str:
     return str(value or "").strip().lstrip("$")
 
 
+class WatchTargetAmbiguous(ValueError):
+    def __init__(self, query: str, candidates: list[dict]):
+        super().__init__(f"Multiple Base tokens passed watch filters for {query}")
+        self.query = query
+        self.candidates = candidates
+
+
 def gecko_search_pool_address(pool: dict) -> str:
     base_addr = pool.get("relationships", {}).get("base_token", {}).get("data", {}).get("id", "")
     return str(base_addr or "").replace("base_", "").lower()
@@ -3375,11 +3384,56 @@ def gecko_search_pool_symbol(pool: dict) -> str:
     return pool_name.split(" / ")[0].strip() if " / " in pool_name else pool_name.strip()
 
 
+def gecko_search_pool_market(pool: dict) -> dict:
+    attrs = pool.get("attributes") or {}
+    vol_raw = attrs.get("volume_usd") or {}
+    price_changes = attrs.get("price_change_percentage") or {}
+    return {
+        "mcap": float(attrs.get("market_cap_usd") or attrs.get("fdv_usd") or 0),
+        "volume_24h": float(vol_raw.get("h24") or 0),
+        "liquidity": float(attrs.get("reserve_in_usd") or 0),
+        "price_usd": attrs.get("base_token_price_usd") or attrs.get("price_in_usd") or "0",
+        "price_change_1h": float(price_changes.get("h1") or 0),
+        "price_change_24h": float(price_changes.get("h24") or 0),
+        "pair_url": attrs.get("url") or f"https://www.geckoterminal.com/base/pools/{attrs.get('address', '')}",
+        "pair_created_at": 0,
+        "token_name": gecko_search_pool_symbol(pool),
+        "token_symbol": gecko_search_pool_symbol(pool),
+        "dex_id": attrs.get("dex_id", ""),
+        "_source": "geckoterminal_search",
+    }
+
+
+def pool_passes_watch_filters(pool: dict) -> bool:
+    market = gecko_search_pool_market(pool)
+    return (
+        market["mcap"] > 50_000
+        and market["volume_24h"] > 50_000
+        and market["liquidity"] > 50_000
+    )
+
+
+def watch_candidate(pool: dict) -> dict:
+    address = gecko_search_pool_address(pool)
+    market = gecko_search_pool_market(pool)
+    return {
+        "address": address,
+        "symbol": market.get("token_symbol") or address[:8],
+        "name": market.get("token_name") or "",
+        "mcap": market.get("mcap") or 0,
+        "volume_24h": market.get("volume_24h") or 0,
+        "liquidity": market.get("liquidity") or 0,
+    }
+
+
 def choose_gecko_search_pool(pools: list[dict], query: str) -> dict | None:
     query_upper = clean_watch_query(query).upper()
+    filtered = [pool for pool in pools if is_base_contract(gecko_search_pool_address(pool))]
+    passing = [pool for pool in filtered if pool_passes_watch_filters(pool)]
+    search_pool = passing or filtered
     best_pool = None
     best_score = -1.0
-    for pool in pools:
+    for pool in search_pool:
         pool_attrs = pool.get("attributes") or {}
         vol_raw = pool_attrs.get("volume_usd") or {}
         volume = float(vol_raw.get("h24") or 0)
@@ -3394,6 +3448,27 @@ def choose_gecko_search_pool(pools: list[dict], query: str) -> dict | None:
             best_score = score
             best_pool = pool
     return best_pool
+
+
+def format_watch_ambiguous_message(query: str, candidates: list[dict]) -> str:
+    lines = [
+        f"⭐ <b>Multiple Base tokens found for {h(query)}</b>",
+        "",
+        "These all pass watch filters: MC > 50K · Vol > 50K · Liq > 50K.",
+        "Copy the exact CA you want and send:",
+        "<code>/watch 0x...</code>",
+        "",
+    ]
+    for idx, item in enumerate(candidates[:8], 1):
+        lines.extend([
+            f"{idx}. <b>${h(item.get('symbol') or '')}</b>"
+            + (f" · {h(str(item.get('name') or '')[:36])}" if item.get("name") else ""),
+            f"   MC {fmt_usd(item.get('mcap') or 0)} · Vol {fmt_usd(item.get('volume_24h') or 0)} · Liq {fmt_usd(item.get('liquidity') or 0)}",
+            f"   <code>{h(item.get('address') or '')}</code>",
+        ])
+    if len(candidates) > 8:
+        lines.append(f"\n+{len(candidates) - 8} more candidates hidden.")
+    return "\n".join(lines)[:3900]
 
 
 async def resolve_watch_target(session: aiohttp.ClientSession, query: str) -> tuple[str, dict, dict | None]:
@@ -3416,7 +3491,11 @@ async def resolve_watch_target(session: aiohttp.ClientSession, query: str) -> tu
     except Exception as exc:
         raise ValueError(f"Base search failed for {cleaned}") from exc
 
-    best_pool = choose_gecko_search_pool(data.get("data", []) or [], cleaned)
+    pools = data.get("data", []) or []
+    passing = [pool for pool in pools if is_base_contract(gecko_search_pool_address(pool)) and pool_passes_watch_filters(pool)]
+    if len(passing) > 1:
+        raise WatchTargetAmbiguous(cleaned, [watch_candidate(pool) for pool in passing])
+    best_pool = passing[0] if len(passing) == 1 else choose_gecko_search_pool(pools, cleaned)
     if not best_pool:
         raise ValueError(f"No Base token found for {cleaned}")
     ca = gecko_search_pool_address(best_pool)
