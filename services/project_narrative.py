@@ -185,7 +185,11 @@ def ca_confirmed_tweets(tweets: list[dict[str, Any]], ca: str) -> int:
     if not ca:
         return 0
     needle = ca.lower()
-    return sum(1 for tweet in tweets if needle in str(tweet.get("text") or tweet.get("excerpt") or "").lower())
+    return sum(
+        1 for tweet in tweets
+        if tweet.get("ca_confirmed")
+        or needle in str(tweet.get("text") or tweet.get("excerpt") or "").lower()
+    )
 
 
 def qualified_tweets(social_evidence: dict[str, Any] | None, tweets: list[dict[str, Any]]) -> int:

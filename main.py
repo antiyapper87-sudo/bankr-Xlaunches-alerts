@@ -125,6 +125,7 @@ from services.social_evidence import (
 from services.social_fetcher import AlphaDetector, NitterFetcher, SmartFetchOrchestrator, SocialDataFetcher
 from services.tenants import ensure_telegram_tenant
 from services.token_intelligence import analyze_token_intelligence
+from services.tweet_provenance import annotate_tweet_source, ca_first_sort_key, strict_ca_query, strict_ticker_query
 from settings import resolve_database_url, settings
 
 # ─── Config from environment ──────────────────────────────────────────────────
@@ -2240,17 +2241,16 @@ def contains_term(text_lower: str, term: str) -> bool:
 
 def build_research_query(ticker: str, address: str = "") -> str:
     if address:
-        return address.lower()
+        return strict_ca_query(address)
     return build_ticker_research_query(ticker)
 
 
 def build_ticker_research_query(ticker: str) -> str:
-    clean_ticker = (ticker or "").strip().lstrip("$")
-    return f"${clean_ticker.upper()}" if clean_ticker else ""
+    return strict_ticker_query(ticker)
 
 
 def build_address_research_query(address: str) -> str:
-    return address.lower() if address else ""
+    return strict_ca_query(address)
 
 
 def research_clean_text(text: str) -> str:
@@ -2330,12 +2330,9 @@ def research_has_min_engagement(tweet: dict) -> bool:
 
 
 def research_relevance(tweet: dict, ticker: str, address: str = "") -> bool:
-    text = tweet.get("text", "")
-    upper = text.upper()
-    lower = text.lower()
-    clean_ticker = (ticker or "").strip().lstrip("$").upper()
-    has_ticker = bool(clean_ticker and (f"${clean_ticker}" in upper or clean_ticker in tweet.get("tokens", [])))
-    has_ca = bool(address and address.lower() in lower)
+    annotated = annotate_tweet_source(tweet, ticker=ticker, address=address)
+    has_ticker = bool(annotated.get("ticker_confirmed"))
+    has_ca = bool(annotated.get("ca_confirmed"))
     if address:
         return has_ca
     return has_ticker or has_ca or bool(tweet.get("watched_influencer") and tweet.get("score", 0) >= 2)
@@ -2449,6 +2446,7 @@ def parse_socialdata_tweet(tweet: dict) -> dict | None:
         "date": str(created_raw)[:16],
         "created_at": created_dt,
         "url": f"https://x.com/{username}/status/{tweet_id}",
+        "source_provider": "socialdata",
         "high_priority": username.lower() in HIGH_PRIORITY_INFLUENCERS,
     }
     if not passes_social_intelligence_filters(item):
@@ -2701,6 +2699,7 @@ def filter_research_tweets(
     for tweet in tweets:
         if not tweet or tweet.get("url") in seen_urls:
             continue
+        tweet = annotate_tweet_source(tweet, ticker=ticker, address=address, provider=tweet.get("source_provider") or tweet.get("source") or "")
         text = tweet.get("text", "")
         if (
             research_is_hard_spam(text)
@@ -2737,6 +2736,7 @@ def filter_research_tweets(
             break
     selected.sort(
         key=lambda m: (
+            ca_first_sort_key(m)[0],
             1 if int(m.get("tier") or 3) == 1 else 0,
             int(m.get("score") or 0),
             float(m.get("thesis_quality") or 0),
@@ -2870,6 +2870,7 @@ def parse_nitter_rss_item(item: ET.Element, *, max_age_hours: int = 24) -> dict 
         "created_at": created_at,
         "url": link.replace("nitter.net", "x.com"),
         "source": "nitter",
+        "source_provider": "nitter",
     }
     if not is_recent_tweet(tweet, max_age_hours=max_age_hours):
         return None
@@ -2903,7 +2904,8 @@ async def search_nitter_mentions(
                 tweet = parse_nitter_rss_item(item, max_age_hours=max_age_hours)
                 if not tweet:
                     continue
-                if address and address.lower() not in tweet.get("text", "").lower():
+                tweet = annotate_tweet_source(tweet, ticker=ticker, address=address, provider="nitter")
+                if address and not tweet.get("ca_confirmed"):
                     continue
                 parsed.append(tweet)
                 if len(parsed) >= limit:

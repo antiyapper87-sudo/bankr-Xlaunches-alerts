@@ -152,6 +152,7 @@ def summarize_social_confirmation(launch: Launch) -> dict[str, Any]:
         "project_value_score": int(social_evidence.get("project_value_score") or 0),
         "evidence_count": int(social_evidence.get("evidence_count") or len(top_tweets)),
         "evidence_tweets": top_tweets[:24],
+        "source_provenance": social_evidence.get("source_provenance") or {},
         "hermes_agent": social_evidence.get("agent") or {},
     }
 

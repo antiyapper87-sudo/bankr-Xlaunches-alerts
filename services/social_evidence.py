@@ -12,6 +12,7 @@ from hermes_skills.social_intelligence import (
     tweet_tier_score,
 )
 from services.hermes_context import load_hermes_context
+from services.tweet_provenance import annotate_tweet_source, ca_first_sort_key
 
 
 VERSION = "hermes-social-v1"
@@ -343,6 +344,9 @@ def build_social_evidence(
         url = str(tweet.get("url") or "")
         if not tweet or url in seen_urls or not is_recent_tweet(tweet, max_age_hours=max_age_hours):
             continue
+        tweet = annotate_tweet_source(tweet, ticker=ticker, address=address, provider=tweet.get("source_provider") or tweet.get("source") or "")
+        if address and not tweet.get("ca_confirmed"):
+            continue
         if not passes_social_intelligence_filters(tweet):
             continue
         seen_urls.add(url)
@@ -350,6 +354,7 @@ def build_social_evidence(
 
     ranked.sort(
         key=lambda item: (
+            ca_first_sort_key(item)[0],
             -int(item.get("tweet_tier_rank") or 3),
             int(item.get("tweet_tier_score") or 0),
             int(item.get("hermes_score") or 0),
@@ -384,6 +389,11 @@ def build_social_evidence(
                 "importance": evidence_importance(item),
                 "excerpt": excerpt,
                 "language": "en" if is_likely_english_text(excerpt) else "other",
+                "source_match": item.get("source_match") or "",
+                "source_matches": item.get("source_matches") or [],
+                "source_provider": item.get("source_provider") or item.get("source") or "",
+                "ca_confirmed": bool(item.get("ca_confirmed")),
+                "ticker_confirmed": bool(item.get("ticker_confirmed")),
             }
         )
     qualified_count = sum(1 for item in top if _num(item.get("views")) >= 50 and _num(item.get("likes")) >= 5)
@@ -414,4 +424,9 @@ def build_social_evidence(
         "signal_terms": totals,
         "thesis": thesis,
         "top_tweets": evidence,
+        "source_provenance": {
+            "ca_confirmed": sum(1 for item in evidence if item.get("ca_confirmed")),
+            "ticker_confirmed": sum(1 for item in evidence if item.get("ticker_confirmed")),
+            "providers": sorted({str(item.get("source_provider") or "") for item in evidence if item.get("source_provider")}),
+        },
     }

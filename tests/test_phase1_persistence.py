@@ -1113,11 +1113,73 @@ def test_research_with_ca_requires_contract_mentions_not_ticker_only():
         )
     )
 
-    assert build_research_query("CUE", token_ca) == token_ca
+    assert build_research_query("CUE", token_ca) == f'"{token_ca}"'
     assert "OR%20$CUE" in build_x_research_url(token_ca, "CUE")
     assert research_relevance(ticker_only, "CUE", token_ca) is False
     assert research_relevance(ca_mention, "CUE", token_ca) is True
     assert filter_research_tweets([ticker_only], ticker="CUE", address=token_ca, allow_tier3=True) == []
+
+
+def test_tweet_provenance_marks_ca_and_cashtag_sources():
+    from main import filter_research_tweets, parse_socialdata_tweet
+
+    token_ca = ca(73)
+    ca_mention = parse_socialdata_tweet(
+        socialdata_tweet(
+            tweet_id=173,
+            text=f"{token_ca} $SRC utility protocol thesis with volume and holder traction",
+            views=900,
+            likes=20,
+        )
+    )
+    selected = filter_research_tweets(
+        [ca_mention],
+        ticker="SRC",
+        address=token_ca,
+        allow_tier3=True,
+        min_count=0,
+    )
+
+    assert len(selected) == 1
+    assert selected[0]["source_match"] == "ca"
+    assert selected[0]["ca_confirmed"] is True
+    assert selected[0]["ticker_confirmed"] is True
+    assert selected[0]["source_provider"] == "socialdata"
+
+
+def test_social_evidence_with_ca_drops_ticker_only_and_keeps_provenance():
+    from services.social_evidence import build_social_evidence
+
+    token_ca = ca(74)
+    ticker_only = {
+        "username": "ticker_only",
+        "url": "https://x.com/ticker_only/status/1",
+        "text": "$SAFE utility protocol thesis with real traction and volume context.",
+        "views": 2_000,
+        "likes": 30,
+        "retweets": 4,
+        "created_at": utc_now(),
+    }
+    ca_linked = {
+        "username": "ca_linked",
+        "url": "https://x.com/ca_linked/status/2",
+        "text": f"{token_ca} $SAFE utility protocol thesis with real traction and volume context.",
+        "views": 2_000,
+        "likes": 30,
+        "retweets": 4,
+        "created_at": utc_now(),
+    }
+
+    evidence = build_social_evidence(
+        [ticker_only, ca_linked],
+        ticker="SAFE",
+        address=token_ca,
+        min_count=1,
+    )
+
+    assert [item["username"] for item in evidence["top_tweets"]] == ["ca_linked"]
+    assert evidence["top_tweets"][0]["source_match"] == "ca"
+    assert evidence["source_provenance"]["ca_confirmed"] == 1
 
 
 @pytest.mark.asyncio
