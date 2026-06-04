@@ -8,7 +8,8 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import create_verdict_v3, get_latest_token_research, get_relevant_memories, utc_now
+from database import create_verdict_v3, get_latest_token_research, list_bundle_signals, utc_now
+from services.agent_memory import build_memory_context
 
 
 VERSION = "3.0"
@@ -323,24 +324,31 @@ async def build_verdict_v3(db: AsyncSession, *, ca: str, launch: dict[str, Any])
     research_row = await get_latest_token_research(db, ca)
     research = (research_row.processed_data if research_row else {}) or {}
     source = research.get("source") or {}
-    memories = []
     deployer_key = source.get("deployer_wallet") or source.get("x_username") or ""
-    if deployer_key:
-        memories = await get_relevant_memories(db, subject_type="dev_wallet", subject_id=f"base:{deployer_key}", limit=3)
-    memory_context = {
-        "score_adjustment": sum(float(item.normalized_json.get("score_adjustment") or 0) for item in memories),
-        "confidence": max((float(item.confidence or 0) for item in memories), default=0.0),
-        "matches": [
-            {
-                "memory_type": item.memory_type,
-                "insight": item.insight,
-                "confidence": item.confidence,
-            }
-            for item in memories
-        ],
-        "risk_notes": [item.insight for item in memories if item.polarity == "negative"][:2],
-        "positive_notes": [item.insight for item in memories if item.polarity == "positive"][:2],
-    }
+    memory_context = await build_memory_context(
+        db,
+        chain="base",
+        deployer_wallet=deployer_key,
+        ticker=(launch.get("symbol") or research.get("symbol") or "").lstrip("$"),
+        launch_source=launch.get("source") or source.get("source") or "",
+    )
+    bundle_signals = await list_bundle_signals(db, chain="base", token_id=ca)
+    if bundle_signals:
+        max_risk = max(float(item.risk_score or 0) for item in bundle_signals)
+        research["onchain"] = {
+            **(research.get("onchain") or {}),
+            "provider": "block-reader",
+            "bundle_risk": max_risk,
+            "signals": [
+                {
+                    "type": item.signal_type,
+                    "severity": item.severity,
+                    "risk_score": item.risk_score,
+                    "title": item.title,
+                }
+                for item in bundle_signals[:6]
+            ],
+        }
     verdict_input = build_verdict_input(ca=ca, launch=launch, research=research, memory=memory_context)
     output = build_output(verdict_input)
     human = format_verdict_v3(output)

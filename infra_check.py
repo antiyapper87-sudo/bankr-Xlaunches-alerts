@@ -27,6 +27,18 @@ async def check_database() -> dict[str, str]:
                 "wallet_events",
                 "nitter_health_logs",
                 "socialdata_usage_logs",
+                "chain_token_identities",
+                "token_outcomes",
+                "project_lore",
+                "agent_memory",
+                "pattern_memory",
+                "verdict_v3",
+                "block_scans",
+                "token_transactions",
+                "bundle_signals",
+                "prebuy_signals",
+                "holder_snapshots",
+                "liquidity_events",
             ):
                 await db.execute(text(f"select 1 from {table} limit 0"))
         return {
@@ -35,6 +47,8 @@ async def check_database() -> dict[str, str]:
             "phase3_schema": "ok",
             "phase4_schema": "ok",
             "social_fetcher_schema": "ok",
+            "feature_foundation_schema": "ok",
+            "block_reader_schema": "ok",
         }
     finally:
         await close_db()

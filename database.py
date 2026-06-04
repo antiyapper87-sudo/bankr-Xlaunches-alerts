@@ -314,16 +314,22 @@ class TelegramCallbackRef(Base):
 from models import (  # noqa: E402
     AgentMemory,
     AISummary,
+    BlockScan,
+    BundleSignal,
     ChainTokenIdentity,
     DevWalletProfile,
     HistoricalLaunch,
+    HolderSnapshot,
+    LiquidityEvent,
     LoreEvidence,
     NarrativePattern,
     PatternMemory,
+    PrebuySignal,
     ProjectLore,
     SocialAccountPattern,
     SpoofSignal,
     TokenOutcome,
+    TokenTransaction,
     TokenResearch,
     TrackedWallet,
     UserFeedback,
@@ -331,6 +337,7 @@ from models import (  # noqa: E402
     VerdictV2,
     VerdictV3,
     WalletEvent,
+    WalletCluster,
 )
 
 
@@ -1556,6 +1563,27 @@ async def get_relevant_memories(
     return list(await db.scalars(stmt))
 
 
+async def list_recent_agent_memories(db: AsyncSession, *, limit: int = 10) -> list[AgentMemory]:
+    stmt = (
+        select(AgentMemory)
+        .where(AgentMemory.status == "active")
+        .order_by(AgentMemory.last_seen_at.desc(), AgentMemory.confidence.desc())
+        .limit(limit)
+    )
+    return list(await db.scalars(stmt))
+
+
+async def disable_agent_memory(db: AsyncSession, *, memory_key: str, review_note: str = "") -> bool:
+    row = await db.scalar(select(AgentMemory).where(AgentMemory.memory_key == memory_key))
+    if row is None:
+        return False
+    row.status = "disabled"
+    row.reviewed_by_admin = True
+    row.review_note = review_note or "disabled by admin"
+    row.last_seen_at = utc_now()
+    return True
+
+
 async def upsert_pattern_memory(
     db: AsyncSession,
     *,
@@ -1657,6 +1685,294 @@ async def get_latest_verdict_v3(db: AsyncSession, *, chain: str, token_id: str) 
         .limit(1)
     )
     return await db.scalar(stmt)
+
+
+async def backfill_chain_identities_from_launches(db: AsyncSession, *, limit: int = 500) -> int:
+    stmt = (
+        select(Launch)
+        .outerjoin(ChainTokenIdentity, ChainTokenIdentity.identity_key == func.concat("base:", Launch.ca))
+        .where(ChainTokenIdentity.id.is_(None))
+        .order_by(Launch.first_seen_at.asc())
+        .limit(limit)
+    )
+    if db.bind and db.bind.dialect.name != "postgresql":
+        stmt = (
+            select(Launch)
+            .where(~Launch.ca.in_(select(ChainTokenIdentity.token_id).where(ChainTokenIdentity.chain == "base")))
+            .order_by(Launch.first_seen_at.asc())
+            .limit(limit)
+        )
+    count = 0
+    for launch in list(await db.scalars(stmt)):
+        await upsert_chain_token_identity(
+            db,
+            chain="base",
+            token_id=launch.ca,
+            ticker=launch.ticker or "",
+            name=launch.name or "",
+            launch_source=launch.source or "",
+            source_method=((launch.raw_json or {}).get("source_method") or ""),
+            deployer_wallet=((launch.raw_json or {}).get("deployer_wallet") or (launch.raw_json or {}).get("msg_sender") or ""),
+            creator_handle=((launch.raw_json or {}).get("x_username") or ""),
+            pair_address=((launch.market_json or {}).get("pair_address") or ""),
+            first_seen_at=launch.first_seen_at,
+            source_created_at=launch.launched_at,
+            reliable_created_at=bool(launch.launched_at),
+            source_confidence="medium" if launch.launched_at else "low",
+            raw_refs_json={"backfilled_from": "launches", "source": launch.source or ""},
+        )
+        count += 1
+    return count
+
+
+async def upsert_block_scan(
+    db: AsyncSession,
+    *,
+    chain: str,
+    token_id: str,
+    pair_address: str = "",
+    from_block: int | None = None,
+    to_block: int | None = None,
+    confidence: str = "LOW",
+    status: str = "pending",
+    provider: str = "alchemy",
+    summary_json: dict[str, Any] | None = None,
+    error: str = "",
+) -> BlockScan:
+    chain = str(chain or "base").strip().lower()
+    token_id = normalize_ca(token_id) if chain in {"base", "ethereum", "bnb"} else str(token_id or "").strip()
+    key = identity_key(chain, token_id)
+    row = await db.scalar(select(BlockScan).where(BlockScan.identity_key == key, BlockScan.provider == provider))
+    now = utc_now()
+    if row is None:
+        row = BlockScan(
+            chain=chain,
+            token_id=token_id,
+            identity_key=key,
+            pair_address=pair_address or None,
+            provider=provider,
+            created_at=now,
+            updated_at=now,
+            summary_json=summary_json or {},
+        )
+        db.add(row)
+        await db.flush()
+    row.pair_address = pair_address or row.pair_address
+    row.from_block = from_block if from_block is not None else row.from_block
+    row.to_block = to_block if to_block is not None else row.to_block
+    row.confidence = confidence or row.confidence
+    row.status = status or row.status
+    row.summary_json = summary_json if summary_json is not None else (row.summary_json or {})
+    row.error = error[:2000] if error else None
+    row.updated_at = now
+    return row
+
+
+async def upsert_token_transaction(
+    db: AsyncSession,
+    *,
+    chain: str,
+    token_id: str,
+    tx_hash: str,
+    event_type: str,
+    wallet_address: str = "",
+    counterparty_address: str = "",
+    pair_address: str = "",
+    block_number: int | None = None,
+    tx_index: int | None = None,
+    amount_token: float | None = None,
+    amount_native: float | None = None,
+    raw_json: dict[str, Any] | None = None,
+) -> tuple[TokenTransaction, bool]:
+    chain = str(chain or "base").strip().lower()
+    token_id = normalize_ca(token_id) if chain in {"base", "ethereum", "bnb"} else str(token_id or "").strip()
+    tx_hash = str(tx_hash or "").lower()
+    event_type = str(event_type or "transfer")[:32]
+    wallet_address = str(wallet_address or "").lower()
+    row = await db.scalar(
+        select(TokenTransaction).where(
+            TokenTransaction.chain == chain,
+            TokenTransaction.tx_hash == tx_hash,
+            TokenTransaction.token_id == token_id,
+            TokenTransaction.event_type == event_type,
+            TokenTransaction.wallet_address == (wallet_address or None),
+        )
+    )
+    inserted = False
+    if row is None:
+        row = TokenTransaction(
+            chain=chain,
+            token_id=token_id,
+            identity_key=identity_key(chain, token_id),
+            tx_hash=tx_hash,
+            event_type=event_type,
+            wallet_address=wallet_address or None,
+            counterparty_address=(counterparty_address or "").lower() or None,
+            pair_address=(pair_address or "").lower() or None,
+            block_number=block_number,
+            tx_index=tx_index,
+            amount_token=amount_token,
+            amount_native=amount_native,
+            raw_json=raw_json or {},
+        )
+        db.add(row)
+        await db.flush()
+        inserted = True
+    return row, inserted
+
+
+async def upsert_bundle_signal(
+    db: AsyncSession,
+    *,
+    chain: str,
+    token_id: str,
+    signal_type: str,
+    severity: str,
+    risk_score: float,
+    score_impact: float,
+    title: str,
+    details: str = "",
+    evidence_json: dict[str, Any] | None = None,
+    detector_version: str = "bundle-v1",
+) -> BundleSignal:
+    chain = str(chain or "base").strip().lower()
+    token_id = normalize_ca(token_id) if chain in {"base", "ethereum", "bnb"} else str(token_id or "").strip()
+    key = identity_key(chain, token_id)
+    row = await db.scalar(
+        select(BundleSignal).where(
+            BundleSignal.identity_key == key,
+            BundleSignal.signal_type == signal_type,
+            BundleSignal.detector_version == detector_version,
+        )
+    )
+    if row is None:
+        row = BundleSignal(
+            chain=chain,
+            token_id=token_id,
+            identity_key=key,
+            signal_type=signal_type,
+            severity=severity,
+            risk_score=float(risk_score or 0),
+            score_impact=float(score_impact or 0),
+            title=title[:180],
+            details=details[:2000] if details else None,
+            evidence_json=evidence_json or {},
+            detector_version=detector_version,
+        )
+        db.add(row)
+        await db.flush()
+        return row
+    row.severity = severity
+    row.risk_score = float(risk_score or 0)
+    row.score_impact = float(score_impact or 0)
+    row.title = title[:180]
+    row.details = details[:2000] if details else None
+    row.evidence_json = evidence_json or {}
+    return row
+
+
+async def upsert_prebuy_signal(
+    db: AsyncSession,
+    *,
+    chain: str,
+    token_id: str,
+    severity: str,
+    risk_score: float,
+    evidence_json: dict[str, Any] | None = None,
+    detector_version: str = "prebuy-v1",
+) -> PrebuySignal:
+    chain = str(chain or "base").strip().lower()
+    token_id = normalize_ca(token_id) if chain in {"base", "ethereum", "bnb"} else str(token_id or "").strip()
+    key = identity_key(chain, token_id)
+    row = await db.scalar(select(PrebuySignal).where(PrebuySignal.identity_key == key, PrebuySignal.detector_version == detector_version))
+    if row is None:
+        row = PrebuySignal(
+            chain=chain,
+            token_id=token_id,
+            identity_key=key,
+            severity=severity,
+            risk_score=float(risk_score or 0),
+            evidence_json=evidence_json or {},
+            detector_version=detector_version,
+        )
+        db.add(row)
+        await db.flush()
+        return row
+    row.severity = severity
+    row.risk_score = float(risk_score or 0)
+    row.evidence_json = evidence_json or {}
+    return row
+
+
+async def insert_holder_snapshot(
+    db: AsyncSession,
+    *,
+    chain: str,
+    token_id: str,
+    provider: str = "unknown",
+    snapshot_json: dict[str, Any] | None = None,
+    holder_count: int | None = None,
+    top_1_pct: float | None = None,
+    top_5_pct: float | None = None,
+    top_10_pct: float | None = None,
+    dev_related_pct: float | None = None,
+    fresh_wallet_pct: float | None = None,
+) -> HolderSnapshot:
+    chain = str(chain or "base").strip().lower()
+    token_id = normalize_ca(token_id) if chain in {"base", "ethereum", "bnb"} else str(token_id or "").strip()
+    row = HolderSnapshot(
+        chain=chain,
+        token_id=token_id,
+        identity_key=identity_key(chain, token_id),
+        provider=provider,
+        snapshot_json=snapshot_json or {},
+        holder_count=holder_count,
+        top_1_pct=top_1_pct,
+        top_5_pct=top_5_pct,
+        top_10_pct=top_10_pct,
+        dev_related_pct=dev_related_pct,
+        fresh_wallet_pct=fresh_wallet_pct,
+    )
+    db.add(row)
+    await db.flush()
+    return row
+
+
+async def insert_liquidity_event(
+    db: AsyncSession,
+    *,
+    chain: str,
+    token_id: str,
+    event_type: str,
+    tx_hash: str = "",
+    liquidity_usd: float | None = None,
+    liquidity_change_pct: float | None = None,
+    evidence_json: dict[str, Any] | None = None,
+) -> LiquidityEvent:
+    chain = str(chain or "base").strip().lower()
+    token_id = normalize_ca(token_id) if chain in {"base", "ethereum", "bnb"} else str(token_id or "").strip()
+    row = LiquidityEvent(
+        chain=chain,
+        token_id=token_id,
+        identity_key=identity_key(chain, token_id),
+        event_type=event_type,
+        tx_hash=(tx_hash or "").lower() or None,
+        liquidity_usd=liquidity_usd,
+        liquidity_change_pct=liquidity_change_pct,
+        evidence_json=evidence_json or {},
+    )
+    db.add(row)
+    await db.flush()
+    return row
+
+
+async def list_bundle_signals(db: AsyncSession, *, chain: str, token_id: str) -> list[BundleSignal]:
+    stmt = (
+        select(BundleSignal)
+        .where(BundleSignal.identity_key == identity_key(chain, token_id))
+        .order_by(BundleSignal.risk_score.desc(), BundleSignal.created_at.desc())
+    )
+    return list(await db.scalars(stmt))
 
 
 async def upsert_spoof_signal(

@@ -6,6 +6,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import create_or_update_token_outcome, pct_change, utc_now
+from services.agent_memory import update_memory_from_outcome
 
 
 OUTCOME_WINDOWS = ("1h", "4h", "24h", "7d")
@@ -118,7 +119,7 @@ async def record_outcome_snapshot(
         next_check_at = utc_now() + timedelta(hours=20)
     elif window == "24h":
         next_check_at = utc_now() + timedelta(days=6)
-    await create_or_update_token_outcome(
+    outcome = await create_or_update_token_outcome(
         db,
         chain=chain,
         token_id=token_id,
@@ -129,4 +130,21 @@ async def record_outcome_snapshot(
         evidence_json={f"snapshot_{window}": latest, "metrics": metrics},
         status="completed" if window == "7d" else "tracking",
     )
+    if outcome.status == "completed":
+        await update_memory_from_outcome(db, outcome)
     return {"window": window, "label": label, "metrics": metrics, "market": latest}
+
+
+def next_due_window(outcome) -> str:
+    if not outcome.snapshot_1h_json or "market" not in (outcome.snapshot_1h_json or {}):
+        return "1h"
+    if not outcome.snapshot_4h_json:
+        return "4h"
+    if not outcome.snapshot_24h_json:
+        return "24h"
+    return "7d"
+
+
+def initial_snapshot_from_outcome(outcome) -> dict[str, Any]:
+    snap = outcome.snapshot_1h_json or {}
+    return snap.get("initial") or snap.get("market") or {}

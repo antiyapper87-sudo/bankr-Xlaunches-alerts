@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     max_delivery_concurrency: int = 20
 
     auto_verdict_enabled: bool = True
+    ai_verdict3_enabled: bool = False
     trading_enabled: bool = False
     allow_unsafe_trading: bool = False
     dynamic_thresholds_enabled: bool = False

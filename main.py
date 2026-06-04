@@ -66,11 +66,14 @@ from database import (
     get_launch,
     get_launch_status,
     get_latest_token_research,
+    get_relevant_memories,
     get_tenant,
     get_tenant_settings,
     get_status_snapshot,
     get_telegram_callback_ref,
     init_db,
+    disable_agent_memory,
+    list_recent_agent_memories,
     list_tracked_wallets,
     list_watchlist_items,
     mark_delivery_failed,
@@ -120,6 +123,7 @@ from services.project_narrative import (
     extract_project_narrative,
     narrative_token_type,
 )
+from services.queueing import enqueue_block_reader, enqueue_memory_rebuild, enqueue_outcome_checks
 from services.social_evidence import (
     build_social_evidence,
     hide_contract_mentions,
@@ -239,6 +243,8 @@ last_coingecko_poll_at: float = 0
 last_update_id: int = 0
 alert_count: int = 0
 default_tenant_db_id: int | None = None
+last_outcome_job_at: float = 0
+last_memory_job_at: float = 0
 
 # ─── Recheck queue ────────────────────────────────────────────────────────────
 RECHECK_MAX_AGE = 3600
@@ -483,6 +489,9 @@ ADMIN_COMMANDS = {
     "/unblock",
     "/blocklist",
     "/verdict3",
+    "/memory_review",
+    "/memory_disable",
+    "/memory_for",
     "/track",
     "/untrack",
     "/wallets",
@@ -1682,6 +1691,77 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                         await send_telegram(session, f"❌ <b>Verdict 3 failed</b>\n{h(str(e)[:160])}", chat_id)
 
                 track_background_command(f"verdict3 {ca.lower()}", do_verdict3())
+
+            elif cmd == "/memory_review":
+                async with db_session() as db:
+                    memories = await list_recent_agent_memories(db, limit=10)
+                if not memories:
+                    await send_telegram(session, "🧠 <b>Memory Review</b>\n\nNo active memory rows.", chat_id)
+                    continue
+                lines = ["🧠 <b>Memory Review</b> · active recent"]
+                for idx, item in enumerate(memories, 1):
+                    lines.append(
+                        f"{idx}. <code>{h(item.memory_key)}</code>\n"
+                        f"   {h(item.memory_type)} · conf {float(item.confidence or 0):.2f} · {h(item.polarity)}\n"
+                        f"   {h(item.insight[:180])}"
+                    )
+                await send_telegram(session, safe_join_blocks(["\n".join(lines)], limit=3900, truncation_note="Memory review truncated."), chat_id)
+
+            elif cmd == "/memory_disable":
+                parts = text.split(maxsplit=1)
+                key = parts[1].strip() if len(parts) == 2 else ""
+                if not key:
+                    await send_telegram(session, "🧠 <b>Disable memory</b>\n<code>/memory_disable memory_key</code>", chat_id)
+                    continue
+                async with db_session() as db:
+                    disabled = await disable_agent_memory(db, memory_key=key, review_note=f"disabled by {chat_id}")
+                await send_telegram(
+                    session,
+                    f"{'✅' if disabled else '⚠️'} <b>Memory {'disabled' if disabled else 'not found'}</b>\n<code>{h(key)}</code>",
+                    chat_id,
+                )
+
+            elif cmd == "/memory_for":
+                parts = text.split(maxsplit=1)
+                query = parts[1].strip() if len(parts) == 2 else ""
+                if not query:
+                    await send_telegram(session, "🧠 <b>Memory lookup</b>\n<code>/memory_for 0x...</code>\n<code>/memory_for ticker:VEIL</code>\n<code>/memory_for wallet:0x...</code>", chat_id)
+                    continue
+                async with db_session() as db:
+                    if query.startswith("ticker:"):
+                        subject_type = "ticker"
+                        subject_id = f"base:ticker:{query.split(':', 1)[1].strip().lstrip('$').lower()}"
+                        memories = await get_relevant_memories(db, subject_type=subject_type, subject_id=subject_id, min_confidence=0, limit=10)
+                    elif query.startswith("wallet:"):
+                        subject_type = "dev_wallet"
+                        subject_id = f"base:{query.split(':', 1)[1].strip().lower()}"
+                        memories = await get_relevant_memories(db, subject_type=subject_type, subject_id=subject_id, min_confidence=0, limit=10)
+                    elif is_base_contract(query):
+                        launch = await get_launch(db, query.lower())
+                        raw = launch.raw_json if launch and launch.raw_json else {}
+                        memories = []
+                        if launch and launch.ticker:
+                            memories.extend(await get_relevant_memories(db, subject_type="ticker", subject_id=f"base:ticker:{launch.ticker.lower()}", min_confidence=0, limit=5))
+                        wallet = raw.get("deployer_wallet") or raw.get("msg_sender") or ""
+                        if wallet:
+                            memories.extend(await get_relevant_memories(db, subject_type="dev_wallet", subject_id=f"base:{wallet.lower()}", min_confidence=0, limit=5))
+                    else:
+                        memories = await get_relevant_memories(db, subject_type="ticker", subject_id=f"base:ticker:{query.lstrip('$').lower()}", min_confidence=0, limit=10)
+                if not memories:
+                    await send_telegram(session, f"🧠 <b>Memory</b>\nNo rows for <code>{h(query)}</code>", chat_id)
+                    continue
+                seen_keys = set()
+                lines = [f"🧠 <b>Memory for</b> <code>{h(query)}</code>"]
+                for item in memories:
+                    if item.memory_key in seen_keys:
+                        continue
+                    seen_keys.add(item.memory_key)
+                    lines.append(
+                        f"• <code>{h(item.memory_key)}</code>\n"
+                        f"  {h(item.memory_type)} · conf {float(item.confidence or 0):.2f} · adj {float((item.normalized_json or {}).get('score_adjustment') or 0):+.1f}\n"
+                        f"  {h(item.insight[:220])}"
+                    )
+                await send_telegram(session, safe_join_blocks(["\n".join(lines)], limit=3900, truncation_note="Memory lookup truncated."), chat_id)
 
             elif cmd in ("/spoof-check", "/spoof_check"):
                 parts = text.split(maxsplit=1)
@@ -5680,6 +5760,9 @@ async def enrich_launch_social_confirmation(
 
 def command_market_line(result: dict) -> str:
     verdict = result.get("verdict") or {}
+    verdict_v3 = result.get("verdict_v3") or {}
+    if settings.ai_verdict3_enabled and verdict_v3.get("human_readable"):
+        verdict = verdict_v3
     research = verdict.get("research") or (result.get("research") or {}).get("processed_data") or {}
     market = research.get("market") or {}
     if not market:
@@ -5875,6 +5958,10 @@ async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, s
             )
         except Exception as exc:
             log.warning(f"  ⚠️ Outcome schedule skipped for {address[:10]}...: {exc}")
+        try:
+            enqueue_block_reader(address)
+        except Exception as exc:
+            log.warning(f"  ⚠️ Block reader enqueue skipped for {address[:10]}...: {exc}")
         log_event(
             "signal_sent",
             correlation_id=cid,
@@ -6080,7 +6167,7 @@ async def seed_existing(session: aiohttp.ClientSession):
 # ─── Main Loop ────────────────────────────────────────────────────────────────
 
 async def main():
-    global alert_count, default_tenant_db_id
+    global alert_count, default_tenant_db_id, last_outcome_job_at, last_memory_job_at
 
     if not TELEGRAM_BOT_TOKEN:
         log.error("❌ TELEGRAM_BOT_TOKEN not set!")
@@ -6196,6 +6283,19 @@ async def main():
                 wallet_events = await process_tracked_wallet_checks(session)
                 if wallet_events:
                     log.info(f"🐋 Stored {wallet_events} tracked wallet event(s)")
+                now_ts = time.time()
+                if now_ts - last_outcome_job_at >= int(os.getenv("OUTCOME_JOB_INTERVAL", "900")):
+                    try:
+                        enqueue_outcome_checks(int(os.getenv("OUTCOME_JOB_BATCH", "50")))
+                        last_outcome_job_at = now_ts
+                    except Exception as exc:
+                        log.debug(f"Outcome worker enqueue skipped: {exc}")
+                if now_ts - last_memory_job_at >= int(os.getenv("MEMORY_JOB_INTERVAL", "3600")):
+                    try:
+                        enqueue_memory_rebuild(int(os.getenv("MEMORY_JOB_BATCH", "100")))
+                        last_memory_job_at = now_ts
+                    except Exception as exc:
+                        log.debug(f"Memory worker enqueue skipped: {exc}")
 
                 bankr_launches = await fetch_bankr(session)
                 clanker_launches = await fetch_clanker(session)

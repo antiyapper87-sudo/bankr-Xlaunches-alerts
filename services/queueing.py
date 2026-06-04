@@ -26,3 +26,38 @@ def enqueue_launch_enrichment(ca: str) -> str:
         result_ttl=3600,
     )
     return job.id
+
+
+def enqueue_block_reader(ca: str) -> str:
+    ca = ca.lower()
+    job = get_launch_queue().enqueue(
+        "worker.run_block_reader",
+        ca,
+        job_id=f"block_reader:{ca}",
+        retry=Retry(max=3, interval=[30, 90, 180]),
+        job_timeout=120,
+        result_ttl=3600,
+    )
+    return job.id
+
+
+def enqueue_outcome_checks(limit: int = 50) -> str:
+    job = get_launch_queue().enqueue(
+        "worker.process_due_outcomes",
+        limit,
+        retry=Retry(max=2, interval=[60, 180]),
+        job_timeout=180,
+        result_ttl=3600,
+    )
+    return job.id
+
+
+def enqueue_memory_rebuild(limit: int = 100) -> str:
+    job = get_launch_queue().enqueue(
+        "worker.rebuild_memory",
+        limit,
+        retry=Retry(max=2, interval=[60, 180]),
+        job_timeout=180,
+        result_ttl=3600,
+    )
+    return job.id

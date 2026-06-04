@@ -6,18 +6,26 @@ import pytest
 import pytest_asyncio
 
 from database import (
+    backfill_chain_identities_from_launches,
     close_db,
     create_or_update_token_outcome,
     db_session,
     get_chain_token_identity,
     get_latest_project_lore,
     init_db,
+    list_bundle_signals,
+    upsert_bundle_signal,
     upsert_agent_memory,
     upsert_chain_token_identity,
+    upsert_launch,
     utc_now,
 )
+from services.agent_memory import build_memory_context, update_memory_from_outcome
+from services.block_reader.bundle_detector import detect_bundle_like_patterns
+from services.chains.types import NormalizedTx
 from services.lore_extraction import build_lore_payload, extract_and_store_project_lore
-from services.outcome_tracker import classify_outcome
+from services.market_selection import select_canonical_market
+from services.outcome_tracker import classify_outcome, initial_snapshot_from_outcome, next_due_window, record_outcome_snapshot
 from services.verdict_v3 import build_output, build_verdict_input, build_verdict_v3
 
 
@@ -224,3 +232,201 @@ async def test_verdict3_persists_shadow_output(db_url, monkeypatch):
     assert output["id"]
     assert output["label"] in {"WAIT", "SKIP", "WATCH", "HIGH RISK"}
     assert "Verdict 3.0" in output["human_readable"]
+
+
+@pytest.mark.asyncio
+async def test_backfill_launches_into_chain_identity(db_url):
+    token = ca(207)
+    async with db_session() as db:
+        await upsert_launch(
+            db,
+            ca=token,
+            source="bankr",
+            ticker="BACK",
+            name="Backfill",
+            launched_at=utc_now(),
+            raw_json={"x_username": "builder"},
+        )
+        count = await backfill_chain_identities_from_launches(db, limit=10)
+        assert count == 1
+
+    async with db_session() as db:
+        row = await get_chain_token_identity(db, chain="base", token_id=token)
+        assert row is not None
+        assert row.launch_source == "bankr"
+
+
+def test_canonical_market_selector_rejects_wrong_side_common_asset():
+    token = ca(209)
+    selected = select_canonical_market(
+        [
+            {"base_token_address": ca(1), "base_token_symbol": "WETH", "quote_token_symbol": "TEST", "liquidity": 1_000_000, "volume_24h": 1_000_000},
+            {"base_token_address": token, "base_token_symbol": "TEST", "quote_token_symbol": "WETH", "liquidity": 50_000, "volume_24h": 60_000},
+        ],
+        token_id=token,
+        ticker="TEST",
+    )
+    assert selected is not None
+    assert selected["base_token_address"] == token
+    assert selected["canonical_pool_confidence"] == "HIGH"
+
+
+def test_bundle_detector_flags_same_block_cluster_without_claiming_certainty():
+    token = ca(210)
+    transfers = [
+        NormalizedTx(
+            chain="base",
+            tx_hash=f"0x{i:064x}",
+            block_number=100,
+            tx_index=i,
+            timestamp=None,
+            from_address=ca(300),
+            to_address=ca(400 + i),
+            event_type="transfer",
+            token_id=token,
+            wallet_address=ca(400 + i),
+            pair_address=None,
+            amount_token=100,
+            amount_native=None,
+            raw={},
+        )
+        for i in range(5)
+    ]
+    summary = detect_bundle_like_patterns(transfers)
+    assert summary.bundle_risk >= 25
+    assert summary.confidence == "LOW"
+    assert summary.signals[0]["type"] == "same_block_buy_cluster"
+
+
+@pytest.mark.asyncio
+async def test_bundle_signal_persistence_is_idempotent(db_url):
+    token = ca(211)
+    async with db_session() as db:
+        first = await upsert_bundle_signal(
+            db,
+            chain="base",
+            token_id=token,
+            signal_type="same_block_buy_cluster",
+            severity="MEDIUM",
+            risk_score=25,
+            score_impact=-6,
+            title="Same-block buyer cluster",
+        )
+        second = await upsert_bundle_signal(
+            db,
+            chain="base",
+            token_id=token,
+            signal_type="same_block_buy_cluster",
+            severity="HIGH",
+            risk_score=80,
+            score_impact=-15,
+            title="Updated cluster",
+        )
+        rows = await list_bundle_signals(db, chain="base", token_id=token)
+
+    assert first.id == second.id
+    assert len(rows) == 1
+    assert rows[0].risk_score == 80
+
+
+@pytest.mark.asyncio
+async def test_memory_update_from_completed_outcomes_is_bounded(db_url):
+    wallet = ca(212)
+    async with db_session() as db:
+        labels = ["dumped", "dead", "dumped", "dead", "winner_24h", "flat", "dumped"]
+        for idx, label in enumerate(labels, start=1):
+            await create_or_update_token_outcome(
+                db,
+                chain="base",
+                token_id=ca(220 + idx),
+                ticker="MEM",
+                deployer_wallet=wallet,
+                first_seen_at=utc_now(),
+                final_outcome_label=label,
+                status="completed",
+                snapshot_key="7d",
+                snapshot_json={"market": {"mcap": 1}},
+            )
+        outcome = await create_or_update_token_outcome(
+            db,
+            chain="base",
+            token_id=ca(224),
+            ticker="MEM",
+            deployer_wallet=wallet,
+            first_seen_at=utc_now(),
+            final_outcome_label="dumped",
+            status="completed",
+            snapshot_key="7d",
+            snapshot_json={"market": {"mcap": 1}},
+        )
+        keys = await update_memory_from_outcome(db, outcome)
+        context = await build_memory_context(db, chain="base", deployer_wallet=wallet, ticker="MEM")
+
+    assert keys
+    assert -12 <= context["score_adjustment"] <= 8
+    assert context["confidence"] >= 0.3
+
+
+@pytest.mark.asyncio
+async def test_outcome_window_progression_and_final_memory_update(db_url):
+    token = ca(230)
+    async with db_session() as db:
+        outcome = await create_or_update_token_outcome(
+            db,
+            chain="base",
+            token_id=token,
+            ticker="WIN",
+            first_seen_at=utc_now(),
+            snapshot_key="1h",
+            snapshot_json={"initial": {"mcap": 100_000, "liquidity": 50_000}},
+        )
+        assert next_due_window(outcome) == "1h"
+        assert initial_snapshot_from_outcome(outcome)["mcap"] == 100_000
+        result = await record_outcome_snapshot(
+            db,
+            chain="base",
+            token_id=token,
+            window="7d",
+            dex={"mcap": 700_000, "liquidity": 55_000, "volume_24h": 100_000},
+            initial_snapshot={"mcap": 100_000, "liquidity": 50_000},
+        )
+
+    assert result["label"] == "winner_24h"
+
+
+@pytest.mark.asyncio
+async def test_verdict3_uses_persisted_block_reader_risk(db_url, monkeypatch):
+    import services.verdict_v3 as verdict_v3
+
+    token = ca(240)
+    research = {
+        "symbol": "RISK",
+        "market": {"mcap": 500_000, "volume_24h": 300_000, "liquidity": 150_000},
+        "social": {"source_provenance": {"ca_confirmed": 5}, "social_score": 80},
+        "project_lore": {
+            "narrative_summary": "Risk is a Base analytics protocol.",
+            "why_it_matters": "It gives traders better tooling.",
+            "ca_attribution_confidence": "HIGH",
+            "project_category": "Trading / Tooling",
+        },
+    }
+
+    async def fake_latest_research(db, ca):
+        return SimpleNamespace(processed_data=dict(research))
+
+    monkeypatch.setattr(verdict_v3, "get_latest_token_research", fake_latest_research)
+    async with db_session() as db:
+        await upsert_bundle_signal(
+            db,
+            chain="base",
+            token_id=token,
+            signal_type="same_block_buy_cluster",
+            severity="HIGH",
+            risk_score=85,
+            score_impact=-15,
+            title="Same-block buyer cluster",
+        )
+        output = await build_verdict_v3(db, ca=token, launch={"symbol": "RISK", "source": "bankr"})
+
+    assert output["label"] == "HIGH RISK"
+    assert output["onchain_risk"]["bundle_risk"] == 85
