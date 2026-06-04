@@ -51,6 +51,7 @@ load_local_env()
 
 from database import (
     close_db,
+    consume_user_command_quota,
     db_session,
     deactivate_watchlist_item,
     deactivate_tracked_wallet,
@@ -138,6 +139,7 @@ AUTHORIZED_USER_IDS = {
     if user_id.strip()
 }
 ADMIN_USER_ID = os.getenv("ADMIN_USER_ID", "544999608").strip()
+PUBLIC_RESEARCH_TOKEN_LIMIT = int(os.getenv("PUBLIC_RESEARCH_TOKEN_LIMIT", "5"))
 WHAPI_TOKEN = os.getenv("WHAPI_TOKEN", "")
 WHATSAPP_GROUP_ID = os.getenv("WHATSAPP_GROUP_ID", "")
 SOCIALDATA_API_KEY = os.getenv("SOCIALDATA_API_KEY", "")
@@ -530,7 +532,37 @@ def is_private_chat(msg: dict) -> bool:
 
 def is_admin_update(msg: dict) -> bool:
     user_id = str(msg.get("from", {}).get("id", ""))
-    return user_id == ADMIN_USER_ID or is_authorized_update(msg)
+    return user_id == ADMIN_USER_ID
+
+
+def telegram_user_id(msg: dict) -> str:
+    return str(msg.get("from", {}).get("id", "")).strip()
+
+
+def is_quota_exempt_user(msg: dict) -> bool:
+    return telegram_user_id(msg) == ADMIN_USER_ID
+
+
+async def consume_public_research_quota_for_message(msg: dict) -> tuple[bool, int, int]:
+    if is_quota_exempt_user(msg):
+        return True, 0, PUBLIC_RESEARCH_TOKEN_LIMIT
+    user_id = telegram_user_id(msg)
+    async with db_session() as db:
+        return await consume_user_command_quota(
+            db,
+            telegram_user_id=user_id,
+            command_key="research",
+            limit=PUBLIC_RESEARCH_TOKEN_LIMIT,
+        )
+
+
+def format_research_quota_exhausted(used: int, limit: int) -> str:
+    return (
+        "🔒 <b>Research limit reached</b>\n\n"
+        f"Free access allows <b>{limit}</b> token research requests.\n"
+        f"Used: <b>{used}/{limit}</b>.\n\n"
+        "Ask the bot owner for extended access."
+    )
 
 
 def telegram_user_title(msg: dict) -> str:
@@ -1776,6 +1808,10 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                     await send_telegram(session, "🔍 <b>Research</b>\n<code>/research 0x...</code>\n<code>/research $TICKER</code>", chat_id)
                     continue
                 ticker_query = parts[1].strip()
+                allowed, used, limit = await consume_public_research_quota_for_message(msg)
+                if not allowed:
+                    await send_telegram(session, format_research_quota_exhausted(used, limit), chat_id)
+                    continue
                 await send_telegram(session, f"🔍 <b>Research queued</b>\n<code>{h(ticker_query)}</code>", chat_id)
 
                 async def do_research():

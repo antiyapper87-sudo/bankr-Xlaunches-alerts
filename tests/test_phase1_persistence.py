@@ -8,6 +8,7 @@ import pytest_asyncio
 
 from database import (
     close_db,
+    consume_user_command_quota,
     db_session,
     deactivate_watchlist_item,
     deactivate_tracked_wallet,
@@ -183,6 +184,74 @@ async def test_public_start_tenant_receives_all_default_signal_sources(db_url):
 
         assert tenant.external_id == "544999608"
         assert inserted == 1
+
+
+@pytest.mark.asyncio
+async def test_public_research_quota_allows_five_requests(db_url):
+    async with db_session() as db:
+        results = [
+            await consume_user_command_quota(
+                db,
+                telegram_user_id="700100",
+                command_key="research",
+                limit=5,
+            )
+            for _ in range(6)
+        ]
+
+    assert [allowed for allowed, _, _ in results] == [True, True, True, True, True, False]
+    assert results[-1] == (False, 5, 5)
+
+
+@pytest.mark.asyncio
+async def test_admin_research_quota_is_exempt(db_url):
+    import main
+
+    msg = {"from": {"id": int(main.ADMIN_USER_ID)}}
+    for _ in range(8):
+        allowed, used, limit = await main.consume_public_research_quota_for_message(msg)
+        assert allowed is True
+        assert used == 0
+        assert limit == main.PUBLIC_RESEARCH_TOKEN_LIMIT
+
+
+def test_admin_commands_are_strictly_owner_only(monkeypatch):
+    import main
+
+    monkeypatch.setattr(main, "ADMIN_USER_ID", "544999608")
+    monkeypatch.setattr(main, "AUTHORIZED_USER_IDS", {"700200"})
+
+    assert main.is_authorized_update({"from": {"id": 700200}, "chat": {"id": 1}}) is True
+    assert main.is_admin_update({"from": {"id": 700200}, "chat": {"id": 1}}) is False
+    assert main.is_admin_update({"from": {"id": 544999608}, "chat": {"id": 1}}) is True
+
+
+@pytest.mark.asyncio
+async def test_research_quota_stress_for_20_public_traders(db_url):
+    async with db_session() as db:
+        blocked = 0
+        for user_idx in range(20):
+            user_id = str(800000 + user_idx)
+            for _ in range(5):
+                allowed, used, limit = await consume_user_command_quota(
+                    db,
+                    telegram_user_id=user_id,
+                    command_key="research",
+                    limit=5,
+                )
+                assert allowed is True
+                assert 1 <= used <= limit
+            allowed, used, limit = await consume_user_command_quota(
+                db,
+                telegram_user_id=user_id,
+                command_key="research",
+                limit=5,
+            )
+            assert allowed is False
+            assert used == limit == 5
+            blocked += 1
+
+    assert blocked == 20
 
 
 @pytest.mark.asyncio

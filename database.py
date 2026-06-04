@@ -92,6 +92,23 @@ class User(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
 
 
+class UserCommandUsage(Base):
+    __tablename__ = "user_command_usage"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    telegram_user_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    command_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    usage_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
+
+    __table_args__ = (
+        UniqueConstraint("telegram_user_id", "command_key", name="uq_user_command_usage_user_command"),
+        Index("ix_user_command_usage_user", "telegram_user_id"),
+    )
+
+
 class TenantMember(Base):
     __tablename__ = "tenant_members"
 
@@ -389,6 +406,44 @@ async def update_tenant_min_score(db: AsyncSession, *, tenant_id: int, min_score
     settings.updated_at = utc_now()
     await db.flush()
     return settings
+
+
+async def consume_user_command_quota(
+    db: AsyncSession,
+    *,
+    telegram_user_id: str,
+    command_key: str,
+    limit: int,
+) -> tuple[bool, int, int]:
+    telegram_user_id = str(telegram_user_id or "").strip()
+    command_key = str(command_key or "").strip().lower()
+    limit = int(limit)
+    if not telegram_user_id or not command_key:
+        return False, 0, limit
+
+    stmt = select(UserCommandUsage).where(
+        UserCommandUsage.telegram_user_id == telegram_user_id,
+        UserCommandUsage.command_key == command_key,
+    )
+    row = await db.scalar(stmt)
+    now = utc_now()
+    if row is None:
+        row = UserCommandUsage(
+            telegram_user_id=telegram_user_id,
+            command_key=command_key,
+            usage_count=1,
+            last_used_at=now,
+        )
+        db.add(row)
+        await db.flush()
+        return True, 1, limit
+    if int(row.usage_count or 0) >= limit:
+        return False, int(row.usage_count or 0), limit
+    row.usage_count = int(row.usage_count or 0) + 1
+    row.last_used_at = now
+    row.updated_at = now
+    await db.flush()
+    return True, int(row.usage_count), limit
 
 
 async def upsert_launch(
