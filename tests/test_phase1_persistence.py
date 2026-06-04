@@ -17,6 +17,7 @@ from database import (
     get_due_delivery_retries,
     get_due_rechecks,
     get_tenant_settings,
+    get_telegram_callback_ref,
     get_status_snapshot,
     init_db,
     list_tracked_wallets,
@@ -36,6 +37,7 @@ from database import (
     upsert_wallet_event,
     upsert_watchlist_item,
     upsert_tenant,
+    upsert_telegram_callback_ref,
     utc_now,
 )
 from services.delivery import prepare_signal_fanout, prepare_tenant_delivery
@@ -699,6 +701,141 @@ def test_seed_existing_does_not_suppress_fresh_or_unknown_launch():
     assert main.should_seed_suppress_launch(fresh) is False
     assert main.should_seed_suppress_launch(unknown) is False
     assert main.should_seed_suppress_launch(old) is True
+
+
+def test_unknown_pair_age_requeues_dex_discovery_not_signal():
+    import main
+
+    dex = {"mcap": 120_000, "volume_24h": 80_000, "liquidity": 55_000, "pair_created_at": 0}
+
+    passes, reason = main.passes_market_filters(dex, source="dexscreener")
+
+    assert passes is False
+    assert "unknown pair age" in reason
+
+
+def test_launchpad_created_at_can_satisfy_missing_pair_age():
+    import main
+
+    dex = {"mcap": 120_000, "volume_24h": 80_000, "liquidity": 0, "pair_created_at": 0}
+    launch = {"created_at": utc_now().isoformat()}
+
+    passes, reason = main.passes_market_filters(dex, source="bankr", launch=launch)
+
+    assert passes is True
+    assert reason == ""
+
+
+def test_safe_join_blocks_does_not_cut_anchor_tag():
+    import main
+
+    blocks = [
+        "<b>Header</b>",
+        "<a href='https://example.com?a=1&amp;b=2'>safe link</a>",
+        "<b>Large</b> " + "x" * 5000,
+    ]
+
+    rendered = main.safe_join_blocks(blocks, limit=120, truncation_note="cut")
+
+    assert "<a href='https://example.com?a=1&amp;b=2'>safe link</a>" in rendered
+    assert "<b>Large</b>" not in rendered
+    assert "<i>cut</i>" in rendered
+
+
+def test_command_insert_keyboard_prefills_current_chat():
+    import main
+
+    keyboard = main.build_command_insert_keyboard("/research")
+
+    button = keyboard["inline_keyboard"][0][0]
+    assert button["switch_inline_query_current_chat"] == "/research "
+
+
+@pytest.mark.asyncio
+async def test_telegram_callback_ref_persists_short_ca_mapping(db_url):
+    token_ca = ca(94)
+    async with db_session() as db:
+        await upsert_telegram_callback_ref(db, key="0xabc123", kind="xsignal", ca=token_ca)
+
+    async with db_session() as db:
+        ref = await get_telegram_callback_ref(db, key="0xabc123", kind="xsignal")
+
+    assert ref is not None
+    assert ref.ca == token_ca
+
+
+def test_social_confirmation_provider_failure_is_retriable(monkeypatch):
+    import main
+
+    monkeypatch.setattr(main, "NITTER_ENABLED", True)
+    monkeypatch.setattr(main, "NITTER_BASE_URLS", ["https://nitter.local"])
+    main.nitter_health_state["ok"] = False
+    evidence = {
+        "fetch_strategy": {
+            "socialdata_called": False,
+            "latest_count": 0,
+        }
+    }
+
+    status = main.classify_social_fetch_failure(evidence)
+    payload = main.social_status_payload(status, evidence)
+
+    assert status == main.SocialConfirmationStatus.PROVIDER_UNAVAILABLE
+    assert main.is_social_confirmation_retriable("nitter down", payload) is True
+
+
+@pytest.mark.asyncio
+async def test_same_ticker_collision_blocks_watch_without_primary_evidence(monkeypatch):
+    from services import verdict_v2
+
+    research = {
+        "symbol": "COLLIDE",
+        "market": {"mcap": 500_000, "volume_24h": 400_000, "liquidity": 120_000, "pair_created_at": 1},
+        "source": {"source": "dexscreener"},
+        "social": {
+            "qualified_tweets": 20,
+            "total_followers": 500_000,
+            "total_likes": 500,
+            "max_score": 20,
+            "avg_thesis_quality": 7,
+            "evidence_count": 20,
+            "project_value_score": 20,
+            "social_score": 90,
+            "source_provenance": {"ticker_strong": 20},
+            "project_value": "Utility / Tech",
+            "evidence_thesis": "Ticker narrative is strong but not contract-confirmed.",
+        },
+        "project_narrative": {
+            "same_ticker_collision": True,
+            "product": "Ticker context only.",
+            "confidence": "LOW",
+            "is_ticker_only_evidence": True,
+        },
+    }
+
+    async def fake_get_latest_token_research(db, ca):
+        return SimpleNamespace(id=1, processed_data=research)
+
+    async def fake_list_spoof_signals(db, ca):
+        return []
+
+    async def fake_create_verdict_v2(db, **kwargs):
+        return SimpleNamespace(id=123)
+
+    monkeypatch.setattr(verdict_v2, "get_latest_token_research", fake_get_latest_token_research)
+    monkeypatch.setattr(verdict_v2, "list_spoof_signals", fake_list_spoof_signals)
+    monkeypatch.setattr(verdict_v2, "create_verdict_v2", fake_create_verdict_v2)
+
+    verdict = await verdict_v2.build_verdict_v2(
+        None,
+        ca=ca(95),
+        launch={"symbol": "COLLIDE", "name": "Collide", "source": "dexscreener"},
+        dex=research["market"],
+    )
+
+    assert verdict["label"] == "SKIP"
+    assert verdict["score"] <= 55
+    assert "Collision" in verdict["human_readable"]
 
 
 def socialdata_tweet(

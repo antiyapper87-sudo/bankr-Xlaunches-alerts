@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 from sqlalchemy import (
@@ -296,6 +296,18 @@ class BotState(Base):
 
     key: Mapped[str] = mapped_column(String(128), primary_key=True)
     value: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
+
+
+class TelegramCallbackRef(Base):
+    __tablename__ = "telegram_callback_refs"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    ca: Mapped[str] = mapped_column(String(42), nullable=False, index=True)
+    payload_json: Mapped[dict[str, Any] | None] = mapped_column(JSONCompat)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
 
 
@@ -1513,6 +1525,58 @@ async def set_bot_state(db: AsyncSession, key: str, value: str | dict[str, Any])
         row.updated_at = utc_now()
     else:
         db.add(BotState(key=key, value=payload))
+
+
+async def upsert_telegram_callback_ref(
+    db: AsyncSession,
+    *,
+    key: str,
+    kind: str,
+    ca: str,
+    payload_json: dict[str, Any] | None = None,
+    expires_at: datetime | None = None,
+) -> TelegramCallbackRef:
+    key = str(key or "").strip().lower()[:64]
+    ca = normalize_ca(ca)
+    if not key or not ca:
+        raise ValueError("callback key and ca are required")
+    row = await db.get(TelegramCallbackRef, key)
+    now = utc_now()
+    if row:
+        row.kind = kind[:32]
+        row.ca = ca
+        row.payload_json = payload_json
+        row.expires_at = expires_at or (now + timedelta(days=7))
+        row.updated_at = now
+        return row
+    row = TelegramCallbackRef(
+        key=key,
+        kind=kind[:32],
+        ca=ca,
+        payload_json=payload_json,
+        expires_at=expires_at or (now + timedelta(days=7)),
+    )
+    db.add(row)
+    await db.flush()
+    return row
+
+
+async def get_telegram_callback_ref(
+    db: AsyncSession,
+    *,
+    key: str,
+    kind: str | None = None,
+    now: datetime | None = None,
+) -> TelegramCallbackRef | None:
+    now = now or utc_now()
+    row = await db.get(TelegramCallbackRef, str(key or "").strip().lower()[:64])
+    if not row:
+        return None
+    if kind and row.kind != kind:
+        return None
+    if ensure_aware(row.expires_at) <= now:
+        return None
+    return row
 
 
 async def get_status_snapshot(db: AsyncSession) -> dict[str, Any]:

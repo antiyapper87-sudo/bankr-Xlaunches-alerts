@@ -99,6 +99,26 @@ def label_for_score(score: float, hard_risks: list[str]) -> str:
     return "SKIP"
 
 
+def primary_social_evidence_count(research: dict[str, Any]) -> int:
+    social = research.get("social") or {}
+    provenance = social.get("source_provenance") or {}
+    trust = social.get("trust_summary") or {}
+    return (
+        int(provenance.get("ca_confirmed") or trust.get("ca_confirmed") or 0)
+        + int(provenance.get("pair_confirmed") or trust.get("pair_confirmed") or 0)
+        + int(provenance.get("project_confirmed") or trust.get("project_confirmed") or 0)
+    )
+
+
+def has_same_ticker_collision(research: dict[str, Any], risks: list[str]) -> bool:
+    project_narrative = research.get("project_narrative") or {}
+    if project_narrative.get("same_ticker_collision"):
+        return True
+    flags = " ".join(str(flag or "") for flag in research.get("flags") or []).lower()
+    risk_text = " ".join(str(risk or "") for risk in risks).lower()
+    return "ticker_collision" in flags or "same_ticker" in flags or "ticker collision" in risk_text or "same ticker" in risk_text
+
+
 def score_market(market: dict[str, Any], source: str) -> tuple[float, list[str], list[str]]:
     mcap = num(market.get("mcap"))
     volume = num(market.get("volume_24h"))
@@ -452,9 +472,9 @@ def format_evidence_refs(research: dict[str, Any], *, limit: int = 3) -> str:
         retweets = fmt_compact_int(int(item.get("retweets") or 0))
         label = f"[{ref}] @{username} ❤️ {likes} · 👁 {views} · 🔄 {retweets}"
         if url:
-            parts.append(f"<a href='{url}'>{label}</a>")
+            parts.append(f"<a href='{html.escape(str(url), quote=True)}'>{esc(label)}</a>")
         else:
-            parts.append(label)
+            parts.append(esc(label))
     return " · ".join(parts)
 
 
@@ -493,9 +513,17 @@ def build_human_readable(
     lore_context = str(project_narrative.get("key_lore_context") or "").strip()
     if len(lore_context) > 320:
         lore_context = lore_context[:317] + "..."
+    collision_warning = ""
+    if has_same_ticker_collision(research, risks):
+        primary_count = primary_social_evidence_count(research)
+        collision_warning = (
+            f"⚠️ <b>Collision:</b> same-ticker risk detected; primary evidence {primary_count}/5. "
+            "Treat ticker narrative as unsafe until this CA is proven.\n\n"
+        )
     return (
         f"🧠 <b>AI brief</b> • Score <b>{score / 10:.1f}/10</b> · <b>{label}</b>\n\n"
-        f"• <b>Type:</b> {esc(project_value)}\n"
+        + collision_warning
+        + f"• <b>Type:</b> {esc(project_value)}\n"
         f"• <b>Product:</b> {esc(product_line)}\n"
         f"• <b>Thesis:</b> {esc(thesis_line)}\n"
         + (f"• <b>Key Lore / Context:</b> {esc(lore_context)}\n" if lore_context else "")
@@ -549,6 +577,20 @@ async def build_verdict_v2(
     score = round(clamp(raw_score, 0, 100), 1)
     label = label_for_score(score, risks)
     confidence = confidence_for(research, spoof)
+    same_ticker_collision = has_same_ticker_collision(research, risks)
+    primary_count = primary_social_evidence_count(research)
+    if same_ticker_collision and primary_count < 5:
+        score = min(score, 55.0)
+        label = "SKIP"
+        confidence = "low"
+        if "same-ticker collision with weak primary evidence" not in risks:
+            risks.insert(0, "same-ticker collision with weak primary evidence")
+    elif same_ticker_collision:
+        score = min(score, 71.0)
+        if label == "WATCH":
+            label = "WAIT"
+        if "same-ticker collision caps conviction" not in risks:
+            risks.insert(0, "same-ticker collision caps conviction")
     symbol = (launch.get("symbol") or research.get("symbol") or "").lstrip("$")
     token_name = launch.get("name") or symbol or ca
     human = build_human_readable(

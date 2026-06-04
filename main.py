@@ -27,6 +27,7 @@ import time
 import html
 import hashlib
 import xml.etree.ElementTree as ET
+from enum import Enum
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
@@ -68,6 +69,7 @@ from database import (
     get_tenant,
     get_tenant_settings,
     get_status_snapshot,
+    get_telegram_callback_ref,
     init_db,
     list_tracked_wallets,
     list_watchlist_items,
@@ -89,6 +91,7 @@ from database import (
     update_tenant_min_score,
     upsert_user_feedback,
     upsert_launch,
+    upsert_telegram_callback_ref,
     upsert_tracked_wallet,
     upsert_wallet_event,
     upsert_watchlist_item,
@@ -674,6 +677,15 @@ def build_admin_keyboard() -> dict:
     }
 
 
+def build_command_insert_keyboard(command: str) -> dict:
+    command = command.strip()
+    return {
+        "inline_keyboard": [
+            [{"text": f"Insert {command}", "switch_inline_query_current_chat": f"{command} "}],
+        ]
+    }
+
+
 _address_map: dict[str, str] = {}
 _xsignal_page_cache: dict[str, dict] = {}
 XSIGNAL_PAGE_SIZE = 6
@@ -948,7 +960,7 @@ async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: 
         except ValueError:
             await answer_callback_query(session, callback_id, "Invalid Fomo chain", show_alert=True)
             return
-        ca = _address_map.get(parts[2].strip().lower(), parts[2].strip().lower())
+        ca = await resolve_callback_address(parts[2].strip().lower())
         if not is_base_contract(ca):
             await answer_callback_query(session, callback_id, "Invalid token address", show_alert=True)
             return
@@ -973,7 +985,7 @@ async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: 
         except ValueError:
             await answer_callback_query(session, callback_id, "Invalid page", show_alert=True)
             return
-        ca = _address_map.get(key, key)
+        ca = await resolve_callback_address(key)
         if not is_base_contract(ca):
             await answer_callback_query(session, callback_id, "Invalid token address", show_alert=True)
             return
@@ -1058,7 +1070,7 @@ async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: 
     action, second, addr_truncated = parts
 
     if action == "copyca":
-        full_address = _address_map.get(addr_truncated, addr_truncated)
+        full_address = await resolve_callback_address(addr_truncated)
         await answer_callback_query(session, callback_id, "📋 Contract address sent below")
         await send_telegram(session, f"<code>{full_address}</code>", chat_id=chat_id)
         return
@@ -1066,7 +1078,7 @@ async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: 
     if action == "xresearch":
         symbol = second
         await answer_callback_query(session, callback_id, f"🔍 Searching X for ${symbol}...")
-        full_address = _address_map.get(addr_truncated, addr_truncated)
+        full_address = await resolve_callback_address(addr_truncated)
 
         async def do_x_research():
             try:
@@ -1398,7 +1410,7 @@ def build_watchlist_message(items: list, page: int = 1, launches: dict[str, obje
             index += 1
             lines.append(format_watchlist_item(item, launches.get(item.ca), index)["text"])
         lines.append("")
-    return "\n".join(lines)[:3900]
+    return safe_join_blocks(lines, limit=3900, truncation_note="Watchlist truncated.", separator="\n")
 
 
 def format_watch_added_message(item, launch=None, *, inserted: bool = True) -> str:
@@ -1686,6 +1698,7 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                         "<code>/watch 0x... [label]</code>\n"
                         "<code>/watch $TICKER [label]</code>",
                         chat_id,
+                        reply_markup=build_command_insert_keyboard("/watch"),
                     )
                     continue
                 tenant = await ensure_tenant_for_chat(chat_id, title=telegram_user_title(msg))
@@ -1810,7 +1823,14 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
             elif cmd in ("/research", "/r"):
                 parts = text.split(maxsplit=1)
                 if len(parts) < 2:
-                    await send_telegram(session, "🔍 <b>Research</b>\n<code>/research 0x...</code>\n<code>/research $TICKER</code>", chat_id)
+                    await send_telegram(
+                        session,
+                        "🔍 <b>Research token</b>\n"
+                        "<code>/research 0x...</code>\n"
+                        "<code>/research $TICKER</code>",
+                        chat_id,
+                        reply_markup=build_command_insert_keyboard("/research"),
+                    )
                     continue
                 ticker_query = parts[1].strip()
                 allowed, used, limit = await consume_public_research_quota_for_message(msg)
@@ -2242,7 +2262,18 @@ async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str
 MAX_TOKEN_AGE = int(os.getenv("MAX_TOKEN_AGE", str(4 * 3600)))
 
 
-def passes_market_filters(dex: dict | None, source: str = "", *, enforce_age: bool = True) -> tuple[bool, str]:
+def has_reliable_launchpad_age(launch: dict | None) -> bool:
+    age = launch_age_seconds(launch or {})
+    return age is not None and age <= MAX_TOKEN_AGE
+
+
+def passes_market_filters(
+    dex: dict | None,
+    source: str = "",
+    *,
+    enforce_age: bool = True,
+    launch: dict | None = None,
+) -> tuple[bool, str]:
     """Check if token passes market filters.
 
     For safe launchpads (bankr, clanker, virtuals) — skip liquidity check
@@ -2261,9 +2292,10 @@ def passes_market_filters(dex: dict | None, source: str = "", *, enforce_age: bo
             age_hours = age_seconds / 3600
             return False, f"too old ({age_hours:.1f}h > {MAX_TOKEN_AGE//3600}h)"
     elif enforce_age:
-        mcap_check = float(dex.get("mcap", 0))
-        if mcap_check > 200_000:
-            return False, f"no creation time + high mcap ${mcap_check:,.0f}, likely old"
+        if is_safe and has_reliable_launchpad_age(launch):
+            pass
+        else:
+            return False, "unknown pair age; waiting for reliable creation time"
 
     mcap = dex.get("mcap", 0)
     vol = dex.get("volume_24h", 0)
@@ -3241,6 +3273,48 @@ async def build_deep_social_evidence(
     return evidence
 
 
+class SocialConfirmationStatus(str, Enum):
+    VERIFIED = "verified"
+    NO_EVIDENCE = "no_evidence"
+    PROVIDER_UNAVAILABLE = "provider_unavailable"
+    BUDGET_EXHAUSTED = "budget_exhausted"
+    CONFIG_MISSING = "config_missing"
+
+
+def social_status_payload(status: SocialConfirmationStatus, payload: dict | None = None) -> dict:
+    result = dict(payload or {})
+    result["status"] = status.value
+    result.setdefault("verified", status == SocialConfirmationStatus.VERIFIED)
+    return result
+
+
+def is_social_confirmation_retriable(reason: str, evidence: dict | None) -> bool:
+    status = (evidence or {}).get("status") or ""
+    if status in {
+        SocialConfirmationStatus.PROVIDER_UNAVAILABLE.value,
+        SocialConfirmationStatus.BUDGET_EXHAUSTED.value,
+        SocialConfirmationStatus.CONFIG_MISSING.value,
+    }:
+        return True
+    lower = str(reason or "").lower()
+    return any(term in lower for term in ("unavailable", "missing", "budget", "cooldown", "disabled", "down"))
+
+
+def classify_social_fetch_failure(social_evidence: dict) -> SocialConfirmationStatus:
+    fetch_strategy = social_evidence.get("fetch_strategy") or {}
+    if not SOCIALDATA_API_KEY:
+        return SocialConfirmationStatus.CONFIG_MISSING
+    if not NITTER_ENABLED or not NITTER_BASE_URLS:
+        return SocialConfirmationStatus.PROVIDER_UNAVAILABLE
+    if nitter_health_state.get("ok") is False and not fetch_strategy.get("latest_count"):
+        return SocialConfirmationStatus.PROVIDER_UNAVAILABLE
+    if not fetch_strategy.get("socialdata_called"):
+        return SocialConfirmationStatus.PROVIDER_UNAVAILABLE
+    if fetch_strategy.get("socialdata_called") and not fetch_strategy.get("top_count"):
+        return SocialConfirmationStatus.NO_EVIDENCE
+    return SocialConfirmationStatus.NO_EVIDENCE
+
+
 async def validate_ca_social_confirmation(
     session: aiohttp.ClientSession,
     *,
@@ -3249,11 +3323,11 @@ async def validate_ca_social_confirmation(
 ) -> tuple[bool, str, dict]:
     """Require social evidence to mention the exact contract, not only the ticker."""
     if not REQUIRE_CA_SOCIAL_CONFIRMATION:
-        return True, "CA social confirmation disabled", {"enabled": False}
+        return True, "CA social confirmation disabled", social_status_payload(SocialConfirmationStatus.VERIFIED, {"enabled": False})
     if not address:
-        return False, "missing contract address for CA social confirmation", {}
+        return False, "missing contract address for CA social confirmation", social_status_payload(SocialConfirmationStatus.NO_EVIDENCE, {})
     if not SOCIALDATA_API_KEY:
-        return False, "SocialData key missing; CA social confirmation unavailable", {}
+        return False, "SocialData key missing; CA social confirmation unavailable", social_status_payload(SocialConfirmationStatus.CONFIG_MISSING, {})
 
     social_evidence = await build_deep_social_evidence(
         session,
@@ -3273,6 +3347,7 @@ async def validate_ca_social_confirmation(
         )[:5]
         evidence = {
             "enabled": True,
+            "status": SocialConfirmationStatus.VERIFIED.value,
             "verified": True,
             "query_mode": "ca_only",
             "qualified_tweets": len(ca_mentions),
@@ -3301,15 +3376,16 @@ async def validate_ca_social_confirmation(
 
     fetch_strategy = social_evidence.get("fetch_strategy") or {}
     if not fetch_strategy.get("socialdata_called"):
+        status = classify_social_fetch_failure(social_evidence)
         return (
             False,
             f"no Nitter alpha for CA; SocialData Top skipped ({fetch_strategy.get('alpha_reason') or 'no_alpha'})",
-            {
+            social_status_payload(status, {
                 "enabled": True,
                 "verified": False,
                 "query_mode": "ca_only",
                 "social_evidence": social_evidence,
-            },
+            }),
         )
 
     ticker_mentions = await search_x_mentions(session, ticker, address="", min_count=0)
@@ -3317,14 +3393,17 @@ async def validate_ca_social_confirmation(
         return (
             False,
             f"ticker-qualified tweets found but no CA-qualified tweets; possible false contract/ticker hijack",
-            {
+            social_status_payload(SocialConfirmationStatus.NO_EVIDENCE, {
                 "enabled": True,
                 "verified": False,
                 "query_mode": "ca_only",
                 "ticker_only_tweets": len(ticker_mentions),
-            },
+            }),
         )
-    return False, "no CA-qualified X mentions passed filters", {"enabled": True, "verified": False, "query_mode": "ca_only"}
+    return False, "no CA-qualified X mentions passed filters", social_status_payload(
+        SocialConfirmationStatus.NO_EVIDENCE,
+        {"enabled": True, "verified": False, "query_mode": "ca_only"},
+    )
 
 
 async def resolve_deployer_x(session: aiohttp.ClientSession, address: str) -> dict:
@@ -3536,6 +3615,9 @@ async def research_token(
         "latest_count": len(nitter_mentions),
         "top_count": len(x_mentions),
     }
+    if address:
+        remember_xsignal_evidence(address, social_evidence)
+        await persist_callback_ref(xsignal_cache_key(address), address, kind="xsignal")
     for mode, fetch in (("ca", ca_fetch), ("ticker", ticker_fetch)):
         if not fetch or not fetch.socialdata_called:
             continue
@@ -3707,7 +3789,7 @@ def format_watch_ambiguous_message(query: str, candidates: list[dict]) -> str:
         ])
     if len(candidates) > 8:
         lines.append(f"\n+{len(candidates) - 8} more candidates hidden.")
-    return "\n".join(lines)[:3900]
+    return safe_join_blocks(lines, limit=3900, truncation_note="Candidate list truncated.", separator="\n")
 
 
 async def resolve_watch_target(session: aiohttp.ClientSession, query: str) -> tuple[str, dict, dict | None]:
@@ -4284,6 +4366,32 @@ def h(value) -> str:
     return html.escape(str(value or ""), quote=True)
 
 
+def safe_join_blocks(
+    blocks: list[str],
+    *,
+    limit: int = 3900,
+    truncation_note: str = "Output truncated.",
+    separator: str = "\n\n",
+) -> str:
+    out: list[str] = []
+    size = 0
+    for block in blocks:
+        block = str(block or "").strip()
+        if not block:
+            continue
+        extra = len(block) + (len(separator) if out else 0)
+        if size + extra > limit:
+            break
+        out.append(block)
+        size += extra
+    if len(out) < len([block for block in blocks if str(block or "").strip()]) and truncation_note:
+        note = f"<i>{h(truncation_note)}</i>"
+        extra = len(note) + (len(separator) if out else 0)
+        if size + extra <= limit:
+            out.append(note)
+    return separator.join(out)
+
+
 def clean_x_handle(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_]", "", str(value or "").strip().lstrip("@"))[:32]
 
@@ -4669,6 +4777,34 @@ def remember_xsignal_evidence(address: str, social_evidence: dict | None) -> Non
     _xsignal_page_cache[key] = social_evidence
 
 
+async def persist_callback_ref(key: str, address: str, *, kind: str = "xsignal", payload: dict | None = None) -> None:
+    if not key or not is_base_contract(address):
+        return
+    async with db_session() as db:
+        await upsert_telegram_callback_ref(
+            db,
+            key=key,
+            kind=kind,
+            ca=address.lower(),
+            payload_json=payload,
+            expires_at=utc_now() + timedelta(days=14),
+        )
+
+
+async def resolve_callback_address(key: str, *, kind: str = "xsignal") -> str:
+    candidate = str(key or "").strip().lower()
+    if is_base_contract(candidate):
+        return candidate
+    if candidate in _address_map and is_base_contract(_address_map[candidate]):
+        return _address_map[candidate].lower()
+    async with db_session() as db:
+        ref = await get_telegram_callback_ref(db, key=candidate, kind=kind)
+    if ref and is_base_contract(ref.ca):
+        _address_map[candidate] = ref.ca.lower()
+        return ref.ca.lower()
+    return candidate
+
+
 def xsignal_visible_tweets(social_evidence: dict | None) -> list[dict]:
     tweets = (social_evidence or {}).get("top_tweets") or []
     return [
@@ -4838,7 +4974,7 @@ def format_research_social_block(
             continue
         text = h(clean_text[:300])
         lines.append(
-            f"• {marker} <a href='{item.get('url')}'>@{author}</a>{hp} · "
+            f"• {marker} <a href='{h(item.get('url'))}'>@{author}</a>{hp} · "
             f"❤️ {likes} · 👁 {views} · 🔄 {retweets}\n"
             f"  <i>{text}</i>"
         )
@@ -4886,7 +5022,7 @@ def format_research_card(
     elif launch_status:
         status_line = f"\n🗂 Scanner status: <code>{h(launch_status)}</code>"
 
-    body = (
+    header = (
         f"🔍 <b>{h(title)}</b> 🧪 <b>{h(source)}</b>\n\n"
         f"<b>{safe_name}</b> - ${safe_ticker}\n\n"
         f"🕐 <b>Launched:</b> {h(age + ' ago' if age != 'n/a' else 'n/a')}\n"
@@ -4894,8 +5030,11 @@ def format_research_card(
         f"•📈 <b>Volume:</b> {fmt_usd(volume)}\n"
         f"•💧 <b>Liquidity:</b> {fmt_usd(liquidity)}\n"
         f"•{one_h_emoji} <b>1h:</b> {change_1h:+.1f}%{status_line}\n\n"
-        + (f"🔗 " + " · ".join(links) + "\n\n" if links else "")
-        + format_research_ai_brief(
+        + (f"🔗 " + " · ".join(links) if links else "")
+    )
+    blocks = [
+        header,
+        format_research_ai_brief(
             token_name=token_name,
             ticker=ticker,
             dex=dex,
@@ -4905,18 +5044,17 @@ def format_research_card(
             social_evidence=social_evidence,
             project_narrative=project_narrative,
             launch_status=launch_status,
-        )
-        + "\n\n"
-        + format_research_social_block(
+        ),
+        format_research_social_block(
             ticker,
             x_mentions,
             influencer_mentions,
             nitter_mentions=nitter_mentions,
             social_evidence=social_evidence,
             address=address,
-        )
-    )
-    return body[:3900]
+        ),
+    ]
+    return safe_join_blocks(blocks, limit=3900, truncation_note="Research output truncated.")
 
 
 SOURCE_EMOJIS = {"bankr": "🤖", "clanker": "⚙️", "virtuals": "🤖", "dexscreener": "📊", "coingecko": "🦎"}
@@ -5545,7 +5683,7 @@ def format_verdict2_report(result: dict) -> str:
     ]
     if summary:
         lines.extend(["", f"📝 <b>Summary</b>\n{h(summary.get('summary_text', ''))}"])
-    return "\n".join(lines)[:3900]
+    return safe_join_blocks(["\n".join(lines)], limit=3900, truncation_note="Verdict output truncated.")
 
 
 def format_spoof_report(result: dict) -> str:
@@ -5567,20 +5705,24 @@ def format_spoof_report(result: dict) -> str:
             lines.append(f"• <b>{h(signal.get('severity'))}</b> -{impact:.0f} · {h(signal.get('title'))}")
             if signal.get("details"):
                 lines.append(f"  {h(signal.get('details'))}")
-    return "\n".join(lines)[:3900]
+    return safe_join_blocks(["\n".join(lines)], limit=3900, truncation_note="Spoof output truncated.")
 
 
 def format_summary_report(result: dict) -> str:
     launch = result.get("launch") or {}
     summary = result.get("summary") or {}
     verdict = result.get("verdict") or {}
-    return (
-        f"🧠 <b>Summary</b> · ${h(launch.get('symbol') or '')}\n"
-        f"<code>{h(launch.get('ca') or '')}</code>\n\n"
-        f"{h(command_market_line(result))}\n\n"
-        f"{h(summary.get('summary_text') or 'Summary unavailable')}\n\n"
-        f"<b>{h(verdict.get('label'))}</b> · {float(verdict.get('score') or 0) / 10:.1f}/10"
-    )[:3900]
+    return safe_join_blocks(
+        [
+            f"🧠 <b>Summary</b> · ${h(launch.get('symbol') or '')}\n"
+            f"<code>{h(launch.get('ca') or '')}</code>",
+            h(command_market_line(result)),
+            h(summary.get("summary_text") or "Summary unavailable"),
+            f"<b>{h(verdict.get('label'))}</b> · {float(verdict.get('score') or 0) / 10:.1f}/10",
+        ],
+        limit=3900,
+        truncation_note="Summary output truncated.",
+    )
 
 
 async def analyze_ca_for_command(
@@ -5614,6 +5756,7 @@ async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, s
 
     addr_truncated = address[:20]
     _address_map[addr_truncated] = address
+    await persist_callback_ref(addr_truncated, address, kind="xsignal")
 
     tg_text = format_signal_telegram(launch, dex)
     wa_text = format_alert_whatsapp(launch, dex)
@@ -5792,8 +5935,13 @@ async def build_signal_verdict_text(
         )
         if "🐦 <b>X Signal</b>" not in new_text:
             new_text = f"{new_text}\n\n{xsignal_block}"
+        await persist_callback_ref(xsignal_cache_key(address), address, kind="xsignal")
     if len(new_text) > 3900:
-        new_text = new_text[:3800] + "\n\n<i>Verdict 2.0 truncated</i>"
+        new_text = safe_join_blocks(
+            [base_text, verdict_block, xsignal_block if evidence_tweets else ""],
+            limit=3900,
+            truncation_note="Verdict 2.0 truncated.",
+        )
     log.info(
         f"  🧠 Verdict 2.0: [{source}] ${symbol} → "
         f"{verdict.get('label')} ({float(verdict.get('score') or 0) / 10:.1f}/10)"
@@ -6041,7 +6189,7 @@ async def main():
                         launch["dex_id"] = dex.get("dex_id") or launch.get("dex_id", "")
                         symbol = launch["symbol"]
 
-                    passes, reason = passes_market_filters(dex, source=source)
+                    passes, reason = passes_market_filters(dex, source=source, launch=launch)
 
                     if not passes:
                         if "too old" in reason or "likely old" in reason:
@@ -6069,6 +6217,10 @@ async def main():
                         address=address,
                     )
                     if not social_ok:
+                        if is_social_confirmation_retriable(social_reason, social_evidence):
+                            await persist_recheck(address, social_reason, no_data=False, dex=dex)
+                            log.info(f"  🕒 [{source}] ${symbol} — {social_reason}, social provider degraded → recheck")
+                            continue
                         async with db_session() as db:
                             await mark_launch_status(
                                 db,
@@ -6121,7 +6273,7 @@ async def main():
                     gecko_cache.pop(addr, None)
                     dex = await fetch_geckoterminal(session, addr)
 
-                    passes, reason = passes_market_filters(dex, source=source)
+                    passes, reason = passes_market_filters(dex, source=source, launch=launch)
                     if not passes:
                         if "too old" in reason or "likely old" in reason:
                             log.debug(f"  ♻️ [{source}] ${symbol} — {reason}, dropping")
@@ -6143,6 +6295,10 @@ async def main():
                         address=addr,
                     )
                     if not social_ok:
+                        if is_social_confirmation_retriable(social_reason, social_evidence):
+                            await persist_recheck(addr, social_reason, no_data=False, dex=dex)
+                            log.info(f"  🕒 [{source}] ${symbol} recheck — {social_reason}, social provider degraded → recheck")
+                            continue
                         async with db_session() as db:
                             await mark_launch_status(
                                 db,
