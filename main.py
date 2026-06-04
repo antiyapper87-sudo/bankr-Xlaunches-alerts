@@ -1111,17 +1111,25 @@ def watch_market(item) -> dict:
     return dict(item.last_market_json or {})
 
 
+def launch_field(launch, key: str, default: str = "") -> str:
+    if not launch:
+        return default
+    if isinstance(launch, dict):
+        return str(launch.get(key) or default)
+    return str(getattr(launch, key, default) or default)
+
+
 def watch_symbol_name(item, launch=None) -> tuple[str, str]:
     market = watch_market(item)
     symbol = (
-        (launch.ticker if launch else "")
+        launch_field(launch, "ticker") or launch_field(launch, "symbol")
         or market.get("token_symbol")
         or market.get("symbol")
         or item.label
         or short_ca(item.ca)
     )
     name = (
-        (launch.name if launch else "")
+        launch_field(launch, "name")
         or market.get("token_name")
         or market.get("name")
         or item.label
@@ -1583,17 +1591,23 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
 
             elif cmd == "/watch":
                 parts = text.split(maxsplit=2)
-                ca = parts[1].strip().lower() if len(parts) >= 2 else ""
+                watch_query = parts[1].strip() if len(parts) >= 2 else ""
                 label = parts[2].strip() if len(parts) >= 3 else ""
-                if not is_base_contract(ca):
-                    await send_telegram(session, "⭐ <b>Watch token</b>\n<code>/watch 0x... [label]</code>", chat_id)
+                if not watch_query:
+                    await send_telegram(
+                        session,
+                        "⭐ <b>Watch token</b>\n"
+                        "<code>/watch 0x... [label]</code>\n"
+                        "<code>/watch $TICKER [label]</code>",
+                        chat_id,
+                    )
                     continue
                 tenant = await ensure_tenant_for_chat(chat_id, title=telegram_user_title(msg))
-                await send_telegram(session, "⭐ <b>Watchlist update queued</b>", chat_id)
+                await send_telegram(session, f"⭐ <b>Watchlist update queued</b>\n{h(watch_query)}", chat_id)
 
                 async def do_watch():
                     try:
-                        launch, dex = await ensure_launch_for_analysis(session, ca)
+                        ca, launch, dex = await resolve_watch_target(session, watch_query)
                         async with db_session() as db:
                             item, inserted = await upsert_watchlist_item(db, tenant_id=tenant.id, ca=ca, label=label, market_json=dex)
                             await upsert_user_feedback(
@@ -1610,10 +1624,10 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                             reply_markup=build_watch_item_keyboard(item, launch),
                         )
                     except Exception as e:
-                        log.error(f"Watch command failed for {ca}: {e}", exc_info=True)
+                        log.error(f"Watch command failed for {watch_query}: {e}", exc_info=True)
                         await send_telegram(session, f"❌ <b>Watch failed</b>\n{h(str(e)[:160])}", chat_id)
 
-                track_background_command(f"watch {ca}", do_watch())
+                track_background_command(f"watch {watch_query}", do_watch())
 
             elif cmd == "/unwatch":
                 parts = text.split(maxsplit=1)
@@ -3345,6 +3359,72 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
         social_evidence=social_evidence,
         launch_status=launch_status,
     )
+
+
+def clean_watch_query(value: str) -> str:
+    return str(value or "").strip().lstrip("$")
+
+
+def gecko_search_pool_address(pool: dict) -> str:
+    base_addr = pool.get("relationships", {}).get("base_token", {}).get("data", {}).get("id", "")
+    return str(base_addr or "").replace("base_", "").lower()
+
+
+def gecko_search_pool_symbol(pool: dict) -> str:
+    pool_name = str((pool.get("attributes") or {}).get("name") or "")
+    return pool_name.split(" / ")[0].strip() if " / " in pool_name else pool_name.strip()
+
+
+def choose_gecko_search_pool(pools: list[dict], query: str) -> dict | None:
+    query_upper = clean_watch_query(query).upper()
+    best_pool = None
+    best_score = -1.0
+    for pool in pools:
+        pool_attrs = pool.get("attributes") or {}
+        vol_raw = pool_attrs.get("volume_usd") or {}
+        volume = float(vol_raw.get("h24") or 0)
+        reserve = float(pool_attrs.get("reserve_in_usd") or 0)
+        address = gecko_search_pool_address(pool)
+        if not is_base_contract(address):
+            continue
+        base_symbol = gecko_search_pool_symbol(pool).upper()
+        exact_bonus = 1_000_000_000 if base_symbol == query_upper else 0
+        score = exact_bonus + volume + reserve * 0.05
+        if score > best_score:
+            best_score = score
+            best_pool = pool
+    return best_pool
+
+
+async def resolve_watch_target(session: aiohttp.ClientSession, query: str) -> tuple[str, dict, dict | None]:
+    cleaned = clean_watch_query(query)
+    if not cleaned:
+        raise ValueError("missing token query")
+    if is_base_contract(cleaned):
+        launch, dex = await ensure_launch_for_analysis(session, cleaned.lower())
+        return cleaned.lower(), launch, dex
+
+    try:
+        url = f"{GECKOTERMINAL_API_URL}/search/pools?query={quote(cleaned)}&network=base&page=1"
+        headers = {"Accept": "application/json;version=20230302"}
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            if resp.status != 200:
+                raise ValueError(f"Base search returned {resp.status}")
+            data = await resp.json()
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"Base search failed for {cleaned}") from exc
+
+    best_pool = choose_gecko_search_pool(data.get("data", []) or [], cleaned)
+    if not best_pool:
+        raise ValueError(f"No Base token found for {cleaned}")
+    ca = gecko_search_pool_address(best_pool)
+    launch, dex = await ensure_launch_for_analysis(session, ca)
+    if dex:
+        dex.setdefault("token_symbol", gecko_search_pool_symbol(best_pool))
+        dex.setdefault("token_name", gecko_search_pool_symbol(best_pool))
+    return ca, launch, dex
 
 
 # ─── Bankr API ────────────────────────────────────────────────────────────────

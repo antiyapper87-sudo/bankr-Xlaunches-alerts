@@ -452,6 +452,33 @@ def test_watchlist_message_is_grouped_and_actionable(monkeypatch):
     assert keyboard and any(button["callback_data"].startswith("wl_research:") for row in keyboard["inline_keyboard"] for button in row if "callback_data" in button)
 
 
+def test_watch_symbol_name_accepts_launch_dict():
+    import main
+
+    item = SimpleNamespace(
+        ca=ca(43),
+        label=None,
+        last_market_json={},
+    )
+
+    assert main.watch_symbol_name(item, {"symbol": "VEIL", "name": "Veil Token"}) == ("VEIL", "Veil Token")
+
+
+def test_watch_ticker_search_prefers_exact_base_symbol():
+    import main
+
+    exact = {
+        "attributes": {"name": "VEIL / WETH", "volume_usd": {"h24": "1000"}, "reserve_in_usd": "10000"},
+        "relationships": {"base_token": {"data": {"id": f"base_{ca(44)}"}}},
+    }
+    noisy = {
+        "attributes": {"name": "NOTVEIL / WETH", "volume_usd": {"h24": "999999"}, "reserve_in_usd": "999999"},
+        "relationships": {"base_token": {"data": {"id": f"base_{ca(45)}"}}},
+    }
+
+    assert main.choose_gecko_search_pool([noisy, exact], "$veil") is exact
+
+
 def socialdata_tweet(
     *,
     tweet_id: int,
