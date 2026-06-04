@@ -380,13 +380,13 @@ def test_signal_keyboard_is_research_only(monkeypatch):
 
     assert labels == ["🔎 X Research", "⭐ Worth watching", "📤 Share ticker"]
     assert all("Buy" not in label and "Banana" not in label for label in labels)
-    share_url = next(
-        button["url"]
+    share_query = next(
+        button["switch_inline_query"]
         for row in keyboard["inline_keyboard"]
         for button in row
         if button["text"] == "📤 Share ticker"
     )
-    assert "%24FMT" in share_url
+    assert share_query == "$FMT"
 
 
 def test_signal_keyboard_includes_fomo_when_enabled(monkeypatch):
@@ -941,7 +941,7 @@ def test_hermes_tier_score_sorts_evidence_before_legacy_score():
 
 
 def test_xsignal_paginates_when_more_than_eight_tweets():
-    from main import build_xsignal_pagination_keyboard, format_research_social_block
+    from main import build_xsignal_pagination_keyboard, format_research_social_block, replace_xsignal_block
     from services.social_evidence import build_social_evidence
 
     token_ca = ca(70)
@@ -981,6 +981,9 @@ def test_xsignal_paginates_when_more_than_eight_tweets():
     assert keyboard is not None
     labels = [button["text"] for row in keyboard["inline_keyboard"] for button in row]
     assert labels == ["← Prev", "Page 1/3", "Next →"]
+    replaced = replace_xsignal_block("Header\n\n🐦 <b>X signal</b>\nold page", page_2)
+    assert "old page" not in replaced
+    assert replaced.count("🐦 <b>X signal</b>") == 1
 
 
 def test_research_and_signal_cards_do_not_append_contract_command():

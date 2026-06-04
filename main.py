@@ -611,12 +611,6 @@ def build_x_research_url(token_address: str, symbol: str) -> str:
     return f"https://x.com/search?q={quote(query, safe='$')}&src=typed_query"
 
 
-def build_share_ticker_url(symbol: str) -> str:
-    clean_symbol = (symbol or "").strip().lstrip("$").upper()
-    text = f"${clean_symbol}" if clean_symbol else "Base token"
-    return f"https://t.me/share/url?text={quote(text)}"
-
-
 def build_signal_keyboard(token_address: str, symbol: str) -> dict:
     x_research_url = build_x_research_url(token_address, symbol)
     rows = [[{"text": "🔎 X Research", "url": x_research_url}]]
@@ -628,7 +622,7 @@ def build_signal_keyboard(token_address: str, symbol: str) -> dict:
         ])
     rows.append([
         {"text": "⭐ Worth watching", "callback_data": f"watch:{token_address.lower()}"},
-        {"text": "📤 Share ticker", "url": build_share_ticker_url(symbol)},
+        {"text": "📤 Share ticker", "switch_inline_query": f"${(symbol or '').strip().lstrip('$').upper()}"},
     ])
     return {"inline_keyboard": rows}
 
@@ -4530,12 +4524,11 @@ def merge_inline_keyboards(*keyboards: dict | None) -> dict | None:
 
 
 def replace_xsignal_block(message_text: str, new_block: str) -> str:
-    marker = "🐦 <b>X Signal</b>"
     text = str(message_text or "")
-    start = text.find(marker)
-    if start < 0:
+    match = re.search(r"🐦\s*<b>X signal</b>", text, flags=re.IGNORECASE)
+    if not match:
         return (text.rstrip() + "\n\n" + new_block).strip()
-    return (text[:start].rstrip() + "\n\n" + new_block).strip()
+    return (text[:match.start()].rstrip() + "\n\n" + new_block).strip()
 
 
 async def load_xsignal_evidence_for_ca(address: str) -> dict | None:
