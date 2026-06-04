@@ -10,27 +10,55 @@ from database import create_verdict_v2, get_latest_token_research, list_spoof_si
 
 VERSION = "verdict-v2.1"
 
-SYSTEM_PROMPT_VERDICT = """You are Hermes, a cynical and experienced crypto analyst for early and post-launch Base tokens.
+SYSTEM_PROMPT_VERDICT = """You are Hermes, an extremely experienced, cynical, and unbiased crypto analyst.
+For /research, token age does not matter. Dig as deeply as the available sources allow.
 
-For /research, token age does not matter. Never reject or downgrade a research result only because the pair is older than the scanner launch window.
+Analyze the token and produce an informative, detailed, but non-spammy verdict.
 
-Always produce a concrete Project Narrative when any usable screener metadata, ticker context, project name, official social, or qualified X evidence exists.
-Use hybrid evidence levels:
+Required structure:
+
+🤖 AI VERDICT 2.0 • Score: X.X/10 • {HIGH RISK / MEDIUM / LOW RISK}
+
+Recommendation: [SKIP / HIGH RISK / WATCH / GAMBLE / BUY]
+
+Product:
+[2-4 sentences. What is the project actually? What utility/tech does it claim? How does it work? What lore/context exists?]
+
+Why it matters:
+[1-2 sentences. Why could this project have real value?]
+
+Thesis:
+[Clear conclusion based on all data.]
+
+X Signal:
+CA-Confirmed: X strong tweets
+Ticker Context: Y qualified tweets (not CA-confirmed)
+
+Key Evidence:
+• [1] @username — short analysis of the most important tweet
+• [2] ...
+
+Key Lore / Context:
+[If present, 1-2 sentences from screener/tweets/context.]
+
+Risks & Confidence:
+[Specific risks + Confidence: HIGH/MEDIUM/LOW]
+
+Hybrid evidence levels:
 - CA-Confirmed: tweet contains the exact contract address.
-- Pair/Screener-Confirmed: tweet references the token plus a screener/pair/official market link.
+- Pair/Screener-Confirmed: tweet references the token plus a DexScreener/GeckoTerminal/GMGN/Uniswap/BaseScan link.
 - Project/Account-Confirmed: tweet comes from an official account listed in screener metadata.
-- Ticker-Strong: high-quality tweets by $TICKER without CA.
+- Ticker-Strong: quality tweets by $TICKER without CA.
 - Ticker-Only: weak ticker mentions.
 
 CA-Confirmed, Pair/Screener-Confirmed, and Project/Account-Confirmed can increase trust.
-Ticker-Strong can support narrative but must not be treated as contract proof.
+Ticker-Strong can support narrative, but it is not contract proof.
 Ticker-Only is context only.
 
 If evidence is only ticker-based, explicitly say: "Ticker context, CA attribution not fully confirmed."
 If there is same-ticker collision risk, state the penalty plainly.
-
-Use dry trader language. No hype, no buy/sell advice.
-Narrative must be specific, e.g. "AI inference marketplace on Base" or "decentralized intelligence platform", not generic "Base launch with traction".
+Use dry trader language. No hype. No buy/sell advice.
+Narrative must be concrete, e.g. "AI inference marketplace on Base", "decentralized intelligence platform", or "privacy infrastructure", never generic "Base launch with traction".
 """
 
 WEIGHTS = {
@@ -434,8 +462,8 @@ def build_product_line(research: dict[str, Any], reasons: list[str]) -> str:
     project_narrative = research.get("project_narrative") or {}
     product_note = project_narrative.get("product") or research.get("product_note") or "Product differentiation is not proven yet."
     product_note = " ".join(str(product_note).split())
-    if len(product_note) > 145:
-        product_note = product_note[:142] + "..."
+    if len(product_note) > 520:
+        product_note = product_note[:517] + "..."
     signal = top_items(reasons, 1)
     if signal and signal != "none":
         return f"{product_note} Signal: {signal}."
@@ -455,41 +483,25 @@ def build_human_readable(
     social = research.get("social") or {}
     project_narrative = research.get("project_narrative") or {}
     thesis = social.get("evidence_thesis") or ""
-    value_assessment = social.get("value_assessment") or ""
     social_score = int(social.get("social_score") or 0)
-    breakdown = social.get("score_breakdown") or {}
     project_value = social.get("project_value") or token_type
     product_line = build_product_line(research, reasons)
-    why_value = project_narrative.get("why_it_matters") or value_assessment or product_line
-    if len(why_value) > 220:
-        why_value = why_value[:217] + "..."
     thesis_line = thesis or product_line
-    if len(thesis_line) > 220:
-        thesis_line = thesis_line[:217] + "..."
-    evidence_line = format_evidence_refs(research)
+    if len(thesis_line) > 360:
+        thesis_line = thesis_line[:357] + "..."
     risk_text = top_items(risks, 2) or "no major deterministic risk detected"
-    value_line = value_assessment or why_value
-    if len(value_line) > 220:
-        value_line = value_line[:217] + "..."
-    split = ""
-    if breakdown:
-        split = (
-            f"\n<i>Split: Narrative {int(breakdown.get('narrative') or 0)}/40 · "
-            f"Creator {int(breakdown.get('creator') or 0)}/30 · "
-            f"Utility/Tech {int(breakdown.get('utility_tech') or 0)}/20 · "
-            f"Shill Risk -{int(breakdown.get('shill_risk') or 0)}/10</i>"
-        )
+    lore_context = str(project_narrative.get("key_lore_context") or "").strip()
+    if len(lore_context) > 320:
+        lore_context = lore_context[:317] + "..."
     return (
         f"🧠 <b>AI brief</b> • Score <b>{score / 10:.1f}/10</b> · <b>{label}</b>\n\n"
         f"• <b>Type:</b> {esc(project_value)}\n"
         f"• <b>Product:</b> {esc(product_line)}\n"
         f"• <b>Thesis:</b> {esc(thesis_line)}\n"
-        f"• <b>Why value:</b> {esc(why_value)}\n"
-        f"• <b>Evidence:</b> {evidence_line}\n"
-        f"• <b>Risks:</b> {esc(risk_text)}\n"
+        + (f"• <b>Key Lore / Context:</b> {esc(lore_context)}\n" if lore_context else "")
+        + f"• <b>Risks:</b> {esc(risk_text)}\n"
         f"• <b>Confidence:</b> {esc(confidence)}"
         + (f"\n• <b>Social Score:</b> {social_score}/100" if social_score else "")
-        + split
     )
 
 

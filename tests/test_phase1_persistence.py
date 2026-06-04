@@ -1580,8 +1580,11 @@ async def test_verdict_v21_rewards_ca_verified_social_proof(db_url, monkeypatch)
     assert verdict["score"] >= 72
     assert verdict["categories"]["social"] >= 20
     assert verdict["research"]["social"]["ca_verified"] is True
-    assert "Evidence:" in verdict["human_readable"]
-    assert "[1] @analyst" in verdict["human_readable"]
+    assert "Product:" in verdict["human_readable"]
+    assert "Thesis:" in verdict["human_readable"]
+    assert "Evidence:" not in verdict["human_readable"]
+    assert "Why value:" not in verdict["human_readable"]
+    assert "Split:" not in verdict["human_readable"]
 
 
 def test_geckoterminal_same_ticker_parser_keeps_only_exact_base_symbol_candidates():

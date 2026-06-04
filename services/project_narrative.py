@@ -87,6 +87,7 @@ class ProjectNarrative:
     evidence_sources: list[str] = field(default_factory=list)
     raw_description: str = ""
     key_keywords: list[str] = field(default_factory=list)
+    key_lore_context: str = ""
     same_ticker_collision: bool = False
     is_ticker_only_evidence: bool = False
     ca_confirmed_mentions: int = 0
@@ -104,6 +105,16 @@ def clean_text(value: Any, *, limit: int = 360) -> str:
     if len(text) > limit:
         text = text[: limit - 3].rstrip() + "..."
     return text
+
+
+def split_sentences(text: str, *, limit: int = 4) -> list[str]:
+    clean = clean_text(text, limit=1200)
+    if not clean:
+        return []
+    parts = [part.strip() for part in re.split(r"(?<=[.!?])\s+", clean) if part.strip()]
+    if len(parts) <= 1:
+        parts = [part.strip() for part in re.split(r"\s+[•\-]\s+|\n+", clean) if part.strip()]
+    return [part for part in parts if len(part) >= 24][:limit]
 
 
 def is_generic_description(text: str) -> bool:
@@ -205,6 +216,32 @@ def best_narrative_group(text: str, tweets: list[dict[str, Any]]) -> tuple[str, 
     return group, found[:6], len(tweet_author_by_group.get(group, set()))
 
 
+def high_signal_tweet_sentences(tweets: list[dict[str, Any]], keywords: list[str]) -> list[str]:
+    signals: list[str] = []
+    keyword_set = {term.lower() for term in keywords}
+    for tweet in tweets[:12]:
+        text = tweet_text(tweet)
+        lower = text.lower()
+        if keyword_set and not any(term in lower for term in keyword_set):
+            continue
+        for sentence in split_sentences(text, limit=2):
+            sentence_lower = sentence.lower()
+            if any(term in sentence_lower for term in keyword_set) or any(
+                term in sentence_lower
+                for term in ("problem", "solves", "marketplace", "inference", "platform", "protocol", "utility", "workflow")
+            ):
+                signals.append(sentence)
+                break
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in signals:
+        key = re.sub(r"[^a-z0-9]+", " ", item.lower()).strip()[:120]
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(item)
+    return deduped[:3]
+
+
 def ca_confirmed_tweets(tweets: list[dict[str, Any]], ca: str) -> int:
     if not ca:
         return 0
@@ -239,20 +276,95 @@ def has_same_ticker_collision(social_evidence: dict[str, Any] | None, flags: lis
     return "ticker collision" in risk_text or "same ticker" in risk_text
 
 
-def product_line(group: str, name: str, desc: str, keywords: list[str], *, source_backed: bool) -> str:
+def mechanics_sentence(group: str, keywords: list[str]) -> str:
+    keyword_text = " ".join(keywords).lower()
+    if group == "AI / Agent":
+        if any(term in keyword_text for term in ("inference", "marketplace", "compute", "model", "intelligence")):
+            return (
+                "The useful angle is a marketplace-style layer for AI inference, model access, "
+                "or decentralized intelligence rather than a simple meme wrapper."
+            )
+        return "The useful angle is AI-agent or automation infrastructure, but the exact workflow still needs source-backed proof."
+    if group == "Privacy / Base infrastructure":
+        return "The useful angle is privacy or shielded transaction infrastructure, which can matter if the contract-specific proof is real."
+    if group == "Trading / Analytics Tool":
+        return "The useful angle is trader/data tooling: faster discovery, analytics, alerts, or workflow automation."
+    if group == "DeFi / Protocol":
+        return "The useful angle is protocol utility: liquidity, swaps, fees, yield, or other onchain financial mechanics."
+    if group == "Game / Social App":
+        return "The useful angle is consumer distribution; the token needs visible users, content, or app traction."
+    if group == "Launchpad / Creator Token":
+        return "The useful angle is creator/community distribution, not the ticker by itself."
+    if group == "Memecoin / Community":
+        return "The useful angle is community/lore strength; this stays lower priority without a durable hook."
+    return "The current sources do not yet explain a precise mechanism beyond market and ticker attention."
+
+
+def product_line(
+    group: str,
+    name: str,
+    desc: str,
+    keywords: list[str],
+    *,
+    source_backed: bool,
+    tweet_sentences: list[str] | None = None,
+) -> str:
+    tweet_sentences = tweet_sentences or []
     if desc:
-        return clean_text(desc, limit=220)
+        sentences = split_sentences(desc, limit=2)
+        base = " ".join(sentences) if sentences else clean_text(desc, limit=300)
+        if tweet_sentences:
+            base = f"{base} {clean_text(tweet_sentences[0], limit=220)}"
+        elif len(sentences) < 2:
+            base = f"{base} {mechanics_sentence(group, keywords)}"
+        return clean_text(base, limit=620)
     display = clean_text(name, limit=80) or "This token"
     if group == "Unclear / Experimental":
-        return f"{display} has limited public context from current screeners/X evidence; project description remains thin."
+        return (
+            f"{display} has limited public context from current screeners/X evidence, so the product read remains thin. "
+            f"{mechanics_sentence(group, keywords)}"
+        )
     if not source_backed:
-        return f"{display} has weak signals around {group.lower()}, but source attribution is not strong yet."
+        return (
+            f"{display} has weak signals around {group.lower()}, but source attribution is not strong yet. "
+            f"{mechanics_sentence(group, keywords)}"
+        )
     if group == "AI / Agent":
         if any(term in keywords for term in ("inference", "marketplace", "intelligence", "decentralized intelligence")):
-            return f"{display} appears to be an AI inference / decentralized intelligence platform on Base."
+            base = (
+                f"{display} appears to be an AI inference / decentralized intelligence platform on Base. "
+                f"{mechanics_sentence(group, keywords)}"
+            )
+            if tweet_sentences:
+                base = f"{base} {clean_text(tweet_sentences[0], limit=220)}"
+            return clean_text(base, limit=620)
     keyword_part = ", ".join(keywords[:3])
     qualifier = "appears positioned as" if source_backed else "has weak ticker-only signs of"
-    return f"{display} {qualifier} {group.lower()}" + (f" ({keyword_part})." if keyword_part else ".")
+    base = f"{display} {qualifier} {group.lower()}" + (f" ({keyword_part}). " if keyword_part else ". ")
+    base += mechanics_sentence(group, keywords)
+    if tweet_sentences:
+        base += f" {clean_text(tweet_sentences[0], limit=220)}"
+    return clean_text(base, limit=620)
+
+
+def build_lore_context(
+    *,
+    group: str,
+    keywords: list[str],
+    tweets: list[dict[str, Any]],
+    desc: str,
+    ticker_only: bool,
+) -> str:
+    tweet_sentences = high_signal_tweet_sentences(tweets, keywords)
+    if tweet_sentences:
+        context = " ".join(tweet_sentences[:2])
+    elif desc:
+        context = " ".join(split_sentences(desc, limit=2))
+    else:
+        context = mechanics_sentence(group, keywords)
+    if ticker_only and context:
+        context += " This is ticker context, not contract-confirmed proof."
+    return clean_text(context, limit=420)
 
 
 def confidence_for(
@@ -314,10 +426,26 @@ def extract_project_narrative(
     if collision and ticker_only:
         product = "Possible same-ticker collision; project description is not safe to attribute to this contract."
         why = "Ticker-only evidence can belong to another token, so the current CA needs contract-specific proof."
+        lore_context = why
     else:
         source_backed = has_description or bool(metadata_text.strip()) or unique_authors >= 2 or ca_mentions > 0
-        product = product_line(group, name or ticker, desc, keywords, source_backed=source_backed)
+        tweet_sentences = high_signal_tweet_sentences(tweets, keywords)
+        product = product_line(
+            group,
+            name or ticker,
+            desc,
+            keywords,
+            source_backed=source_backed,
+            tweet_sentences=tweet_sentences,
+        )
         why = str(NARRATIVE_GROUPS.get(group, {}).get("why") or "Current sources do not explain a durable reason for the token to matter yet.")
+        lore_context = build_lore_context(
+            group=group,
+            keywords=keywords,
+            tweets=tweets,
+            desc=desc,
+            ticker_only=ticker_only,
+        )
         if ticker_only:
             why = "X evidence is ticker-only and not CA-confirmed; treat this narrative as weak until contract-specific proof appears."
 
@@ -331,6 +459,7 @@ def extract_project_narrative(
         evidence_sources=sources,
         raw_description=desc,
         key_keywords=keywords,
+        key_lore_context=lore_context,
         same_ticker_collision=collision,
         is_ticker_only_evidence=ticker_only,
         ca_confirmed_mentions=ca_mentions,
@@ -365,7 +494,11 @@ def format_project_narrative_block(narrative: dict[str, Any] | ProjectNarrative 
     if data.get("is_ticker_only_evidence"):
         evidence += " (ticker-only)"
     return (
-        f"• <b>Product:</b> {html.escape(clean_text(data.get('product'), limit=220))}\n"
-        f"• <b>Why value:</b> {html.escape(clean_text(data.get('why_it_matters'), limit=220))}\n"
-        f"• <b>Confidence:</b> {html.escape(str(data.get('confidence') or 'LOW'))} · {html.escape(evidence)}"
+        f"• <b>Product:</b> {html.escape(clean_text(data.get('product'), limit=520))}\n"
+        f"• <b>Why value:</b> {html.escape(clean_text(data.get('why_it_matters'), limit=300))}\n"
+        + (
+            f"• <b>Key Lore / Context:</b> {html.escape(clean_text(data.get('key_lore_context'), limit=300))}\n"
+            if data.get("key_lore_context") else ""
+        )
+        + f"• <b>Confidence:</b> {html.escape(str(data.get('confidence') or 'LOW'))} · {html.escape(evidence)}"
     )

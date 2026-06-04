@@ -122,7 +122,7 @@ from services.social_evidence import (
     is_recent_tweet,
     strip_non_english_content,
 )
-from services.social_fetcher import AlphaDetector, NitterFetcher, SmartFetchOrchestrator, SocialDataFetcher
+from services.social_fetcher import AlphaDetector, NitterFetcher, SmartFetchOrchestrator, SmartFetchResult, SocialDataFetcher
 from services.tenants import ensure_telegram_tenant
 from services.token_intelligence import analyze_token_intelligence
 from services.tweet_provenance import annotate_tweet_source, ca_first_sort_key, strict_ca_query, strict_ticker_query
@@ -3063,6 +3063,60 @@ def build_smart_fetch_orchestrator(session: aiohttp.ClientSession) -> SmartFetch
     )
 
 
+async def fetch_research_social_branch(
+    orchestrator: SmartFetchOrchestrator,
+    *,
+    ticker: str,
+    address: str = "",
+    latest_limit: int = 12,
+    top_limit: int = 24,
+    latest_max_age_hours: int = 72,
+    top_max_age_hours: int = 168,
+    official_handles: set[str] | None = None,
+    force_top_below: int = RESEARCH_MIN_QUALIFIED_TWEETS,
+) -> SmartFetchResult:
+    latest = await orchestrator.nitter.latest(
+        ticker=ticker,
+        address=address,
+        limit=latest_limit,
+        max_age_hours=latest_max_age_hours,
+    )
+    latest_evidence = build_social_evidence(
+        latest,
+        ticker=ticker,
+        address=address,
+        min_count=force_top_below,
+        max_tweets=latest_limit,
+        max_age_hours=latest_max_age_hours,
+        include_context=bool(address),
+        official_handles=official_handles,
+    )
+    latest_quality = int(latest_evidence.get("evidence_count") or 0)
+    alpha_found, alpha_reason = orchestrator.alpha_detector.detect(latest)
+    force_top = latest_quality < force_top_below
+    top: list[dict] = []
+    if alpha_found or force_top:
+        top = await orchestrator.socialdata.top(
+            ticker=ticker,
+            address=address,
+            limit=top_limit,
+            max_age_hours=top_max_age_hours,
+            min_count=0,
+        )
+    reason = alpha_reason
+    if force_top and not alpha_found:
+        reason = f"latest_quality_below_{force_top_below}"
+    elif force_top and alpha_found:
+        reason = f"{alpha_reason};latest_quality_below_{force_top_below}"
+    return SmartFetchResult(
+        latest=latest,
+        top=top,
+        alpha_found=alpha_found,
+        socialdata_called=bool(top) or alpha_found or force_top,
+        alpha_reason=reason,
+    )
+
+
 async def build_deep_social_evidence(
     session: aiohttp.ClientSession,
     *,
@@ -3364,29 +3418,30 @@ async def research_token(
         deployer_info = await resolve_deployer_x(session, address)
 
     nitter_age_hours = max(1, int(search_window_hours or 72))
-    socialdata_age_hours = nitter_age_hours
+    socialdata_age_hours = max(nitter_age_hours, 168)
+    official_handles = dex_official_x_handles(dex)
     orchestrator = build_smart_fetch_orchestrator(session)
-    ca_fetch = await orchestrator.fetch(
+    ca_fetch = await fetch_research_social_branch(
+        orchestrator,
         ticker=ticker,
         address=address,
         latest_limit=12,
         top_limit=24,
-        max_age_hours=nitter_age_hours,
+        latest_max_age_hours=nitter_age_hours,
         top_max_age_hours=socialdata_age_hours,
-        top_min_count=0,
+        official_handles=official_handles,
     )
-    ca_candidate_count = len(ca_fetch.latest) + len(ca_fetch.top)
     ticker_fetch = None
     if address:
-        ticker_fetch = await orchestrator.fetch(
+        ticker_fetch = await fetch_research_social_branch(
+            orchestrator,
             ticker=ticker,
             address="",
             latest_limit=12,
             top_limit=24,
-            max_age_hours=nitter_age_hours,
+            latest_max_age_hours=nitter_age_hours,
             top_max_age_hours=socialdata_age_hours,
-            force_top=ca_candidate_count < RESEARCH_MIN_QUALIFIED_TWEETS,
-            top_min_count=0,
+            official_handles=official_handles,
         )
     x_mentions = ca_fetch.top + ((ticker_fetch.top if ticker_fetch else []) or [])
     influencer_mentions: list[dict] = []
@@ -3399,7 +3454,7 @@ async def research_token(
         max_tweets=24,
         max_age_hours=socialdata_age_hours,
         include_context=bool(address),
-        official_handles=dex_official_x_handles(dex),
+        official_handles=official_handles,
     )
     social_evidence["fetch_strategy"] = {
         "latest_provider": "nitter",
@@ -4352,6 +4407,50 @@ def infer_research_token_type(token_name: str, ticker: str, x_mentions: list[dic
     return "Memecoin / Experimental"
 
 
+def compact_sentence_text(value: str, *, limit: int = 520) -> str:
+    clean = " ".join(str(value or "").split())
+    if len(clean) <= limit:
+        return clean
+    return clean[: limit - 3].rstrip() + "..."
+
+
+def research_risk_label(score: float, risks: list[str], social_evidence: dict | None) -> str:
+    trust = (social_evidence or {}).get("trust_summary") or {}
+    primary = (
+        int(trust.get("ca_confirmed") or 0)
+        + int(trust.get("pair_confirmed") or 0)
+        + int(trust.get("project_confirmed") or 0)
+    )
+    ticker_context = int(trust.get("ticker_strong") or 0) + int(trust.get("ticker_only") or 0)
+    if any("collision" in risk.lower() for risk in risks):
+        return "HIGH RISK"
+    if primary == 0 and ticker_context > 0:
+        return "MEDIUM RISK"
+    if score >= 7.0 and primary > 0:
+        return "LOW RISK"
+    if score >= 5.5:
+        return "MEDIUM RISK"
+    return "HIGH RISK"
+
+
+def research_recommendation(score: float, social_evidence: dict | None, risks: list[str]) -> str:
+    trust = (social_evidence or {}).get("trust_summary") or {}
+    primary = (
+        int(trust.get("ca_confirmed") or 0)
+        + int(trust.get("pair_confirmed") or 0)
+        + int(trust.get("project_confirmed") or 0)
+    )
+    if any("collision" in risk.lower() for risk in risks):
+        return "SKIP"
+    if score >= 7.5 and primary > 0:
+        return "WATCH"
+    if score >= 6.0:
+        return "WATCH" if primary > 0 else "HIGH RISK"
+    if score >= 4.5:
+        return "HIGH RISK"
+    return "SKIP"
+
+
 def format_research_ai_brief(
     *,
     token_name: str,
@@ -4385,7 +4484,6 @@ def format_research_ai_brief(
         score += 1.0
     if launch_status == "signaled":
         score += 1.0
-    score = min(10.0, score)
 
     product = (project_narrative or {}).get("product") or "No product differentiation confirmed from current evidence."
     top_tweet = (influencer_mentions or x_mentions or [{}])[0]
@@ -4395,37 +4493,48 @@ def format_research_ai_brief(
         product = f"{token_name} has market/social traces, but product proof is not confirmed yet."
 
     thesis = (social_evidence or {}).get("thesis") or ""
-    value_assessment = (social_evidence or {}).get("value_assessment") or ""
     social_score = int((social_evidence or {}).get("social_score") or 0)
-    breakdown = (social_evidence or {}).get("score_breakdown") or {}
+    trust = (social_evidence or {}).get("trust_summary") or {}
+    primary_evidence = (
+        int(trust.get("ca_confirmed") or 0)
+        + int(trust.get("pair_confirmed") or 0)
+        + int(trust.get("project_confirmed") or 0)
+    )
+    ticker_context = int(trust.get("ticker_strong") or 0) + int(trust.get("ticker_only") or 0)
     project_value = (
         narrative_token_type(project_narrative, "")
         if project_narrative else ""
     ) or (social_evidence or {}).get("project_value") or infer_research_token_type(token_name, ticker, x_mentions)
-    evidence_line = format_compact_evidence_refs(social_evidence or {})
+    if social_score:
+        score += min(2.4, social_score / 35)
+    if (project_narrative or {}).get("confidence") == "HIGH":
+        score += 1.0
+    elif (project_narrative or {}).get("confidence") == "MEDIUM":
+        score += 0.6
+    product_lower = product.lower()
+    if any(term in product_lower for term in ("inference", "intelligence", "marketplace", "protocol", "platform", "privacy", "infrastructure")):
+        score += 0.8
+    if primary_evidence == 0 and ticker_context > 0:
+        risks.append("ticker context is not contract-confirmed")
+        score = min(score, 6.8)
+    score = min(10.0, score)
     thesis_line = thesis if thesis else product[:180]
-    value_line = (project_narrative or {}).get("why_it_matters") or value_assessment or "No clear value case confirmed from the current evidence."
     confidence = (project_narrative or {}).get("confidence") or "LOW"
-    split = ""
-    if breakdown:
-        split = (
-            f"\n<i>Split: Narrative {int(breakdown.get('narrative') or 0)}/40 · "
-            f"Creator {int(breakdown.get('creator') or 0)}/30 · "
-            f"Utility/Tech {int(breakdown.get('utility_tech') or 0)}/20 · "
-            f"Shill Risk -{int(breakdown.get('shill_risk') or 0)}/10</i>"
-        )
+    lore_context = (project_narrative or {}).get("key_lore_context") or ""
+    risk_label = research_risk_label(score, risks, social_evidence)
+    recommendation = research_recommendation(score, social_evidence, risks)
     return (
         f"🧠 <b>AI brief</b> • Score <b>{score:.1f}/10</b>"
         + (f" · Social <b>{social_score}/100</b>" if social_score else "")
+        + f" · <b>{risk_label}</b>"
         + "\n\n"
-        f"• <b>Type:</b> {h(project_value)}\n"
-        f"• <b>Product:</b> {h(product[:220])}\n"
-        f"• <b>Thesis:</b> {h(thesis_line[:220])}\n"
-        f"• <b>Why value:</b> {h(value_line[:220])}\n"
-        f"• <b>Evidence:</b> {evidence_line}\n"
-        f"• <b>Risks:</b> {h('; '.join(risks[:2]) if risks else 'no major deterministic risk detected')}"
-        f"\n• <b>Confidence:</b> {h(confidence)}"
-        f"{split}"
+        + f"• <b>Recommendation:</b> {h(recommendation)}\n"
+        + f"• <b>Type:</b> {h(project_value)}\n"
+        + f"• <b>Product:</b> {h(compact_sentence_text(product, limit=560))}\n"
+        + f"• <b>Thesis:</b> {h(compact_sentence_text(thesis_line, limit=360))}\n"
+        + (f"• <b>Key Lore / Context:</b> {h(compact_sentence_text(lore_context, limit=320))}\n" if lore_context else "")
+        + f"• <b>Risks:</b> {h('; '.join(risks[:2]) if risks else 'no major deterministic risk detected')}"
+        + f"\n• <b>Confidence:</b> {h(confidence)}"
     )
 
 

@@ -60,7 +60,7 @@ def tweet_source_matches(tweet: dict[str, Any], *, ticker: str = "", address: st
     }
 
 
-def classify_evidence_type(tweet: dict[str, Any], *, official_handles: set[str] | None = None) -> tuple[str, int]:
+def classify_tweet_evidence(tweet: dict[str, Any], *, official_handles: set[str] | None = None) -> tuple[str, int]:
     official_handles = official_handles or set()
     username = str(tweet.get("username") or "").strip().lstrip("@").lower()
     text = str(tweet.get("text") or tweet.get("excerpt") or "").lower()
@@ -79,6 +79,10 @@ def classify_evidence_type(tweet: dict[str, Any], *, official_handles: set[str] 
             return "ticker_strong", 40
         return "ticker_only", 10
     return "unmatched", 0
+
+
+def classify_evidence_type(tweet: dict[str, Any], *, official_handles: set[str] | None = None) -> tuple[str, int]:
+    return classify_tweet_evidence(tweet, official_handles=official_handles)
 
 
 def annotate_tweet_source(

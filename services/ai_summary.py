@@ -21,6 +21,7 @@ def build_stub_summary(verdict: dict[str, Any], *, language: str) -> str:
     reasons = verdict.get("reasons") or []
     risks = verdict.get("risks") or []
     product = project_narrative.get("product") or research.get("product_note") or "Project description is not confirmed."
+    lore = project_narrative.get("key_lore_context") or ""
     thesis = social.get("evidence_thesis") or product
     value = (
         project_narrative.get("why_it_matters")
@@ -38,13 +39,15 @@ def build_stub_summary(verdict: dict[str, Any], *, language: str) -> str:
             f"${symbol}: {label}, {score / 10:.1f}/10. "
             f"Тип: {token_type}. Проект: {product}. Рынок: {market_line}. "
             f"Тезис: {thesis} Оценка ценности: {value}. Главный риск: {risk}. "
-            "Это deterministic AI-brief stub без внешней модели."
+            + (f"Контекст: {lore}. " if lore else "")
+            + "Это deterministic AI-brief stub без внешней модели."
         )
     return (
         f"${symbol}: {label}, {score / 10:.1f}/10. "
         f"Type: {token_type}. Project: {product}. Market: {market_line}. "
         f"Thesis: {thesis} Value read: {value}. Main risk: {risk}. "
-        "This is a deterministic AI-brief stub without an external model."
+        + (f"Context: {lore}. " if lore else "")
+        + "This is a deterministic AI-brief stub without an external model."
     )
 
 
