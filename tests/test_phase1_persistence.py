@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
@@ -403,6 +404,52 @@ def test_signal_keyboard_includes_fomo_when_enabled(monkeypatch):
         if button["text"] == "👀 Fomo"
     )
     assert fomo_url == f"https://fomo.family/coin?address={token_ca}&chainId=8453"
+
+
+def test_watchlist_message_is_grouped_and_actionable(monkeypatch):
+    import main
+
+    monkeypatch.setattr(main, "FOMO_ENABLED", False)
+    now = utc_now()
+    hot = SimpleNamespace(
+        id=1,
+        ca=ca(41),
+        label="alpha",
+        last_mcap=180_000,
+        last_volume=95_000,
+        last_liquidity=42_000,
+        initial_mcap=100_000,
+        initial_volume=50_000,
+        last_mcap_change_pct=42.0,
+        last_volume_change_pct=10.0,
+        last_market_json={"token_symbol": "HOT", "token_name": "Hot Token"},
+        created_at=now - timedelta(hours=30),
+        last_checked_at=now - timedelta(minutes=12),
+    )
+    recent = SimpleNamespace(
+        id=2,
+        ca=ca(42),
+        label=None,
+        last_mcap=70_000,
+        last_volume=31_000,
+        last_liquidity=22_000,
+        initial_mcap=70_000,
+        initial_volume=31_000,
+        last_mcap_change_pct=None,
+        last_volume_change_pct=None,
+        last_market_json={"token_symbol": "NEW", "token_name": "New Token"},
+        created_at=now - timedelta(hours=2),
+        last_checked_at=now - timedelta(minutes=5),
+    )
+
+    message = main.build_watchlist_message([recent, hot], launches={})
+    keyboard = main.build_watchlist_keyboard([recent, hot], launches={})
+
+    assert "🔥 Hot Movers" in message
+    assert "🆕 Recently Added" in message
+    assert "$HOT" in message
+    assert ca(41) not in message
+    assert keyboard and any(button["callback_data"].startswith("wl_research:") for row in keyboard["inline_keyboard"] for button in row if "callback_data" in button)
 
 
 def socialdata_tweet(

@@ -41,6 +41,14 @@ def ensure_aware(dt: datetime) -> datetime:
     return dt
 
 
+def pct_change(old: float | None, new: float | None) -> float | None:
+    old = float(old or 0)
+    new = float(new or 0)
+    if old <= 0 or new <= 0:
+        return None
+    return ((new - old) / old) * 100
+
+
 class JSONCompat(TypeDecorator):
     impl = JSON
     cache_ok = True
@@ -772,6 +780,12 @@ async def upsert_watchlist_item(
         if label:
             row.label = label[:128]
         if market_json:
+            if row.initial_mcap is None:
+                row.initial_mcap = mcap
+            if row.initial_volume is None:
+                row.initial_volume = volume
+            if row.initial_liquidity is None:
+                row.initial_liquidity = liquidity
             row.last_market_json = market_json
             row.last_mcap = mcap
             row.last_volume = volume
@@ -791,6 +805,13 @@ async def upsert_watchlist_item(
         last_volume=volume,
         last_liquidity=liquidity,
         last_price_usd=price,
+        initial_mcap=mcap,
+        initial_volume=volume,
+        initial_liquidity=liquidity,
+        previous_mcap=None,
+        previous_volume=None,
+        last_mcap_change_pct=None,
+        last_volume_change_pct=None,
         last_checked_at=utc_now() if market_json else None,
     )
     db.add(row)
@@ -850,10 +871,23 @@ async def mark_watchlist_checked(
         return None
     row.last_checked_at = utc_now()
     if market_json:
+        next_mcap = float(market_json.get("mcap") or 0)
+        next_volume = float(market_json.get("volume_24h") or 0)
+        next_liquidity = float(market_json.get("liquidity") or 0)
+        if row.initial_mcap is None and row.last_mcap is not None:
+            row.initial_mcap = row.last_mcap
+        if row.initial_volume is None and row.last_volume is not None:
+            row.initial_volume = row.last_volume
+        if row.initial_liquidity is None and row.last_liquidity is not None:
+            row.initial_liquidity = row.last_liquidity
+        row.previous_mcap = row.last_mcap
+        row.previous_volume = row.last_volume
+        row.last_mcap_change_pct = pct_change(row.last_mcap, next_mcap)
+        row.last_volume_change_pct = pct_change(row.last_volume, next_volume)
         row.last_market_json = market_json
-        row.last_mcap = float(market_json.get("mcap") or 0)
-        row.last_volume = float(market_json.get("volume_24h") or 0)
-        row.last_liquidity = float(market_json.get("liquidity") or 0)
+        row.last_mcap = next_mcap
+        row.last_volume = next_volume
+        row.last_liquidity = next_liquidity
         row.last_price_usd = str(market_json.get("price_usd") or "") or None
     if notified:
         row.last_notified_at = utc_now()

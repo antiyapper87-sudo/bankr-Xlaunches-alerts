@@ -241,6 +241,9 @@ WATCHLIST_CHECK_INTERVAL = int(os.getenv("WATCHLIST_CHECK_INTERVAL", "900"))
 WATCHLIST_CHECK_BATCH = int(os.getenv("WATCHLIST_CHECK_BATCH", "100"))
 WATCHLIST_NOTIFY_MCAP_CHANGE_PCT = float(os.getenv("WATCHLIST_NOTIFY_MCAP_CHANGE_PCT", "50"))
 WATCHLIST_NOTIFY_VOLUME_CHANGE_PCT = float(os.getenv("WATCHLIST_NOTIFY_VOLUME_CHANGE_PCT", "100"))
+WATCHLIST_PAGE_SIZE = min(12, max(1, int(os.getenv("WATCHLIST_PAGE_SIZE", "10"))))
+WATCHLIST_RECENT_HOURS = int(os.getenv("WATCHLIST_RECENT_HOURS", "24"))
+WATCHLIST_STALE_HOURS = int(os.getenv("WATCHLIST_STALE_HOURS", "6"))
 WALLET_MONITOR_ENABLED = os.getenv("WALLET_MONITOR_ENABLED", "false").lower() == "true"
 WALLET_POLL_INTERVAL = int(os.getenv("WALLET_POLL_INTERVAL", "60"))
 WALLET_POLL_BATCH = int(os.getenv("WALLET_POLL_BATCH", "50"))
@@ -788,6 +791,73 @@ async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: 
         await answer_callback_query(session, callback_id, "Unknown admin action", show_alert=True)
         return
 
+    if len(parts) == 2 and parts[0] == "watchlist_page":
+        try:
+            page = int(parts[1])
+        except ValueError:
+            await answer_callback_query(session, callback_id, "Invalid page", show_alert=True)
+            return
+        tenant = await ensure_tenant_for_chat(chat_id, title=telegram_callback_title(callback_query))
+        async with db_session() as db:
+            items = await list_watchlist_items(db, tenant_id=tenant.id, limit=200)
+        launches = await load_watchlist_launches(items)
+        pages = watchlist_page_count(items)
+        page = max(1, min(page, pages))
+        ok = await edit_telegram_message(
+            session,
+            chat_id,
+            int(message_id),
+            build_watchlist_message(items, page=page, launches=launches),
+            reply_markup=build_watchlist_keyboard(items, page=page, launches=launches),
+        )
+        await answer_callback_query(session, callback_id, f"Page {page}/{pages}" if ok else "Page update failed")
+        return
+
+    if len(parts) == 2 and parts[0] == "wl_research":
+        ca = parts[1].strip().lower()
+        if not is_base_contract(ca):
+            await answer_callback_query(session, callback_id, "Invalid token address", show_alert=True)
+            return
+        await answer_callback_query(session, callback_id, "Research queued")
+
+        async def do_watchlist_research():
+            try:
+                await send_telegram(session, await research_token(session, ca), chat_id=chat_id)
+            except Exception as exc:
+                log.error(f"Watchlist research failed for {ca}: {exc}", exc_info=True)
+                await send_telegram(session, f"❌ <b>Research failed</b>\n{h(str(exc)[:160])}", chat_id=chat_id)
+
+        track_background_command(f"watchlist research {ca}", do_watchlist_research())
+        return
+
+    if len(parts) == 2 and parts[0] == "wl_unwatch":
+        ca = parts[1].strip().lower()
+        if not is_base_contract(ca):
+            await answer_callback_query(session, callback_id, "Invalid token address", show_alert=True)
+            return
+        tenant = await ensure_tenant_for_chat(chat_id, title=telegram_callback_title(callback_query))
+        async with db_session() as db:
+            removed = await deactivate_watchlist_item(db, tenant_id=tenant.id, ca=ca)
+            items = await list_watchlist_items(db, tenant_id=tenant.id, limit=200)
+        launches = await load_watchlist_launches(items)
+        await answer_callback_query(session, callback_id, "Removed" if removed else "Not in watchlist")
+        message = callback_query.get("message", {}) or {}
+        if "⭐ Watchlist" in str(message.get("text") or ""):
+            await edit_telegram_message(
+                session,
+                chat_id,
+                int(message_id),
+                build_watchlist_message(items, page=1, launches=launches),
+                reply_markup=build_watchlist_keyboard(items, page=1, launches=launches),
+            )
+        else:
+            await send_telegram(
+                session,
+                "✅ <b>Removed from watchlist</b>" if removed else "⭐ <b>Not in watchlist</b>",
+                chat_id=chat_id,
+            )
+        return
+
     if len(parts) == 3 and parts[0] == "fomo_h":
         if not FOMO_ENABLED:
             await answer_callback_query(session, callback_id, "Fomo is disabled", show_alert=True)
@@ -863,7 +933,7 @@ async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: 
         tenant = await ensure_tenant_for_chat(chat_id, title=telegram_callback_title(callback_query))
         dex = await fetch_geckoterminal(session, ca)
         async with db_session() as db:
-            await upsert_watchlist_item(db, tenant_id=tenant.id, ca=ca, label="", market_json=dex)
+            item, inserted = await upsert_watchlist_item(db, tenant_id=tenant.id, ca=ca, label="", market_json=dex)
             await upsert_user_feedback(
                 db,
                 tenant_id=tenant.id,
@@ -871,8 +941,14 @@ async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: 
                 action="worth_watching",
                 payload_json={"message_id": message_id, "username": username},
             )
+            launch = await get_launch(db, ca)
         await answer_callback_query(session, callback_id, "⭐ Added to watchlist")
-        await send_telegram(session, f"⭐ Watching\n<code>{ca}</code>\nUse /watchlist anytime.", chat_id=chat_id)
+        await send_telegram(
+            session,
+            format_watch_added_message(item, launch, inserted=inserted),
+            chat_id=chat_id,
+            reply_markup=build_watch_item_keyboard(item, launch),
+        )
         return
 
     if len(parts) == 3 and parts[0] == "fb":
@@ -1009,21 +1085,240 @@ def format_pct(value: float | None) -> str:
     return "n/a" if value is None else f"{value:+.0f}%"
 
 
-def format_watchlist_rows(items: list) -> str:
+def short_ca(ca: str) -> str:
+    value = str(ca or "")
+    return f"{value[:6]}...{value[-4:]}" if len(value) > 12 else value
+
+
+def time_ago(dt: datetime | None) -> str:
+    if not dt:
+        return "n/a"
+    value = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    seconds = max(0, int((utc_now() - value).total_seconds()))
+    if seconds < 60:
+        return "now"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 48:
+        return f"{hours}h ago"
+    days = hours // 24
+    return f"{days}d ago"
+
+
+def watch_market(item) -> dict:
+    return dict(item.last_market_json or {})
+
+
+def watch_symbol_name(item, launch=None) -> tuple[str, str]:
+    market = watch_market(item)
+    symbol = (
+        (launch.ticker if launch else "")
+        or market.get("token_symbol")
+        or market.get("symbol")
+        or item.label
+        or short_ca(item.ca)
+    )
+    name = (
+        (launch.name if launch else "")
+        or market.get("token_name")
+        or market.get("name")
+        or item.label
+        or ""
+    )
+    return str(symbol or "").lstrip("$"), str(name or "")
+
+
+def watchlist_since_added_delta(item) -> tuple[float | None, float | None]:
+    return pct_change(item.initial_mcap, item.last_mcap), pct_change(item.initial_volume, item.last_volume)
+
+
+def watchlist_is_hot(item) -> bool:
+    return (
+        abs(float(item.last_mcap_change_pct or 0)) > 30
+        or abs(float(item.last_volume_change_pct or 0)) > 30
+    )
+
+
+def watchlist_is_recent(item) -> bool:
+    created_at = item.created_at if item.created_at.tzinfo else item.created_at.replace(tzinfo=timezone.utc)
+    return (utc_now() - created_at).total_seconds() <= WATCHLIST_RECENT_HOURS * 3600
+
+
+def watchlist_is_stale(item) -> bool:
+    if not item.last_checked_at:
+        return not watchlist_is_recent(item)
+    checked_at = item.last_checked_at if item.last_checked_at.tzinfo else item.last_checked_at.replace(tzinfo=timezone.utc)
+    return (utc_now() - checked_at).total_seconds() > WATCHLIST_STALE_HOURS * 3600
+
+
+def get_watchlist_groups(items: list) -> list[tuple[str, list]]:
+    buckets = {
+        "🔥 Hot Movers": [],
+        "🆕 Recently Added": [],
+        "👀 Watching": [],
+        "🕰 Stale": [],
+    }
+    for item in items:
+        if watchlist_is_hot(item):
+            buckets["🔥 Hot Movers"].append(item)
+        elif watchlist_is_recent(item):
+            buckets["🆕 Recently Added"].append(item)
+        elif watchlist_is_stale(item):
+            buckets["🕰 Stale"].append(item)
+        else:
+            buckets["👀 Watching"].append(item)
+    return [(name, rows) for name, rows in buckets.items() if rows]
+
+
+def ordered_watchlist_items(items: list) -> list:
+    ordered: list = []
+    for _, rows in get_watchlist_groups(items):
+        ordered.extend(rows)
+    return ordered
+
+
+def watchlist_page_count(items: list) -> int:
+    total = len(ordered_watchlist_items(items))
+    return max(1, (total + WATCHLIST_PAGE_SIZE - 1) // WATCHLIST_PAGE_SIZE)
+
+
+def visible_watchlist_items(items: list, page: int = 1) -> list:
+    ordered = ordered_watchlist_items(items)
+    page = max(1, min(page, watchlist_page_count(items)))
+    start = (page - 1) * WATCHLIST_PAGE_SIZE
+    return ordered[start:start + WATCHLIST_PAGE_SIZE]
+
+
+def format_watchlist_item(item, launch=None, index: int = 1) -> dict:
+    symbol, name = watch_symbol_name(item, launch)
+    label = f" · {h(item.label)}" if item.label and item.label not in {symbol, name} else ""
+    title_name = f" · {h(name[:42])}" if name and name != symbol else ""
+    mcap = fmt_usd(item.last_mcap or 0) if item.last_mcap else "n/a"
+    volume = fmt_usd(item.last_volume or 0) if item.last_volume else "n/a"
+    liquidity = fmt_usd(item.last_liquidity or 0) if item.last_liquidity else "n/a"
+    since_mcap, since_volume = watchlist_since_added_delta(item)
+    last_mcap = item.last_mcap_change_pct
+    last_volume = item.last_volume_change_pct
+    deltas: list[str] = []
+    if since_mcap is not None:
+        deltas.append(f"add MC {format_pct(since_mcap)}")
+    elif since_volume is not None:
+        deltas.append(f"add Vol {format_pct(since_volume)}")
+    if last_mcap is not None:
+        deltas.append(f"last MC {format_pct(last_mcap)}")
+    if last_volume is not None:
+        deltas.append(f"last Vol {format_pct(last_volume)}")
+    if not deltas:
+        deltas.append("change n/a")
+    checked = time_ago(item.last_checked_at) if item.last_checked_at else "no data yet"
+    return {
+        "symbol": symbol,
+        "name": name,
+        "text": (
+            f"{index}. <b>${h(symbol)}</b>{title_name}{label}\n"
+            f"   MC <b>{mcap}</b> · Vol {volume} · Liq {liquidity}\n"
+            f"   {' · '.join(deltas[:2])} · added {time_ago(item.created_at)} · checked {checked}"
+        ),
+    }
+
+
+async def load_watchlist_launches(items: list) -> dict[str, object]:
+    launches: dict[str, object] = {}
+    async with db_session() as db:
+        for item in items:
+            launch = await get_launch(db, item.ca)
+            if launch:
+                launches[item.ca] = launch
+    return launches
+
+
+def build_watch_item_keyboard(item, launch=None) -> dict:
+    symbol, _ = watch_symbol_name(item, launch)
+    ca = item.ca.lower()
+    row = [
+        {"text": "🔎 Research", "callback_data": f"wl_research:{ca}"},
+        {"text": "🐦 X Research", "url": build_x_research_url(ca, symbol)},
+    ]
+    if FOMO_ENABLED:
+        row.append({"text": "👀 Fomo", "url": build_fomo_url(ca, FOMO_DEFAULT_CHAIN_ID)})
+    return {
+        "inline_keyboard": [
+            row,
+            [{"text": "⭐ Unwatch", "callback_data": f"wl_unwatch:{ca}"}],
+        ]
+    }
+
+
+def build_watchlist_keyboard(items: list, page: int = 1, launches: dict[str, object] | None = None) -> dict | None:
+    launches = launches or {}
+    visible = visible_watchlist_items(items, page)
+    if not visible:
+        return None
+    page = max(1, min(page, watchlist_page_count(items)))
+    rows: list[list[dict]] = []
+    start = (page - 1) * WATCHLIST_PAGE_SIZE
+    for offset, item in enumerate(visible, 1):
+        symbol, _ = watch_symbol_name(item, launches.get(item.ca))
+        ca = item.ca.lower()
+        number = start + offset
+        action_row = [
+            {"text": f"{number} 🔎", "callback_data": f"wl_research:{ca}"},
+            {"text": "🐦", "url": build_x_research_url(ca, symbol)},
+        ]
+        if FOMO_ENABLED:
+            action_row.append({"text": "👀", "url": build_fomo_url(ca, FOMO_DEFAULT_CHAIN_ID)})
+        action_row.append({"text": "⭐ Unwatch", "callback_data": f"wl_unwatch:{ca}"})
+        rows.append(action_row)
+    pages = watchlist_page_count(items)
+    if pages > 1:
+        prev_page = max(1, page - 1)
+        next_page = min(pages, page + 1)
+        rows.append([
+            {"text": "← Prev", "callback_data": f"watchlist_page:{prev_page}"},
+            {"text": f"Page {page}/{pages}", "callback_data": f"watchlist_page:{page}"},
+            {"text": "Next →", "callback_data": f"watchlist_page:{next_page}"},
+        ])
+    return {"inline_keyboard": rows}
+
+
+def build_watchlist_message(items: list, page: int = 1, launches: dict[str, object] | None = None) -> str:
     if not items:
         return (
             "⭐ <b>Watchlist</b>\n\n"
             "No saved tokens yet.\n"
             "<code>/watch 0x... [label]</code>"
         )
-    lines = [f"⭐ <b>Watchlist</b> · {len(items)} token(s)", ""]
-    for idx, item in enumerate(items, 1):
-        label = f" · <b>{h(item.label)}</b>" if item.label else ""
-        mcap = fmt_usd(item.last_mcap or 0) if item.last_mcap else "n/a"
-        volume = fmt_usd(item.last_volume or 0) if item.last_volume else "n/a"
-        lines.append(f"{idx}. <code>{h(item.ca)}</code>{label}")
-        lines.append(f"   MC {mcap} · Vol {volume} · <code>/research {h(item.ca)}</code>")
+    launches = launches or {}
+    pages = watchlist_page_count(items)
+    page = max(1, min(page, pages))
+    visible_ids = {item.id for item in visible_watchlist_items(items, page)}
+    lines = [
+        f"⭐ <b>Watchlist</b> · {len(items)} token(s)",
+        f"Page <b>{page}/{pages}</b> · {WATCHLIST_PAGE_SIZE} per page",
+        "",
+    ]
+    index = (page - 1) * WATCHLIST_PAGE_SIZE
+    for group_name, group_items in get_watchlist_groups(items):
+        visible_group = [item for item in group_items if item.id in visible_ids]
+        if not visible_group:
+            continue
+        lines.append(f"<b>{group_name}</b>")
+        for item in visible_group:
+            index += 1
+            lines.append(format_watchlist_item(item, launches.get(item.ca), index)["text"])
+        lines.append("")
     return "\n".join(lines)[:3900]
+
+
+def format_watch_added_message(item, launch=None, *, inserted: bool = True) -> str:
+    status = "Added to watchlist" if inserted else "Watchlist updated"
+    return f"⭐ <b>{status}</b>\n\n{format_watchlist_item(item, launch, 1)['text']}"
+
+
+def format_watchlist_rows(items: list) -> str:
+    return build_watchlist_message(items)
 
 
 def format_settings_text(min_score: float) -> str:
@@ -1294,13 +1589,13 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                     await send_telegram(session, "⭐ <b>Watch token</b>\n<code>/watch 0x... [label]</code>", chat_id)
                     continue
                 tenant = await ensure_tenant_for_chat(chat_id, title=telegram_user_title(msg))
-                await send_telegram(session, f"⭐ <b>Watchlist update queued</b>\n<code>{ca}</code>", chat_id)
+                await send_telegram(session, "⭐ <b>Watchlist update queued</b>", chat_id)
 
                 async def do_watch():
                     try:
-                        _, dex = await ensure_launch_for_analysis(session, ca)
+                        launch, dex = await ensure_launch_for_analysis(session, ca)
                         async with db_session() as db:
-                            _, inserted = await upsert_watchlist_item(db, tenant_id=tenant.id, ca=ca, label=label, market_json=dex)
+                            item, inserted = await upsert_watchlist_item(db, tenant_id=tenant.id, ca=ca, label=label, market_json=dex)
                             await upsert_user_feedback(
                                 db,
                                 tenant_id=tenant.id,
@@ -1308,14 +1603,11 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                                 action="worth_watching",
                                 payload_json={"command": "/watch", "label": label},
                             )
-                        status = "Added to" if inserted else "Updated in"
-                        label_text = f" · {h(label)}" if label else ""
                         await send_telegram(
                             session,
-                            f"⭐ <b>{status} watchlist</b>{label_text}\n\n"
-                            f"<code>{ca}</code>\n"
-                            f"{h(command_market_line({'verdict': {'research': {'market': dex or {}}}}))}",
+                            format_watch_added_message(item, launch, inserted=inserted),
                             chat_id,
+                            reply_markup=build_watch_item_keyboard(item, launch),
                         )
                     except Exception as e:
                         log.error(f"Watch command failed for {ca}: {e}", exc_info=True)
@@ -1333,15 +1625,21 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                 async with db_session() as db:
                     removed = await deactivate_watchlist_item(db, tenant_id=tenant.id, ca=ca)
                 if removed:
-                    await send_telegram(session, f"✅ <b>Removed from watchlist</b>\n<code>{ca}</code>", chat_id)
+                    await send_telegram(session, f"✅ <b>Removed from watchlist</b>\n{h(short_ca(ca))}", chat_id)
                 else:
-                    await send_telegram(session, f"⭐ <b>Not in watchlist</b>\n<code>{ca}</code>", chat_id)
+                    await send_telegram(session, f"⭐ <b>Not in watchlist</b>\n{h(short_ca(ca))}", chat_id)
 
             elif cmd == "/watchlist":
                 tenant = await ensure_tenant_for_chat(chat_id, title=telegram_user_title(msg))
                 async with db_session() as db:
-                    items = await list_watchlist_items(db, tenant_id=tenant.id, limit=50)
-                await send_telegram(session, format_watchlist_rows(items), chat_id)
+                    items = await list_watchlist_items(db, tenant_id=tenant.id, limit=200)
+                launches = await load_watchlist_launches(items)
+                await send_telegram(
+                    session,
+                    build_watchlist_message(items, page=1, launches=launches),
+                    chat_id,
+                    reply_markup=build_watchlist_keyboard(items, page=1, launches=launches),
+                )
 
             elif cmd == "/settings":
                 tenant = await ensure_tenant_for_chat(chat_id, title=telegram_user_title(msg))
@@ -4312,14 +4610,23 @@ def build_watchlist_change_message(item, market: dict, launch) -> str | None:
         triggers.append(f"Vol {format_pct(volume_change)}")
     if not triggers:
         return None
-    symbol = h((launch.ticker if launch else "") or (market.get("token_symbol") or item.ca[:8]))
+    symbol, name = watch_symbol_name(item, launch)
+    title_name = f" · {h(name[:42])}" if name and name != symbol else ""
     label = f" · {h(item.label)}" if item.label else ""
+    since_mcap = pct_change(item.initial_mcap, mcap)
+    since_volume = pct_change(item.initial_volume, volume)
+    since_parts = []
+    if since_mcap is not None:
+        since_parts.append(f"add MC {format_pct(since_mcap)}")
+    if since_volume is not None:
+        since_parts.append(f"add Vol {format_pct(since_volume)}")
+    since_line = f"\nSince add: {' · '.join(since_parts[:2])}" if since_parts else ""
     return (
-        f"⭐ <b>Watchlist update</b> · ${symbol}{label}\n"
-        f"<code>{h(item.ca)}</code>\n\n"
-        f"Move: <b>{h(' · '.join(triggers))}</b>\n"
-        f"MC {fmt_usd(mcap)} · Vol {fmt_usd(volume)} · Liq {fmt_usd(liquidity)}\n"
-        f"/research {h(item.ca)}"
+        f"⭐ <b>Watchlist move</b>\n\n"
+        f"<b>${h(symbol)}</b>{title_name}{label}\n"
+        f"Move: <b>{h(' · '.join(triggers))}</b>{since_line}\n"
+        f"MC <b>{fmt_usd(mcap)}</b> · Vol {fmt_usd(volume)} · Liq {fmt_usd(liquidity)}\n"
+        f"Added {time_ago(item.created_at)} · checked now"
     )
 
 
@@ -4343,7 +4650,12 @@ async def process_watchlist_checks(session: aiohttp.ClientSession) -> int:
             await mark_watchlist_checked(db, watchlist_id=item.id, market_json=market, notified=bool(message))
         if not message or not tenant:
             continue
-        sent = await send_telegram(session, message, chat_id=tenant.external_id)
+        sent = await send_telegram(
+            session,
+            message,
+            chat_id=tenant.external_id,
+            reply_markup=build_watch_item_keyboard(item, launch),
+        )
         if sent is not None:
             notified_count += 1
     return notified_count
