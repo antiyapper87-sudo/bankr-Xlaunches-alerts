@@ -1517,6 +1517,18 @@ async def set_bot_state(db: AsyncSession, key: str, value: str | dict[str, Any])
 
 async def get_status_snapshot(db: AsyncSession) -> dict[str, Any]:
     active_tenants = await db.scalar(select(func.count()).select_from(Tenant).where(Tenant.status == "active"))
+    active_user_tenants = await db.scalar(
+        select(func.count()).select_from(Tenant).where(Tenant.status == "active", Tenant.type == "telegram_user")
+    )
+    active_group_tenants = await db.scalar(
+        select(func.count()).select_from(Tenant).where(Tenant.status == "active", Tenant.type == "telegram_group")
+    )
+    research_users = await db.scalar(
+        select(func.count()).select_from(UserCommandUsage).where(UserCommandUsage.command_key == "research")
+    )
+    research_used = await db.scalar(
+        select(func.coalesce(func.sum(UserCommandUsage.usage_count), 0)).where(UserCommandUsage.command_key == "research")
+    )
     total_launches = await db.scalar(select(func.count()).select_from(Launch))
     queued_rechecks = await db.scalar(select(func.count()).select_from(Launch).where(Launch.status == "queued_recheck"))
     signaled = await db.scalar(select(func.count()).select_from(Launch).where(Launch.status == "signaled"))
@@ -1528,6 +1540,11 @@ async def get_status_snapshot(db: AsyncSession) -> dict[str, Any]:
     cooldowns = await db.scalars(select(ProviderCooldown.provider).where(ProviderCooldown.cooldown_until > utc_now()))
     return {
         "tenants_active": int(active_tenants or 0),
+        "telegram_users_active": int(active_user_tenants or 0),
+        "telegram_groups_active": int(active_group_tenants or 0),
+        "public_started_total": int(active_user_tenants or 0) + int(active_group_tenants or 0),
+        "research_users": int(research_users or 0),
+        "research_used_total": int(research_used or 0),
         "launches_total": int(total_launches or 0),
         "queued_rechecks": int(queued_rechecks or 0),
         "launches_signaled": int(signaled or 0),

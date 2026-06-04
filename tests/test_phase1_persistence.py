@@ -204,6 +204,23 @@ async def test_public_research_quota_allows_five_requests(db_url):
 
 
 @pytest.mark.asyncio
+async def test_admin_status_counts_started_users_and_research_usage(db_url):
+    async with db_session() as db:
+        await upsert_tenant(db, tenant_type="telegram_user", external_id="701001", title="u1")
+        await upsert_tenant(db, tenant_type="telegram_user", external_id="701002", title="u2")
+        await upsert_tenant(db, tenant_type="telegram_group", external_id="-701003", title="g1")
+        await consume_user_command_quota(db, telegram_user_id="701001", command_key="research", limit=5)
+        await consume_user_command_quota(db, telegram_user_id="701001", command_key="research", limit=5)
+        status = await get_status_snapshot(db)
+
+    assert status["public_started_total"] == 3
+    assert status["telegram_users_active"] == 2
+    assert status["telegram_groups_active"] == 1
+    assert status["research_users"] == 1
+    assert status["research_used_total"] == 2
+
+
+@pytest.mark.asyncio
 async def test_admin_research_quota_is_exempt(db_url):
     import main
 
