@@ -7,6 +7,7 @@ from typing import Any
 EVM_CA_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 EVM_CA_IN_TEXT_RE = re.compile(r"\b0x[a-fA-F0-9]{40}\b")
 CASHTAG_RE = re.compile(r"\$([A-Za-z0-9]{2,10})\b")
+AI_VERDICT_EVIDENCE_TYPES = {"ca_confirmed", "project_confirmed", "pair_confirmed"}
 
 
 def normalize_ca(value: str) -> str:
@@ -52,7 +53,32 @@ def tweet_source_matches(tweet: dict[str, Any], *, ticker: str = "", address: st
     }
 
 
-def annotate_tweet_source(tweet: dict[str, Any], *, ticker: str = "", address: str = "", provider: str = "") -> dict[str, Any]:
+def classify_evidence_type(tweet: dict[str, Any], *, official_handles: set[str] | None = None) -> tuple[str, int]:
+    official_handles = official_handles or set()
+    username = str(tweet.get("username") or "").strip().lstrip("@").lower()
+    if tweet.get("ca_confirmed"):
+        return "ca_confirmed", 100
+    if username and username in official_handles and tweet.get("ticker_confirmed"):
+        return "project_confirmed", 70
+    if tweet.get("ticker_confirmed"):
+        views = int(tweet.get("views") or 0)
+        likes = int(tweet.get("likes") or 0)
+        followers = int(tweet.get("followers") or 0)
+        score = int(tweet.get("score") or tweet.get("tweet_tier_score") or 0)
+        if views >= 1000 or likes >= 25 or followers >= 5000 or score >= 8:
+            return "ticker_strong", 40
+        return "ticker_only", 10
+    return "unmatched", 0
+
+
+def annotate_tweet_source(
+    tweet: dict[str, Any],
+    *,
+    ticker: str = "",
+    address: str = "",
+    provider: str = "",
+    official_handles: set[str] | None = None,
+) -> dict[str, Any]:
     annotated = dict(tweet)
     provenance = tweet_source_matches(annotated, ticker=ticker, address=address)
     existing = list(annotated.get("source_matches") or [])
@@ -64,6 +90,10 @@ def annotate_tweet_source(tweet: dict[str, Any], *, ticker: str = "", address: s
     annotated["source_match"] = "ca" if "ca" in existing else "cashtag" if "cashtag" in existing else provenance["source_match"]
     annotated["ca_confirmed"] = "ca" in existing
     annotated["ticker_confirmed"] = "cashtag" in existing
+    evidence_type, confidence_score = classify_evidence_type(annotated, official_handles=official_handles)
+    annotated["evidence_type"] = evidence_type
+    annotated["confidence_score"] = confidence_score
+    annotated["ai_verdict_eligible"] = evidence_type in AI_VERDICT_EVIDENCE_TYPES
     if provider:
         annotated["source_provider"] = provider
     return annotated

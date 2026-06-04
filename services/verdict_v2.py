@@ -154,6 +154,8 @@ def score_social(research: dict[str, Any]) -> tuple[float, list[str], list[str]]
     evidence_count = int(social.get("evidence_count") or 0)
     project_value_score = int(social.get("project_value_score") or 0)
     hermes_social_score = int(social.get("social_score") or 0)
+    provenance = social.get("source_provenance") or {}
+    primary_evidence_count = int(provenance.get("ca_confirmed") or 0) + int(provenance.get("project_confirmed") or 0)
 
     if social.get("ca_verified"):
         score += 8
@@ -198,13 +200,15 @@ def score_social(research: dict[str, Any]) -> tuple[float, list[str], list[str]]
     if evidence_count >= 5:
         score += 2
         reasons.append("Hermes evidence set is populated")
-    if project_value_score >= 14:
+    if project_value_score >= 14 and primary_evidence_count:
         score += 2
         reasons.append("social evidence supports project value")
-    if hermes_social_score >= 70:
+    elif project_value_score >= 14 and not primary_evidence_count:
+        risks.append("X narrative is ticker-context only")
+    if hermes_social_score >= 70 and primary_evidence_count:
         score += 4
         reasons.append(f"Hermes social score is strong ({hermes_social_score}/100)")
-    elif hermes_social_score >= 50:
+    elif hermes_social_score >= 50 and primary_evidence_count:
         score += 2
         reasons.append(f"Hermes social score is watchable ({hermes_social_score}/100)")
     elif hermes_social_score and hermes_social_score < 35:

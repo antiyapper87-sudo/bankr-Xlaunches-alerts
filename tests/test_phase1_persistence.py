@@ -1182,6 +1182,78 @@ def test_social_evidence_with_ca_drops_ticker_only_and_keeps_provenance():
     assert evidence["source_provenance"]["ca_confirmed"] == 1
 
 
+def test_hybrid_social_evidence_keeps_ticker_context_without_verdict_credit():
+    from services.social_evidence import build_social_evidence
+
+    token_ca = ca(75)
+    ticker_context = {
+        "username": "ticker_context",
+        "url": "https://x.com/ticker_context/status/1",
+        "text": "$HYBRID privacy protocol thesis with real Base traction and strong narrative context.",
+        "views": 8_000,
+        "likes": 80,
+        "retweets": 10,
+        "followers": 12_000,
+        "created_at": utc_now(),
+    }
+    ca_linked = {
+        "username": "ca_linked",
+        "url": "https://x.com/ca_linked/status/2",
+        "text": f"{token_ca} $HYBRID privacy protocol thesis with real Base traction and strong narrative context.",
+        "views": 500,
+        "likes": 10,
+        "retweets": 1,
+        "created_at": utc_now(),
+    }
+
+    evidence = build_social_evidence(
+        [ticker_context, ca_linked],
+        ticker="HYBRID",
+        address=token_ca,
+        min_count=2,
+        include_context=True,
+    )
+
+    assert len(evidence["top_tweets"]) == 2
+    assert evidence["qualified"] is False
+    assert evidence["qualified_tweets"] == 1
+    assert evidence["trust_summary"]["ca_confirmed"] == 1
+    assert evidence["trust_summary"]["ticker_strong"] == 1
+    assert evidence["top_tweets"][0]["evidence_type"] == "ca_confirmed"
+    assert evidence["top_tweets"][1]["evidence_type"] == "ticker_strong"
+
+
+def test_x_signal_hybrid_summary_shows_ca_and_ticker_context():
+    from main import format_research_social_block
+    from services.social_evidence import build_social_evidence
+
+    token_ca = ca(76)
+    evidence = build_social_evidence(
+        [
+            {
+                "username": "ticker_context",
+                "url": "https://x.com/ticker_context/status/1",
+                "text": "$SUM utility product narrative with real attention and market traction.",
+                "views": 8_000,
+                "likes": 80,
+                "retweets": 10,
+                "followers": 12_000,
+                "created_at": utc_now(),
+            }
+        ],
+        ticker="SUM",
+        address=token_ca,
+        min_count=1,
+        include_context=True,
+    )
+    block = format_research_social_block("SUM", [], [], social_evidence=evidence, address=token_ca)
+
+    assert "CA proof:" in block
+    assert "none" in block
+    assert "Ticker context:" in block
+    assert "narrative exists, but attribution to this CA is not confirmed" in block
+
+
 @pytest.mark.asyncio
 async def test_ca_social_confirmation_blocks_ticker_only_social_proof(monkeypatch):
     import main

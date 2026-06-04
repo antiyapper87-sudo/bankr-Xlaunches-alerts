@@ -3326,7 +3326,8 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
         deployer_info = await resolve_deployer_x(session, address)
 
     research_tweet_age_hours = 24
-    smart_fetch = await build_smart_fetch_orchestrator(session).fetch(
+    orchestrator = build_smart_fetch_orchestrator(session)
+    ca_fetch = await orchestrator.fetch(
         ticker=ticker,
         address=address,
         latest_limit=12,
@@ -3334,9 +3335,19 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
         max_age_hours=research_tweet_age_hours,
         top_min_count=0,
     )
-    x_mentions = smart_fetch.top
+    ticker_fetch = None
+    if address:
+        ticker_fetch = await orchestrator.fetch(
+            ticker=ticker,
+            address="",
+            latest_limit=12,
+            top_limit=24,
+            max_age_hours=research_tweet_age_hours,
+            top_min_count=0,
+        )
+    x_mentions = ca_fetch.top + ((ticker_fetch.top if ticker_fetch else []) or [])
     influencer_mentions: list[dict] = []
-    nitter_mentions = smart_fetch.latest
+    nitter_mentions = ca_fetch.latest + ((ticker_fetch.latest if ticker_fetch else []) or [])
     social_evidence = build_social_evidence(
         x_mentions + influencer_mentions + nitter_mentions,
         ticker=ticker,
@@ -3344,26 +3355,34 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
         min_count=RESEARCH_MIN_QUALIFIED_TWEETS,
         max_tweets=24,
         max_age_hours=research_tweet_age_hours,
+        include_context=bool(address),
+        official_handles=dex_official_x_handles(dex),
     )
     social_evidence["fetch_strategy"] = {
         "latest_provider": "nitter",
         "top_provider": "socialdata",
-        "alpha_found": smart_fetch.alpha_found,
-        "alpha_reason": smart_fetch.alpha_reason,
-        "socialdata_called": smart_fetch.socialdata_called,
-        "latest_count": len(smart_fetch.latest),
-        "top_count": len(smart_fetch.top),
+        "alpha_found": ca_fetch.alpha_found or bool(ticker_fetch and ticker_fetch.alpha_found),
+        "alpha_reason": ca_fetch.alpha_reason if ca_fetch.alpha_found else ((ticker_fetch.alpha_reason if ticker_fetch else "") or ca_fetch.alpha_reason),
+        "socialdata_called": ca_fetch.socialdata_called or bool(ticker_fetch and ticker_fetch.socialdata_called),
+        "ca_latest_count": len(ca_fetch.latest),
+        "ca_top_count": len(ca_fetch.top),
+        "ticker_latest_count": len(ticker_fetch.latest) if ticker_fetch else 0,
+        "ticker_top_count": len(ticker_fetch.top) if ticker_fetch else 0,
+        "latest_count": len(nitter_mentions),
+        "top_count": len(x_mentions),
     }
-    if smart_fetch.socialdata_called:
+    for mode, fetch in (("ca", ca_fetch), ("ticker", ticker_fetch)):
+        if not fetch or not fetch.socialdata_called:
+            continue
         async with db_session() as db:
             await record_socialdata_usage_log(
                 db,
                 endpoint="twitter/search",
-                query_hash=hashlib.sha256(f"{ticker}:{address}:manual_top".encode("utf-8")).hexdigest()[:24],
+                query_hash=hashlib.sha256(f"{ticker}:{address}:{mode}:manual_top".encode("utf-8")).hexdigest()[:24],
                 mode="Top",
-                result_count=len(smart_fetch.top),
-                triggered_by_alpha=smart_fetch.alpha_found,
-                alpha_reason=smart_fetch.alpha_reason,
+                result_count=len(fetch.top),
+                triggered_by_alpha=fetch.alpha_found,
+                alpha_reason=fetch.alpha_reason,
             )
     launch_status = None
     launch_for_narrative = {
@@ -4136,6 +4155,20 @@ def dex_social_label(dex: dict | None, social_type: str) -> str:
     return ""
 
 
+def dex_official_x_handles(dex: dict | None) -> set[str]:
+    handles: set[str] = set()
+    for item in (dex or {}).get("socials") or []:
+        if (item.get("type") or "").lower() != "twitter":
+            continue
+        url = str(item.get("url") or "")
+        if "x.com/" not in url and "twitter.com/" not in url:
+            continue
+        handle = url.rstrip("/").split("/")[-1].split("?")[0].strip().lstrip("@").lower()
+        if handle:
+            handles.add(handle)
+    return handles
+
+
 def dex_website_domain(dex: dict | None) -> str:
     websites = (dex or {}).get("websites") or []
     if not websites:
@@ -4500,7 +4533,24 @@ def format_research_social_block(
     if evidence_tweets:
         remember_xsignal_evidence(address, social_evidence)
         thesis = hide_contract_mentions((social_evidence or {}).get("thesis") or "", address)
+        trust = (social_evidence or {}).get("trust_summary") or {}
+        ca_count = int(trust.get("ca_confirmed") or 0)
+        project_count = int(trust.get("project_confirmed") or 0)
+        ticker_context = int(trust.get("ticker_strong") or 0) + int(trust.get("ticker_only") or 0)
         lines = ["🐦 <b>X signal</b>"]
+        if address:
+            ca_label = f"{ca_count} contract-linked tweet(s)" if ca_count else "none"
+            context_label = f"{ticker_context} ticker-context tweet(s)" if ticker_context else "none"
+            lines.append(f"\n<b>CA proof:</b> {h(ca_label)}")
+            if project_count:
+                lines.append(f"<b>Project account:</b> {project_count} official-context tweet(s)")
+            lines.append(f"<b>Ticker context:</b> {h(context_label)}")
+            if ca_count:
+                lines.append("<b>Takeaway:</b> contract-linked evidence exists; ticker context is supporting only.")
+            elif ticker_context:
+                lines.append("<b>Takeaway:</b> narrative exists, but attribution to this CA is not confirmed.")
+            else:
+                lines.append("<b>Takeaway:</b> no useful X narrative passed filters yet.")
         if thesis:
             lines.append(f"\n<b>Thesis:</b> {h(thesis[:520])}")
         visible_tweets = xsignal_visible_tweets(social_evidence)

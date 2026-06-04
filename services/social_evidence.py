@@ -336,6 +336,8 @@ def build_social_evidence(
     min_count: int = 5,
     max_tweets: int = 24,
     max_age_hours: int = 24,
+    include_context: bool = False,
+    official_handles: set[str] | None = None,
 ) -> dict[str, Any]:
     hermes_context = load_hermes_context()
     seen_urls: set[str] = set()
@@ -344,8 +346,14 @@ def build_social_evidence(
         url = str(tweet.get("url") or "")
         if not tweet or url in seen_urls or not is_recent_tweet(tweet, max_age_hours=max_age_hours):
             continue
-        tweet = annotate_tweet_source(tweet, ticker=ticker, address=address, provider=tweet.get("source_provider") or tweet.get("source") or "")
-        if address and not tweet.get("ca_confirmed"):
+        tweet = annotate_tweet_source(
+            tweet,
+            ticker=ticker,
+            address=address,
+            provider=tweet.get("source_provider") or tweet.get("source") or "",
+            official_handles=official_handles,
+        )
+        if address and not include_context and not tweet.get("ca_confirmed"):
             continue
         if not passes_social_intelligence_filters(tweet):
             continue
@@ -355,6 +363,7 @@ def build_social_evidence(
     ranked.sort(
         key=lambda item: (
             ca_first_sort_key(item)[0],
+            int(item.get("confidence_score") or 0),
             -int(item.get("tweet_tier_rank") or 3),
             int(item.get("tweet_tier_score") or 0),
             int(item.get("hermes_score") or 0),
@@ -394,9 +403,22 @@ def build_social_evidence(
                 "source_provider": item.get("source_provider") or item.get("source") or "",
                 "ca_confirmed": bool(item.get("ca_confirmed")),
                 "ticker_confirmed": bool(item.get("ticker_confirmed")),
+                "evidence_type": item.get("evidence_type") or "unmatched",
+                "confidence_score": _num(item.get("confidence_score")),
+                "ai_verdict_eligible": bool(item.get("ai_verdict_eligible")),
             }
         )
-    qualified_count = sum(1 for item in top if _num(item.get("views")) >= 50 and _num(item.get("likes")) >= 5)
+    primary_evidence = [
+        item for item in top
+        if item.get("ai_verdict_eligible")
+        and _num(item.get("views")) >= 50
+        and _num(item.get("likes")) >= 5
+    ]
+    qualified_count = len(primary_evidence)
+    ticker_context_count = sum(
+        1 for item in top
+        if item.get("evidence_type") in {"ticker_strong", "ticker_only"}
+    )
 
     return {
         "schema": "social-evidence-v1",
@@ -427,6 +449,15 @@ def build_social_evidence(
         "source_provenance": {
             "ca_confirmed": sum(1 for item in evidence if item.get("ca_confirmed")),
             "ticker_confirmed": sum(1 for item in evidence if item.get("ticker_confirmed")),
+            "project_confirmed": sum(1 for item in evidence if item.get("evidence_type") == "project_confirmed"),
+            "ticker_context": ticker_context_count,
             "providers": sorted({str(item.get("source_provider") or "") for item in evidence if item.get("source_provider")}),
+        },
+        "trust_summary": {
+            "ca_confirmed": sum(1 for item in evidence if item.get("evidence_type") == "ca_confirmed"),
+            "project_confirmed": sum(1 for item in evidence if item.get("evidence_type") == "project_confirmed"),
+            "ticker_strong": sum(1 for item in evidence if item.get("evidence_type") == "ticker_strong"),
+            "ticker_only": sum(1 for item in evidence if item.get("evidence_type") == "ticker_only"),
+            "ai_verdict_eligible": len(primary_evidence),
         },
     }
