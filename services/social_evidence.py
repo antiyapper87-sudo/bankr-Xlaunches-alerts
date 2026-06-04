@@ -449,12 +449,14 @@ def build_social_evidence(
         "source_provenance": {
             "ca_confirmed": sum(1 for item in evidence if item.get("ca_confirmed")),
             "ticker_confirmed": sum(1 for item in evidence if item.get("ticker_confirmed")),
+            "pair_confirmed": sum(1 for item in evidence if item.get("evidence_type") == "pair_confirmed"),
             "project_confirmed": sum(1 for item in evidence if item.get("evidence_type") == "project_confirmed"),
             "ticker_context": ticker_context_count,
             "providers": sorted({str(item.get("source_provider") or "") for item in evidence if item.get("source_provider")}),
         },
         "trust_summary": {
             "ca_confirmed": sum(1 for item in evidence if item.get("evidence_type") == "ca_confirmed"),
+            "pair_confirmed": sum(1 for item in evidence if item.get("evidence_type") == "pair_confirmed"),
             "project_confirmed": sum(1 for item in evidence if item.get("evidence_type") == "project_confirmed"),
             "ticker_strong": sum(1 for item in evidence if item.get("evidence_type") == "ticker_strong"),
             "ticker_only": sum(1 for item in evidence if item.get("evidence_type") == "ticker_only"),

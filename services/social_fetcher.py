@@ -95,6 +95,7 @@ class SmartFetchOrchestrator:
         latest_limit: int = 12,
         top_limit: int = 24,
         max_age_hours: int = 24,
+        top_max_age_hours: int | None = None,
         force_top: bool = False,
         top_min_count: int = 0,
     ) -> SmartFetchResult:
@@ -118,7 +119,7 @@ class SmartFetchOrchestrator:
             ticker=ticker,
             address=address,
             limit=top_limit,
-            max_age_hours=max_age_hours,
+            max_age_hours=top_max_age_hours or max_age_hours,
             min_count=top_min_count,
         )
         return SmartFetchResult(
@@ -128,4 +129,3 @@ class SmartFetchOrchestrator:
             socialdata_called=True,
             alpha_reason=alpha_reason,
         )
-

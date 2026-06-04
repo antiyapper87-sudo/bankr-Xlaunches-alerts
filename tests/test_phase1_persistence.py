@@ -404,7 +404,7 @@ def test_signal_keyboard_includes_fomo_when_enabled(monkeypatch):
     ]
 
     assert "👀 Fomo" in labels
-    assert "🧬 Deep Research" in labels
+    assert "🚀 Deep Research" in labels
     fomo_url = next(
         button["url"]
         for row in keyboard["inline_keyboard"]
@@ -1680,4 +1680,35 @@ def test_project_narrative_does_not_infer_product_from_ticker_only():
     )
 
     assert narrative.confidence == "LOW"
-    assert narrative.product == "No verified project description found from screeners or qualified X evidence."
+    assert "No verified project description found" not in narrative.product
+    assert "weak signals" in narrative.product
+
+
+def test_project_narrative_infers_surplus_ai_inference_from_metadata():
+    narrative = extract_project_narrative(
+        ca=ca(77),
+        ticker="SURPLUS",
+        name="Surplus Intelligence",
+        dex={
+            "token_name": "Surplus Intelligence",
+            "token_symbol": "SURPLUS",
+            "websites": [{"url": "https://surplusintelligence.ai"}],
+            "socials": [{"type": "twitter", "url": "https://x.com/surplusintelligence"}],
+        },
+        social_evidence={
+            "qualified_tweets": 0,
+            "top_tweets": [
+                {
+                    "username": "researcher",
+                    "text": "$SURPLUS is an AI inference marketplace for decentralized intelligence on Base.",
+                    "views": 8_000,
+                    "likes": 80,
+                    "evidence_type": "ticker_strong",
+                }
+            ],
+        },
+    )
+
+    assert "No verified project description found" not in narrative.product
+    assert "AI inference" in narrative.product
+    assert "intelligence" in narrative.product.lower()

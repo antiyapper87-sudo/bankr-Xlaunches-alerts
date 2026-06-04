@@ -624,7 +624,7 @@ def build_signal_keyboard(token_address: str, symbol: str) -> dict:
         ca = token_address.lower()
         rows.append([
             {"text": "👀 Fomo", "url": build_fomo_url(ca, FOMO_DEFAULT_CHAIN_ID)},
-            {"text": "🧬 Deep Research", "callback_data": f"deep_research:{ca}"},
+            {"text": "🚀 Deep Research", "callback_data": f"deep_research:{ca}"},
         ])
     rows.append([
         {"text": "⭐ Worth watching", "callback_data": f"watch:{token_address.lower()}"},
@@ -833,7 +833,17 @@ async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: 
 
         async def do_watchlist_research():
             try:
-                await send_telegram(session, await research_token(session, ca), chat_id=chat_id)
+                report, action_keyboard, resolved_ca, _ = await research_token(session, ca, include_keyboard=True)
+                social_evidence = _xsignal_page_cache.get(xsignal_cache_key(resolved_ca or ca))
+                await send_telegram(
+                    session,
+                    report,
+                    chat_id=chat_id,
+                    reply_markup=merge_inline_keyboards(
+                        action_keyboard,
+                        build_xsignal_pagination_keyboard(resolved_ca or ca, social_evidence, 1),
+                    ),
+                )
             except Exception as exc:
                 log.error(f"Watchlist research failed for {ca}: {exc}", exc_info=True)
                 await send_telegram(session, f"❌ <b>Research failed</b>\n{h(str(exc)[:160])}", chat_id=chat_id)
@@ -874,14 +884,33 @@ async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: 
         if not is_base_contract(ca):
             await answer_callback_query(session, callback_id, "Invalid token address", show_alert=True)
             return
-        await answer_callback_query(session, callback_id, "Deep Research is coming soon")
-        await send_telegram(
-            session,
-            "🧬 <b>Deep Research</b>\n\n"
-            "This action is reserved for the next research layer. "
-            "For now use <code>/research 0x...</code> or add it to watchlist.",
-            chat_id=chat_id,
-        )
+        await answer_callback_query(session, callback_id, "Deep Research queued")
+
+        async def do_deep_research():
+            try:
+                report, action_keyboard, resolved_ca, _ = await research_token(
+                    session,
+                    ca,
+                    include_keyboard=True,
+                    search_window_hours=168,
+                    title="Deep Research",
+                )
+                target_ca = resolved_ca or ca
+                social_evidence = _xsignal_page_cache.get(xsignal_cache_key(target_ca))
+                await send_telegram(
+                    session,
+                    report,
+                    chat_id=chat_id,
+                    reply_markup=merge_inline_keyboards(
+                        action_keyboard,
+                        build_xsignal_pagination_keyboard(target_ca, social_evidence, 1),
+                    ),
+                )
+            except Exception as exc:
+                log.error(f"Deep Research failed for {ca}: {exc}", exc_info=True)
+                await send_telegram(session, f"❌ <b>Deep Research failed</b>\n{h(str(exc)[:160])}", chat_id=chat_id)
+
+        track_background_command(f"deep research {ca}", do_deep_research())
         return
 
     if len(parts) == 3 and parts[0] == "fomo_h":
@@ -1757,8 +1786,12 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
 
                 async def do_research():
                     try:
-                        report = await research_token(session, ticker_query)
-                        ca_query = ticker_query.strip().lower()
+                        report, action_keyboard, resolved_ca, _ = await research_token(
+                            session,
+                            ticker_query,
+                            include_keyboard=True,
+                        )
+                        ca_query = (resolved_ca or ticker_query).strip().lower()
                         social_evidence = (
                             _xsignal_page_cache.get(xsignal_cache_key(ca_query))
                             if is_base_contract(ca_query)
@@ -1768,7 +1801,10 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                             session,
                             report,
                             chat_id,
-                            reply_markup=build_xsignal_pagination_keyboard(ca_query, social_evidence, 1),
+                            reply_markup=merge_inline_keyboards(
+                                action_keyboard,
+                                build_xsignal_pagination_keyboard(ca_query, social_evidence, 1),
+                            ),
                         )
                     except Exception as re:
                         log.error(f"Research error for {ticker_query}: {re}")
@@ -2145,7 +2181,7 @@ async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str
 MAX_TOKEN_AGE = int(os.getenv("MAX_TOKEN_AGE", str(4 * 3600)))
 
 
-def passes_market_filters(dex: dict | None, source: str = "") -> tuple[bool, str]:
+def passes_market_filters(dex: dict | None, source: str = "", *, enforce_age: bool = True) -> tuple[bool, str]:
     """Check if token passes market filters.
 
     For safe launchpads (bankr, clanker, virtuals) — skip liquidity check
@@ -2158,12 +2194,12 @@ def passes_market_filters(dex: dict | None, source: str = "") -> tuple[bool, str
     is_safe = source.lower() in SAFE_LAUNCHPADS
 
     pair_created = dex.get("pair_created_at", 0)
-    if pair_created:
+    if enforce_age and pair_created:
         age_seconds = time.time() - (pair_created / 1000)
         if age_seconds > MAX_TOKEN_AGE:
             age_hours = age_seconds / 3600
             return False, f"too old ({age_hours:.1f}h > {MAX_TOKEN_AGE//3600}h)"
-    else:
+    elif enforce_age:
         mcap_check = float(dex.get("mcap", 0))
         if mcap_check > 200_000:
             return False, f"no creation time + high mcap ${mcap_check:,.0f}, likely old"
@@ -3255,10 +3291,18 @@ async def resolve_deployer_x(session: aiohttp.ClientSession, address: str) -> di
     return result
 
 
-async def research_token(session: aiohttp.ClientSession, query: str) -> str:
+async def research_token(
+    session: aiohttp.ClientSession,
+    query: str,
+    *,
+    include_keyboard: bool = False,
+    search_window_hours: int = 72,
+    title: str = "Research",
+) -> str | tuple[str, dict | None, str, str]:
     query = query.strip().lstrip("$").upper()
     if not query:
-        return "🔍 <b>Research</b>\n<code>/research 0x...</code>\n<code>/research $TICKER</code>"
+        text = "🔍 <b>Research</b>\n<code>/research 0x...</code>\n<code>/research $TICKER</code>"
+        return (text, None, "", "") if include_keyboard else text
 
     is_address = query.lower().startswith("0x") and len(query) == 42
     ticker = query
@@ -3325,16 +3369,19 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
     if address:
         deployer_info = await resolve_deployer_x(session, address)
 
-    research_tweet_age_hours = 24
+    nitter_age_hours = max(1, int(search_window_hours or 72))
+    socialdata_age_hours = nitter_age_hours
     orchestrator = build_smart_fetch_orchestrator(session)
     ca_fetch = await orchestrator.fetch(
         ticker=ticker,
         address=address,
         latest_limit=12,
         top_limit=24,
-        max_age_hours=research_tweet_age_hours,
+        max_age_hours=nitter_age_hours,
+        top_max_age_hours=socialdata_age_hours,
         top_min_count=0,
     )
+    ca_candidate_count = len(ca_fetch.latest) + len(ca_fetch.top)
     ticker_fetch = None
     if address:
         ticker_fetch = await orchestrator.fetch(
@@ -3342,7 +3389,9 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
             address="",
             latest_limit=12,
             top_limit=24,
-            max_age_hours=research_tweet_age_hours,
+            max_age_hours=nitter_age_hours,
+            top_max_age_hours=socialdata_age_hours,
+            force_top=ca_candidate_count < RESEARCH_MIN_QUALIFIED_TWEETS,
             top_min_count=0,
         )
     x_mentions = ca_fetch.top + ((ticker_fetch.top if ticker_fetch else []) or [])
@@ -3354,7 +3403,7 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
         address=address,
         min_count=RESEARCH_MIN_QUALIFIED_TWEETS,
         max_tweets=24,
-        max_age_hours=research_tweet_age_hours,
+        max_age_hours=socialdata_age_hours,
         include_context=bool(address),
         official_handles=dex_official_x_handles(dex),
     )
@@ -3404,11 +3453,12 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
                     "source": existing_launch.source or "manual",
                 }
     if not dex and not x_mentions and not influencer_mentions and not nitter_mentions:
-        return (
+        text = (
             f"🔍 <b>No data found for ${ticker}</b>\n\n"
             f"No Base market data or CA-verified X mentions found after spam/engagement filters.\n"
             f"Try: /research 0x..."
         )
+        return (text, None, address, ticker) if include_keyboard else text
     project_narrative = extract_project_narrative(
         ca=address,
         ticker=ticker,
@@ -3418,7 +3468,8 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
         social_evidence=social_evidence,
     )
 
-    return format_research_card(
+    body = format_research_card(
+        title=title,
         token_name=token_name or (dex or {}).get("token_name") or ticker,
         ticker=ticker,
         address=address,
@@ -3431,6 +3482,8 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
         project_narrative=project_narrative.to_dict(),
         launch_status=launch_status,
     )
+    keyboard = build_signal_keyboard(address, ticker) if address else None
+    return (body, keyboard, address, ticker) if include_keyboard else body
 
 
 def clean_watch_query(value: str) -> str:
@@ -4274,7 +4327,7 @@ def build_research_takeaway(dex: dict | None, x_mentions: list[dict], influencer
     positives: list[str] = []
     risks: list[str] = []
     if dex:
-        passes, reason = passes_market_filters(dex)
+        passes, reason = passes_market_filters(dex, enforce_age=False)
         if passes:
             positives.append("market filters pass")
         else:
@@ -4321,7 +4374,7 @@ def format_research_ai_brief(
     score = 0.0
     risks: list[str] = []
     if dex:
-        passes, reason = passes_market_filters(dex)
+        passes, reason = passes_market_filters(dex, enforce_age=False)
         if passes:
             score += 3.5
         else:
@@ -4330,7 +4383,7 @@ def format_research_ai_brief(
         risks.append("market data missing")
     if influencer_mentions:
         score += 2.0
-    elif x_mentions:
+    elif x_mentions or nitter_mentions or (social_evidence or {}).get("top_tweets"):
         score += 1.2
     else:
         risks.append("no notable X coverage")
@@ -4535,6 +4588,7 @@ def format_research_social_block(
         thesis = hide_contract_mentions((social_evidence or {}).get("thesis") or "", address)
         trust = (social_evidence or {}).get("trust_summary") or {}
         ca_count = int(trust.get("ca_confirmed") or 0)
+        pair_count = int(trust.get("pair_confirmed") or 0)
         project_count = int(trust.get("project_confirmed") or 0)
         ticker_context = int(trust.get("ticker_strong") or 0) + int(trust.get("ticker_only") or 0)
         lines = ["🐦 <b>X signal</b>"]
@@ -4542,11 +4596,13 @@ def format_research_social_block(
             ca_label = f"{ca_count} contract-linked tweet(s)" if ca_count else "none"
             context_label = f"{ticker_context} ticker-context tweet(s)" if ticker_context else "none"
             lines.append(f"\n<b>CA proof:</b> {h(ca_label)}")
+            if pair_count:
+                lines.append(f"<b>Pair proof:</b> {pair_count} screener-linked tweet(s)")
             if project_count:
                 lines.append(f"<b>Project account:</b> {project_count} official-context tweet(s)")
             lines.append(f"<b>Ticker context:</b> {h(context_label)}")
-            if ca_count:
-                lines.append("<b>Takeaway:</b> contract-linked evidence exists; ticker context is supporting only.")
+            if ca_count or pair_count or project_count:
+                lines.append("<b>Takeaway:</b> primary evidence exists; ticker context is supporting only.")
             elif ticker_context:
                 lines.append("<b>Takeaway:</b> narrative exists, but attribution to this CA is not confirmed.")
             else:
@@ -4632,10 +4688,11 @@ def format_research_card(
     social_evidence: dict | None = None,
     project_narrative: dict | None = None,
     launch_status: str | None = None,
+    title: str = "Research",
 ) -> str:
     safe_name = h(token_name or ticker or address[:10])
     safe_ticker = h(str(ticker or "").lstrip("$"))
-    source = "RESEARCH"
+    source = title.upper()
     age = fmt_token_age(dex) if dex else "n/a"
     mcap = float((dex or {}).get("mcap") or 0)
     volume = float((dex or {}).get("volume_24h") or 0)
@@ -4657,7 +4714,7 @@ def format_research_card(
         status_line = f"\n🗂 Scanner status: <code>{h(launch_status)}</code>"
 
     body = (
-        f"🔍 <b>Research</b> 🧪 <b>{source}</b>\n\n"
+        f"🔍 <b>{h(title)}</b> 🧪 <b>{h(source)}</b>\n\n"
         f"<b>{safe_name}</b> - ${safe_ticker}\n\n"
         f"🕐 <b>Launched:</b> {h(age + ' ago' if age != 'n/a' else 'n/a')}\n"
         f"•💰 <b>Market Cap.:</b> {fmt_usd(mcap)}\n"

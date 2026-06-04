@@ -33,9 +33,10 @@ NARRATIVE_GROUPS: dict[str, dict[str, Any]] = {
     "AI / Agent": {
         "terms": {
             "ai", "agent", "autonomous", "automation", "model", "inference", "workflow",
-            "llm", "compute", "robot", "assistant",
+            "llm", "compute", "robot", "assistant", "intelligence", "marketplace",
+            "ml", "machine learning", "decentralized intelligence",
         },
-        "why": "The narrative points to AI or agent utility; it needs proof beyond ticker hype and generic automation language.",
+        "why": "The narrative points to AI, inference, or intelligence infrastructure; it matters if there is real demand for compute/model access rather than ticker hype.",
     },
     "Trading / Analytics Tool": {
         "terms": {
@@ -141,6 +142,29 @@ def source_description(launch: dict[str, Any] | None, dex: dict[str, Any] | None
     return "", []
 
 
+def metadata_terms(launch: dict[str, Any] | None, dex: dict[str, Any] | None) -> tuple[str, list[str]]:
+    launch = launch or {}
+    dex = dex or {}
+    pieces = [
+        launch.get("name"),
+        launch.get("symbol"),
+        dex.get("token_name"),
+        dex.get("token_symbol"),
+    ]
+    sources: list[str] = []
+    for website in dex.get("websites") or []:
+        url = website.get("url") if isinstance(website, dict) else str(website)
+        if url:
+            pieces.append(str(url).replace("https://", "").replace("http://", "").replace(".", " "))
+            sources.append("Screener metadata")
+    for social in dex.get("socials") or []:
+        url = social.get("url") if isinstance(social, dict) else str(social)
+        if url:
+            pieces.append(str(url).replace("https://", "").replace("http://", "").replace(".", " "))
+            sources.append("Screener metadata")
+    return clean_text(" ".join(str(piece or "") for piece in pieces), limit=500), sources
+
+
 def tweet_text(tweet: dict[str, Any]) -> str:
     return clean_text(tweet.get("excerpt") or tweet.get("text") or "", limit=420)
 
@@ -219,8 +243,13 @@ def product_line(group: str, name: str, desc: str, keywords: list[str], *, sourc
     if desc:
         return clean_text(desc, limit=220)
     display = clean_text(name, limit=80) or "This token"
-    if group == "Unclear / Experimental" or not source_backed:
-        return "No verified project description found from screeners or qualified X evidence."
+    if group == "Unclear / Experimental":
+        return f"{display} has limited public context from current screeners/X evidence; project description remains thin."
+    if not source_backed:
+        return f"{display} has weak signals around {group.lower()}, but source attribution is not strong yet."
+    if group == "AI / Agent":
+        if any(term in keywords for term in ("inference", "marketplace", "intelligence", "decentralized intelligence")):
+            return f"{display} appears to be an AI inference / decentralized intelligence platform on Base."
     keyword_part = ", ".join(keywords[:3])
     qualifier = "appears positioned as" if source_backed else "has weak ticker-only signs of"
     return f"{display} {qualifier} {group.lower()}" + (f" ({keyword_part})." if keyword_part else ".")
@@ -261,7 +290,8 @@ def extract_project_narrative(
 ) -> ProjectNarrative:
     tweets = tweets or list((social_evidence or {}).get("top_tweets") or [])
     desc, sources = source_description(launch, dex)
-    text_pool = " ".join([desc, name, ticker] + [tweet_text(tweet) for tweet in tweets[:12]])
+    metadata_text, metadata_sources = metadata_terms(launch, dex)
+    text_pool = " ".join([desc, metadata_text, name, ticker] + [tweet_text(tweet) for tweet in tweets[:12]])
     group, keywords, unique_authors = best_narrative_group(text_pool, tweets)
     ca_mentions = ca_confirmed_tweets(tweets, ca)
     qualified_count = qualified_tweets(social_evidence, tweets)
@@ -278,13 +308,14 @@ def extract_project_narrative(
     )
     if tweets:
         sources.append("X")
+    sources.extend(metadata_sources)
     sources = sorted(set(sources), key=sources.index)
 
     if collision and ticker_only:
         product = "Possible same-ticker collision; project description is not safe to attribute to this contract."
         why = "Ticker-only evidence can belong to another token, so the current CA needs contract-specific proof."
     else:
-        source_backed = has_description or unique_authors >= 2 or ca_mentions > 0
+        source_backed = has_description or bool(metadata_text.strip()) or unique_authors >= 2 or ca_mentions > 0
         product = product_line(group, name or ticker, desc, keywords, source_backed=source_backed)
         why = str(NARRATIVE_GROUPS.get(group, {}).get("why") or "Current sources do not explain a durable reason for the token to matter yet.")
         if ticker_only:

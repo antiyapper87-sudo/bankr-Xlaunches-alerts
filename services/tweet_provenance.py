@@ -8,6 +8,13 @@ EVM_CA_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 EVM_CA_IN_TEXT_RE = re.compile(r"\b0x[a-fA-F0-9]{40}\b")
 CASHTAG_RE = re.compile(r"\$([A-Za-z0-9]{2,10})\b")
 AI_VERDICT_EVIDENCE_TYPES = {"ca_confirmed", "project_confirmed", "pair_confirmed"}
+PAIR_LINK_TERMS = (
+    "dexscreener.com/base",
+    "geckoterminal.com/base",
+    "gmgn.ai/base/token",
+    "app.uniswap.org",
+    "basescan.org/token",
+)
 
 
 def normalize_ca(value: str) -> str:
@@ -56,8 +63,11 @@ def tweet_source_matches(tweet: dict[str, Any], *, ticker: str = "", address: st
 def classify_evidence_type(tweet: dict[str, Any], *, official_handles: set[str] | None = None) -> tuple[str, int]:
     official_handles = official_handles or set()
     username = str(tweet.get("username") or "").strip().lstrip("@").lower()
+    text = str(tweet.get("text") or tweet.get("excerpt") or "").lower()
     if tweet.get("ca_confirmed"):
         return "ca_confirmed", 100
+    if tweet.get("ticker_confirmed") and any(term in text for term in PAIR_LINK_TERMS):
+        return "pair_confirmed", 80
     if username and username in official_handles and tweet.get("ticker_confirmed"):
         return "project_confirmed", 70
     if tweet.get("ticker_confirmed"):
