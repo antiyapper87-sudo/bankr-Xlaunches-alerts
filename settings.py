@@ -11,6 +11,11 @@ class Settings(BaseSettings):
     authorized_user_ids: str = "544999608"
 
     socialdata_api_key: str = ""
+    coingecko_api_key: str = ""
+    coingecko_discovery_enabled: bool = False
+    coingecko_discovery_limit: int = 25
+    coingecko_poll_interval: int = 720
+    coingecko_rate_limit_per_min: int = 12
 
     database_url: str = "postgresql+asyncpg://user:pass@localhost:5432/bankr_alerts"
     local_database_url: str = "sqlite+aiosqlite:///data/bot.db"

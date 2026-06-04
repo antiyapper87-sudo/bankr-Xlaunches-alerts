@@ -1,11 +1,27 @@
 from __future__ import annotations
 
-from datetime import timedelta
+import os
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import quote
+
+import aiohttp
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import get_recent_launches_by_ticker, get_ticker_history, upsert_spoof_signal, utc_now
+from database import Launch, get_recent_launches_by_ticker, upsert_spoof_signal, utc_now
+
+
+MIN_MCAP = int(os.getenv("MIN_MCAP", "50000"))
+MIN_VOLUME_24H = int(os.getenv("MIN_VOLUME_24H", "30000"))
+MIN_LIQUIDITY = int(os.getenv("MIN_LIQUIDITY", "30000"))
+MAX_TOKEN_AGE = int(os.getenv("MAX_TOKEN_AGE", str(4 * 3600)))
+SAFE_LAUNCHPADS = {"bankr", "clanker", "virtuals"}
+SAME_TICKER_LOOKBACK = timedelta(seconds=MAX_TOKEN_AGE)
+SAME_TICKER_PRIOR_LOOKBACK = timedelta(hours=int(os.getenv("SAME_TICKER_PRIOR_LOOKBACK_HOURS", "48")))
+SAME_TICKER_EXTERNAL_ENABLED = os.getenv("SAME_TICKER_EXTERNAL_ENABLED", "true").lower() == "true"
+SAME_TICKER_EXTERNAL_TIMEOUT_SEC = int(os.getenv("SAME_TICKER_EXTERNAL_TIMEOUT_SEC", "8"))
+GECKOTERMINAL_API_URL = "https://api.geckoterminal.com/api/v2"
 
 
 def severity_from_impact(impact: float) -> str:
@@ -14,6 +30,262 @@ def severity_from_impact(impact: float) -> str:
     if impact >= 9:
         return "medium"
     return "low"
+
+
+def age_seconds_from_pair_created(pair_created_at: Any) -> float | None:
+    if not pair_created_at:
+        return None
+    if isinstance(pair_created_at, str) and not pair_created_at.isdigit():
+        try:
+            dt = datetime.fromisoformat(pair_created_at.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return max(0.0, utc_now().timestamp() - dt.timestamp())
+        except ValueError:
+            return None
+    try:
+        value = float(pair_created_at)
+        if value > 10_000_000_000:
+            value = value / 1000
+        return max(0.0, utc_now().timestamp() - value)
+    except (TypeError, ValueError):
+        return None
+
+
+def age_seconds_from_launch(launch: Launch, market: dict[str, Any]) -> float | None:
+    pair_created_at = market.get("pair_created_at") if market else 0
+    age_seconds = age_seconds_from_pair_created(pair_created_at)
+    if age_seconds is not None:
+        return age_seconds
+
+    started_at = launch.launched_at or launch.first_seen_at
+    if not started_at:
+        return None
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=utc_now().tzinfo)
+    return max(0.0, (utc_now() - started_at).total_seconds())
+
+
+def passes_market_thresholds(market: dict[str, Any], source: str = "dexscreener") -> bool:
+    mcap = float(market.get("mcap") or 0)
+    volume = float(market.get("volume_24h") or 0)
+    liquidity = float(market.get("liquidity") or 0)
+    source = (source or "").lower()
+    if mcap < MIN_MCAP or volume < MIN_VOLUME_24H:
+        return False
+    if source not in SAFE_LAUNCHPADS and liquidity < MIN_LIQUIDITY:
+        return False
+    return True
+
+
+def passes_same_ticker_filters(
+    launch: Launch,
+    *,
+    min_age_seconds: float = 0,
+    max_age_seconds: float = MAX_TOKEN_AGE,
+) -> bool:
+    market = launch.market_json or {}
+    age_seconds = age_seconds_from_launch(launch, market)
+    if age_seconds is None or age_seconds < min_age_seconds or age_seconds > max_age_seconds:
+        return False
+    return passes_market_thresholds(market, launch.source or "")
+
+
+def passes_same_ticker_candidate_filters(
+    candidate: dict[str, Any],
+    *,
+    min_age_seconds: float = 0,
+    max_age_seconds: float = MAX_TOKEN_AGE,
+) -> bool:
+    age_seconds = candidate.get("age_seconds")
+    if age_seconds is None or float(age_seconds) < min_age_seconds or float(age_seconds) > max_age_seconds:
+        return False
+    return passes_market_thresholds(candidate, candidate.get("source") or "dexscreener")
+
+
+def format_same_ticker_candidate(launch: Launch) -> dict[str, Any]:
+    market = launch.market_json or {}
+    age_seconds = age_seconds_from_launch(launch, market)
+    return {
+        "ca": launch.ca,
+        "source": launch.source,
+        "name": launch.name or "",
+        "ticker": launch.ticker or "",
+        "age_minutes": round((age_seconds or 0) / 60, 1),
+        "age_seconds": round(age_seconds or 0, 1),
+        "mcap": float(market.get("mcap") or 0),
+        "volume_24h": float(market.get("volume_24h") or 0),
+        "liquidity": float(market.get("liquidity") or 0),
+    }
+
+
+def format_age_short(age_seconds: float | None) -> str:
+    if age_seconds is None:
+        return "unknown age"
+    if age_seconds < 3600:
+        return f"{int(age_seconds / 60)}m"
+    if age_seconds < 86400:
+        return f"{age_seconds / 3600:.1f}h"
+    return f"{age_seconds / 86400:.1f}d"
+
+
+async def find_same_ticker_passed_launches(
+    db: AsyncSession,
+    *,
+    ca: str,
+    ticker: str,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    clean_ticker = (ticker or "").strip().lstrip("$").upper()
+    if not clean_ticker:
+        return []
+
+    recent = await get_recent_launches_by_ticker(
+        db,
+        ticker=clean_ticker,
+        since=utc_now() - SAME_TICKER_LOOKBACK,
+        limit=50,
+    )
+    current_ca = ca.lower()
+    candidates = [
+        launch
+        for launch in recent
+        if launch.ca.lower() != current_ca and passes_same_ticker_filters(launch)
+    ]
+    candidates.sort(
+        key=lambda launch: float((launch.market_json or {}).get("mcap") or 0),
+        reverse=True,
+    )
+    return [format_same_ticker_candidate(launch) for launch in candidates[:limit]]
+
+
+async def find_same_ticker_prior_passed_launches(
+    db: AsyncSession,
+    *,
+    ca: str,
+    ticker: str,
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    clean_ticker = (ticker or "").strip().lstrip("$").upper()
+    if not clean_ticker:
+        return []
+
+    recent = await get_recent_launches_by_ticker(
+        db,
+        ticker=clean_ticker,
+        since=utc_now() - SAME_TICKER_PRIOR_LOOKBACK,
+        limit=100,
+    )
+    current_ca = ca.lower()
+    max_age = SAME_TICKER_PRIOR_LOOKBACK.total_seconds()
+    candidates = [
+        launch
+        for launch in recent
+        if launch.ca.lower() != current_ca
+        and passes_same_ticker_filters(
+            launch,
+            min_age_seconds=MAX_TOKEN_AGE,
+            max_age_seconds=max_age,
+        )
+    ]
+    candidates.sort(
+        key=lambda launch: float((launch.market_json or {}).get("mcap") or 0),
+        reverse=True,
+    )
+    return [format_same_ticker_candidate(launch) for launch in candidates[:limit]]
+
+
+def parse_geckoterminal_same_ticker_candidates(
+    data: dict[str, Any],
+    *,
+    ticker: str,
+    current_ca: str,
+) -> list[dict[str, Any]]:
+    clean_ticker = (ticker or "").strip().lstrip("$").upper()
+    current_ca = (current_ca or "").lower()
+    if not clean_ticker:
+        return []
+
+    candidates: list[dict[str, Any]] = []
+    for pool in data.get("data", []) or []:
+        attrs = pool.get("attributes") or {}
+        relationships = pool.get("relationships") or {}
+        base_token_id = ((relationships.get("base_token") or {}).get("data") or {}).get("id") or ""
+        base_ca = str(base_token_id).replace("base_", "").lower()
+        if not base_ca or base_ca == current_ca:
+            continue
+
+        pool_name = str(attrs.get("name") or "")
+        base_symbol = pool_name.split(" / ")[0].strip().upper() if " / " in pool_name else ""
+        if base_symbol != clean_ticker:
+            continue
+
+        age_seconds = age_seconds_from_pair_created(attrs.get("pool_created_at"))
+        volume = attrs.get("volume_usd") or {}
+        price_change = attrs.get("price_change_percentage") or {}
+        transactions = attrs.get("transactions") or {}
+        h1_txns = transactions.get("h1") or {}
+        h24_txns = transactions.get("h24") or {}
+        pool_address = attrs.get("address") or ""
+        candidate = {
+            "ca": base_ca,
+            "source": "geckoterminal",
+            "dex_id": (((relationships.get("dex") or {}).get("data") or {}).get("id") or ""),
+            "name": base_symbol.title(),
+            "ticker": clean_ticker,
+            "age_minutes": round((age_seconds or 0) / 60, 1),
+            "age_seconds": round(age_seconds or 0, 1) if age_seconds is not None else None,
+            "mcap": float(attrs.get("market_cap_usd") or attrs.get("fdv_usd") or 0),
+            "volume_24h": float(volume.get("h24") or 0),
+            "liquidity": float(attrs.get("reserve_in_usd") or 0),
+            "price_change_1h": float(price_change.get("h1") or 0),
+            "txns_h1_buys": int(h1_txns.get("buys") or 0),
+            "txns_h1_sells": int(h1_txns.get("sells") or 0),
+            "txns_h24_buys": int(h24_txns.get("buys") or 0),
+            "txns_h24_sells": int(h24_txns.get("sells") or 0),
+            "pool_address": pool_address,
+            "pair_url": f"https://www.geckoterminal.com/base/pools/{pool_address}" if pool_address else "",
+        }
+        candidates.append(candidate)
+    return candidates
+
+
+async def fetch_external_same_ticker_candidates(
+    *,
+    ticker: str,
+    current_ca: str,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    clean_ticker = (ticker or "").strip().lstrip("$").upper()
+    if not clean_ticker or not SAME_TICKER_EXTERNAL_ENABLED:
+        return []
+    url = f"{GECKOTERMINAL_API_URL}/search/pools?query={quote(clean_ticker)}&network=base&page=1"
+    headers = {"Accept": "application/json;version=20230302"}
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=SAME_TICKER_EXTERNAL_TIMEOUT_SEC)) as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
+    except Exception:
+        return []
+    candidates = parse_geckoterminal_same_ticker_candidates(data, ticker=clean_ticker, current_ca=current_ca)
+    candidates.sort(key=lambda item: float(item.get("mcap") or 0), reverse=True)
+    return candidates[:limit]
+
+
+def merge_same_ticker_candidates(*groups: list[dict[str, Any]], limit: int = 5) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for group in groups:
+        for item in group:
+            key = (item.get("ca") or "").lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+    merged.sort(key=lambda item: float(item.get("mcap") or 0), reverse=True)
+    return merged[:limit]
 
 
 async def detect_spoof_signals(
@@ -170,31 +442,76 @@ async def detect_spoof_signals(
             }
         )
 
-    history = await get_ticker_history(
+    same_ticker_matches = await find_same_ticker_passed_launches(
         db,
+        ca=ca,
         ticker=ticker,
-        since=utc_now() - timedelta(days=60),
         limit=25,
     )
-    recent_launches = await get_recent_launches_by_ticker(
-        db,
-        ticker=ticker,
-        since=utc_now() - timedelta(days=60),
-        limit=25,
-    )
-    prior_contracts = {row.ca for row in history if row.ca != ca.lower()}
-    prior_contracts.update(row.ca for row in recent_launches if row.ca != ca.lower())
-    if len(prior_contracts) >= 2:
+    if same_ticker_matches:
+        match_count = len(same_ticker_matches)
+        pair_word = "pair" if match_count == 1 else "pairs"
+        clean_ticker = (ticker or "").strip().lstrip("$").upper()
         signals.append(
             {
-                "signal_type": "ticker_reuse",
-                "score_impact": min(22.0, 8.0 + len(prior_contracts) * 3.0),
-                "title": "Ticker has recent reuse history",
-                "details": f"Ticker appeared {len(prior_contracts)} other times in the last 60 days.",
+                "signal_type": "same_ticker_fresh_passed_filters",
+                "score_impact": min(22.0, 10.0 + match_count * 4.0),
+                "title": f"ticker collision: {match_count} other fresh ${clean_ticker} {pair_word} passed filters",
+                "details": (
+                    f"{match_count} other fresh Base {pair_word} with ticker ${clean_ticker} "
+                    "also passed the scanner filters. This can be organic reuse, but it can also indicate spoofing around an anticipated launch."
+                ),
                 "evidence_json": {
-                    "ticker": ticker,
-                    "prior_count_60d": len(prior_contracts),
-                    "prior_contracts": list(sorted(prior_contracts))[:10],
+                    "ticker": clean_ticker,
+                    "lookback_seconds": MAX_TOKEN_AGE,
+                    "matched_count": match_count,
+                    "matches": same_ticker_matches[:3],
+                },
+            }
+        )
+
+    prior_local = await find_same_ticker_prior_passed_launches(
+        db,
+        ca=ca,
+        ticker=ticker,
+        limit=25,
+    )
+    prior_external = await fetch_external_same_ticker_candidates(
+        ticker=ticker,
+        current_ca=ca,
+        limit=25,
+    )
+    max_prior_age = SAME_TICKER_PRIOR_LOOKBACK.total_seconds()
+    prior_external = [
+        item
+        for item in prior_external
+        if passes_same_ticker_candidate_filters(
+            item,
+            min_age_seconds=MAX_TOKEN_AGE,
+            max_age_seconds=max_prior_age,
+        )
+    ]
+    prior_matches = merge_same_ticker_candidates(prior_local, prior_external, limit=5)
+    if prior_matches:
+        match_count = len(prior_matches)
+        pair_word = "market" if match_count == 1 else "markets"
+        clean_ticker = (ticker or "").strip().lstrip("$").upper()
+        top = prior_matches[0]
+        top_age = format_age_short(float(top.get("age_seconds") or 0))
+        signals.append(
+            {
+                "signal_type": "same_ticker_prior_passed_filters",
+                "score_impact": min(24.0, 14.0 + match_count * 4.0),
+                "title": f"prior ${clean_ticker} {pair_word} passed filters ({top_age} old)",
+                "details": (
+                    f"{match_count} older Base {pair_word} with ticker ${clean_ticker} "
+                    "passed the scanner filters before this launch. Treat the new pair as weak until it proves independent demand."
+                ),
+                "evidence_json": {
+                    "ticker": clean_ticker,
+                    "lookback_seconds": int(max_prior_age),
+                    "matched_count": match_count,
+                    "matches": prior_matches[:3],
                 },
             }
         )

@@ -1,17 +1,19 @@
 # Bankr X Launches Alerts
 
-Monitors early Base token launches from Bankr, Clanker, DexScreener and Virtuals.
-Alerts Telegram with market context, X research links, watched-influencer signals and an
-optional deterministic auto-verdict block.
+Monitors early Base token launches from Bankr, Clanker, DexScreener, CoinGecko Onchain and Virtuals.
+Any Telegram user can press `/start` in DM to subscribe. Alerts are delivered with market context,
+X research links, watched-influencer signals and an optional deterministic auto-verdict block.
 
 ## How it works
 
 1. Polls launch sources and rechecks new tokens while market data is still indexing.
 2. Enriches launches with DexScreener/GeckoTerminal market data.
 3. Filters by market cap, volume, liquidity and source-specific safety rules.
-4. Sends Telegram alerts with X Research, Ticker X, Copy CA and chart/trading links.
+4. Fans out Telegram alerts to active DM/group tenants with X Research, Ticker X, Copy CA and chart/trading links.
 5. Optionally attaches deterministic research verdicts in the background.
 6. Builds Phase 2 Verdict 2.0 research, spoof checks and AI-summary stubs for Base CAs.
+7. Supports Phase 3 retention features: user watchlists, per-user min score and signal feedback.
+8. Stores Phase 4 tracked wallets and wallet events for Base smart-money confirmation.
 
 ## Setup
 
@@ -20,10 +22,10 @@ optional deterministic auto-verdict block.
 - Send `/newbot` and follow the prompts
 - Copy the bot token
 
-### 2. Get Chat ID
-- Send `/start` to your new bot
-- Visit `https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates`
-- Find `"chat":{"id":` — that's your chat ID (use group ID for groups)
+### 2. Subscribe Users
+- Send `/start` to the bot in DM
+- The bot registers that Telegram chat as an active tenant and sends an English introduction
+- `TELEGRAM_CHAT_ID` is optional and is only used as a default group/admin alert destination
 
 ### 3. Deploy
 - Push this repo to GitHub
@@ -36,7 +38,7 @@ optional deterministic auto-verdict block.
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `TELEGRAM_BOT_TOKEN` | ✅ | — | Bot token from @BotFather |
-| `TELEGRAM_CHAT_ID` | ✅ | — | Chat/group ID for alerts |
+| `TELEGRAM_CHAT_ID` | ❌ | — | Optional default chat/group ID for alerts and admin group commands |
 | `AUTHORIZED_USER_IDS` | ❌ | `544999608` | Comma-separated Telegram user IDs allowed to DM commands |
 | `SOCIALDATA_API_KEY` | ✅ | — | SocialData key for X follower and tweet research |
 | `APP_ENV` | ❌ | `local` | Use `production`/`staging` with Postgres |
@@ -52,35 +54,68 @@ optional deterministic auto-verdict block.
 | `POLL_INTERVAL` | ❌ | `30` | Seconds between API polls |
 | `DEXSCREENER_DISCOVERY_ENABLED` | ❌ | `true` | Poll DexScreener latest Base profiles/boosts/CTOs as a launch source |
 | `DEXSCREENER_DISCOVERY_LIMIT` | ❌ | `40` | Max DexScreener Base discoveries per poll |
+| `COINGECKO_API_KEY` | Required if enabled | — | CoinGecko Demo API key for Onchain Base `new_pools` discovery |
+| `COINGECKO_DISCOVERY_ENABLED` | ❌ | `false` | Poll CoinGecko Onchain latest Base pools as a DEX discovery source |
+| `COINGECKO_DISCOVERY_LIMIT` | ❌ | `25` | Max CoinGecko Base pools normalized per poll |
+| `COINGECKO_POLL_INTERVAL` | ❌ | `720` | Seconds between CoinGecko calls; 720s is 5 calls/hour, about 3.6k calls/month |
+| `COINGECKO_RATE_LIMIT_PER_MIN` | ❌ | `12` | Local safety cap under the Demo plan limit |
 | `AUTO_VERDICT_ENABLED` | ❌ | `false` | Attach deterministic research verdicts to signal messages |
 | `AUTO_VERDICT_TIMEOUT_SEC` | ❌ | `12` | Max time spent building one verdict |
 | `AUTO_VERDICT_MAX_CONCURRENT` | ❌ | `2` | Max concurrent verdict jobs |
-| `TRADING_ENABLED` | ❌ | `false` | Enables Telegram trade commands/buttons only when trader IDs are configured |
-| `TRADER_USER_IDS` | Required for trading | — | Comma-separated Telegram user IDs authorized for trade commands |
-| `ALLOW_UNSAFE_TRADING` | ❌ | `false` | Must stay false until quote/minOut-protected on-chain trading is implemented |
-| `ALCHEMY_RPC_URL` | Required for wallet/trading | — | Base RPC URL |
-| `PRIVATE_KEY` | Required for wallet/trading | — | Trading wallet private key |
-| `AUTO_EXECUTE` | ❌ | `false` | Bankr API auto-buy after a Telegram signal is sent |
-| `BANKR_EXECUTION_API_KEY` | Required for auto-execute | — | Bankr execution API key |
+| `SAME_TICKER_EXTERNAL_ENABLED` | ❌ | `true` | Checks GeckoTerminal for older same-ticker Base markets during Verdict 2.0 |
+| `SAME_TICKER_PRIOR_LOOKBACK_HOURS` | ❌ | `48` | Lookback for prior same-ticker markets that passed scanner filters |
+| `SAME_TICKER_EXTERNAL_TIMEOUT_SEC` | ❌ | `8` | Timeout for same-ticker GeckoTerminal fallback |
+| `TELEGRAM_SIGNAL_DELIVERY_LIMIT` | ❌ | `2000` | Max pending Telegram deliveries sent synchronously per signal |
+| `WATCHLIST_CHECK_INTERVAL` | ❌ | `900` | Seconds between per-token watchlist market checks |
+| `WATCHLIST_CHECK_BATCH` | ❌ | `100` | Max due watchlist rows checked per bot loop |
+| `WATCHLIST_NOTIFY_MCAP_CHANGE_PCT` | ❌ | `50` | Alert threshold for watchlist market-cap move |
+| `WATCHLIST_NOTIFY_VOLUME_CHANGE_PCT` | ❌ | `100` | Alert threshold for watchlist volume move |
+| `WALLET_MONITOR_ENABLED` | ❌ | `false` | Enables tracked-wallet polling on Base |
+| `WALLET_POLL_INTERVAL` | ❌ | `60` | Seconds between tracked wallet checks |
+| `WALLET_POLL_BATCH` | ❌ | `50` | Max tracked wallets checked per loop |
+| `WALLET_LOOKBACK_BLOCKS` | ❌ | `1200` | Initial Base block lookback for new tracked wallets |
+| `ALCHEMY_RPC_URL` | Required for wallet monitoring | — | Base RPC URL |
 
-Phase 2 research commands:
+Public Telegram commands:
 
 ```text
+/start
+/help
+/status
+/research $TICKER
+/research 0xCONTRACT
 /verdict2 0xCONTRACT
 /spoof_check 0xCONTRACT
 /summary 0xCONTRACT
+/watch 0xCONTRACT [label]
+/unwatch 0xCONTRACT
+/watchlist
+/settings
+/settings min_score 7.5
 ```
+
+`/research` uses the same compact token-card layout as scanner alerts. X mentions are
+filtered before display with the imported Jarvis rules: exact ticker/CA relevance,
+tiered thesis/action/metric scoring, noise and hashtag spam suppression, trusted-account
+boosts, engagement/velocity boosts and duplicate removal.
+
+Admin wallet-tracking commands:
+
+```text
+/track 0xWALLET [label]
+/untrack 0xWALLET
+/wallets
+```
+
+Wallet monitoring is off by default. When `WALLET_MONITOR_ENABLED=true` and
+`ALCHEMY_RPC_URL` points to a Base Alchemy endpoint, ERC-20 transfer events are stored in
+`wallet_events` and recent inflow appears as Smart Money evidence in Verdict 2.0.
 
 The AI summary provider is currently a deterministic stub. It is intentionally not wired to
 an external AI model yet.
 
-Trading is fail-closed:
-
-- `TRADING_ENABLED=true` is ignored unless `TRADER_USER_IDS` is non-empty.
-- `/buy`, `/sell`, `/wallet` and inline trade callbacks reject non-trader users.
-- On-chain buy/sell execution returns an error unless `ALLOW_UNSAFE_TRADING=true`.
-- Keep `ALLOW_UNSAFE_TRADING=false` until slippage quotes, non-zero `amountOutMinimum`,
-  nonce serialization and async-safe web3 execution are implemented.
+Trading is intentionally not part of this bot. Signal actions are limited to research,
+watchlist and feedback flows.
 
 ## Local Testing
 

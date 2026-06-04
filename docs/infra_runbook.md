@@ -84,17 +84,24 @@ DATABASE_AUTO_CREATE=false
 REDIS_URL=redis://...
 RQ_QUEUE_NAME=launches
 TELEGRAM_BOT_TOKEN=...
-TELEGRAM_CHAT_ID=...
 AUTHORIZED_USER_IDS=...
 SOCIALDATA_API_KEY=...
+COINGECKO_API_KEY=...
+COINGECKO_DISCOVERY_ENABLED=true
+COINGECKO_POLL_INTERVAL=720
+TELEGRAM_SIGNAL_DELIVERY_LIMIT=2000
+WATCHLIST_CHECK_INTERVAL=900
+WATCHLIST_CHECK_BATCH=100
+WALLET_MONITOR_ENABLED=false
+WALLET_POLL_INTERVAL=60
+WALLET_POLL_BATCH=50
 ```
 
-Trading remains disabled unless explicitly configured:
+`TELEGRAM_CHAT_ID` is optional. Set it only when you want one default group/chat tenant
+in addition to self-serve DM subscribers from `/start`.
 
-```text
-TRADING_ENABLED=false
-ALLOW_UNSAFE_TRADING=false
-```
+Trading is not part of the runtime. Do not configure trading or private-key execution
+environment variables on the bot host.
 
 ## Deployment Checklist
 
@@ -106,11 +113,22 @@ ALLOW_UNSAFE_TRADING=false
 - Start exactly one `bot` process.
 - Start one or more `worker` processes.
 - Confirm `/status` reports DB-backed launch, signal, delivery and cooldown state.
-- Keep `ALLOW_UNSAFE_TRADING=false`.
+- Send `/start` from a fresh Telegram user and confirm it receives the English welcome
+  plus future DM signals.
+- Add `/watch 0xCONTRACT test`, confirm `/watchlist`, then `/unwatch 0xCONTRACT`.
+- Add `/track 0xWALLET label`, confirm `/wallets`, then `/untrack 0xWALLET`.
 
 ## Operational Notes
 
 - `data/*.db` files are local-only and ignored by git.
 - Provider 429s are persisted in `provider_cooldowns`.
+- CoinGecko Demo credits are limited; `COINGECKO_POLL_INTERVAL=720` keeps usage near
+  5 calls/hour and about 3.6k calls/month.
 - Failed Telegram signal sends are stored in `signal_deliveries` with retry status.
+- Signal fanout is tenant-driven. `/start` creates an active `telegram_user` tenant with
+  Bankr, Clanker, Virtuals, DexScreener and CoinGecko enabled by default.
+- Watchlist checks run inside the bot loop for now. They are DB-backed and can move to
+  an RQ worker later without changing Telegram commands.
+- Tracked wallets are DB-backed. Wallet polling is off by default and requires a Base
+  Alchemy-compatible `ALCHEMY_RPC_URL` plus `WALLET_MONITOR_ENABLED=true`.
 - `worker.py` must stay import-safe and must not import `main.py`.

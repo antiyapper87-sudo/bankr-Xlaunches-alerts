@@ -28,6 +28,18 @@ services:
       timeout: 3s
       retries: 20
 
+  nitter:
+    image: zedeus/nitter:latest
+    profiles: ["nitter"]
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "18080:8080"
+    volumes:
+      - ./nitter.conf:/src/nitter.conf:ro
+    restart: unless-stopped
+
 volumes:
   bankr_postgres_data:
   bankr_redis_data:

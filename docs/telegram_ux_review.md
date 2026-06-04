@@ -56,11 +56,9 @@ When deterministic verdict enrichment completes, the placeholder is replaced wit
 The inline keyboard is now research-first:
 
 1. X Research
-2. Gecko / GMGN
-3. Copy CA / Ticker X
-4. Banana Gun
+2. Worth watching / Skip
 
-Trading remains available as an external action, but it no longer occupies the first decision slot.
+Trading, ticker-only and copy shortcuts were removed from the signal card to reduce noise.
 
 ## AI Integration Placeholder
 
@@ -79,7 +77,6 @@ Future AI output should stay short:
 ## Open UX Questions
 
 - Should the signal include both text links and inline buttons, or should most links move to buttons?
-- Should `Banana Gun` be hidden completely while internal trading is disabled?
 - Should the verdict label be renamed from `SOLID/MID/WEAK` to more trading-native terms like `WATCH/WAIT/SKIP`?
 - Should watched influencer mentions be shown directly in the first signal when available, or only inside the edited verdict block?
 - Should `/research` return a compact default view with an optional verbose mode later?

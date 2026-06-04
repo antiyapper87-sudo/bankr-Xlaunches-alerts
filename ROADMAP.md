@@ -20,7 +20,7 @@ watchlist, smart-money tracking и дальнейшую монетизацию.
 - Для сервиса на 1000+ клиентов использовать managed Postgres + Redis/queue.
 - Каждую фазу заканчивать тестированием и 1-2 днями на багфиксы.
 - После каждой фазы обновлять `architecture.md`.
-- Не включать on-chain trading до отдельной безопасной реализации.
+- Не добавлять trading/execution в этот бот; продукт остается research/monitoring.
 
 ## Фаза 0: Подготовка
 
@@ -365,6 +365,6 @@ Smart Money inflow: 3 wallets в первые 3 минуты
 ## Что Не Делать До Фазы 5
 
 - Не трогать Solana.
-- Не включать on-chain trading.
+- Не добавлять trading/execution.
 - Не добавлять новые launch sources.
 - Не делать `AI brief` маркетинговым хайпом, пока LLM не будет в production.

@@ -1,16 +1,15 @@
 """
-Whale Alert Bot — Bankr + Clanker + Virtuals + DexScreener
+Whale Alert Bot — Bankr + Clanker + Virtuals + DexScreener + CoinGecko
 ========================================================
-Monitors FIVE sources for new token launches on Base:
+Monitors Base launch/discovery sources:
   1. Bankr API   — https://api.bankr.bot/token-launches
   2. Clanker API  — https://www.clanker.world/api/tokens
   3. Virtuals API — https://api2.virtuals.io/api/virtuals  (AI agent launches)
-  4. DexScreener — market data (MCap, Volume, Liquidity)
-  5. DexScreener — catch-all via profiles/boosts/search (ApeStore, direct deploys)
+  4. DexScreener — profiles/boosts/CTO discovery + market data
+  5. CoinGecko Onchain — Base new pools discovery
 
 When a token passes market filters → alerts to Telegram + WhatsApp + Pushover.
-Telegram signals include inline buy/sell buttons (20% / 50% / 100%).
-Auto-execution via Bankr Agent API when AUTO_EXECUTE=true.
+Telegram signals include research and watchlist actions.
 
 Liquidity filter is SKIPPED for safe launchpads (Bankr, Clanker, Virtuals)
 because they have locked LP / bonding curves — no rug possible.
@@ -26,6 +25,8 @@ import re
 import json
 import time
 import html
+import hashlib
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
@@ -33,27 +34,48 @@ from urllib.parse import quote
 from database import (
     close_db,
     db_session,
+    deactivate_watchlist_item,
+    deactivate_tracked_wallet,
+    get_due_watchlist_items,
+    get_due_tracked_wallets,
     get_due_delivery_retries,
+    get_pending_deliveries_for_signal,
     get_due_rechecks,
+    get_api_budget_usage,
+    get_bot_state,
     get_launch,
     get_launch_status,
+    get_latest_token_research,
+    get_tenant,
+    get_tenant_settings,
     get_status_snapshot,
     init_db,
+    list_tracked_wallets,
+    list_watchlist_items,
     mark_delivery_failed,
     mark_delivery_retry,
     mark_delivery_sent,
     mark_delivery_sending,
     mark_launch_status,
+    mark_tracked_wallet_checked,
+    mark_watchlist_checked,
     provider_available,
     queue_recheck,
     record_api_budget_event,
+    record_nitter_health_log,
+    record_socialdata_usage_log,
     set_bot_state,
     set_provider_cooldown,
-    signal_exists_for_tenant,
     store_verdict,
+    update_tenant_min_score,
+    upsert_user_feedback,
     upsert_launch,
+    upsert_tracked_wallet,
+    upsert_wallet_event,
+    upsert_watchlist_item,
     utc_now,
 )
+from hermes_skills.social_intelligence import passes_social_intelligence_filters
 from research_pipeline import (
     AUTO_VERDICT_ENABLED,
     AUTO_VERDICT_MAX_CONCURRENT,
@@ -62,8 +84,16 @@ from research_pipeline import (
     build_signal_verdict_with_timeout,
     format_verdict_block,
 )
-from services.delivery import prepare_tenant_delivery
+from services.delivery import prepare_signal_fanout
 from services.observability import correlation_id, log_event
+from services.social_evidence import (
+    build_social_evidence,
+    hide_contract_mentions,
+    is_likely_english_text,
+    is_recent_tweet,
+    strip_non_english_content,
+)
+from services.social_fetcher import AlphaDetector, NitterFetcher, SmartFetchOrchestrator, SocialDataFetcher
 from services.tenants import ensure_telegram_tenant
 from services.token_intelligence import analyze_token_intelligence
 from settings import resolve_database_url, settings
@@ -77,49 +107,54 @@ AUTHORIZED_USER_IDS = {
     for user_id in os.getenv("AUTHORIZED_USER_IDS", "544999608").split(",")
     if user_id.strip()
 }
-TRADER_USER_IDS = {
-    user_id.strip()
-    for user_id in (
-        os.getenv("TRADER_USER_IDS", "")
-        or os.getenv("TRADER_USER_ID", "")
-    ).split(",")
-    if user_id.strip()
-}
+ADMIN_USER_ID = os.getenv("ADMIN_USER_ID", "544999608").strip()
 WHAPI_TOKEN = os.getenv("WHAPI_TOKEN", "")
 WHATSAPP_GROUP_ID = os.getenv("WHATSAPP_GROUP_ID", "")
 SOCIALDATA_API_KEY = os.getenv("SOCIALDATA_API_KEY", "")
 MIN_FOLLOWERS = int(os.getenv("MIN_FOLLOWERS", "5000"))
 RESEARCH_MIN_FOLLOWERS = int(os.getenv("RESEARCH_MIN_FOLLOWERS", "1000"))
 RESEARCH_HIGH_SIGNAL_SCORE = int(os.getenv("RESEARCH_HIGH_SIGNAL_SCORE", "8"))
+RESEARCH_MIN_QUALIFIED_TWEETS = int(os.getenv("RESEARCH_MIN_QUALIFIED_TWEETS", "5"))
+RESEARCH_MIN_TWEET_VIEWS = int(os.getenv("RESEARCH_MIN_TWEET_VIEWS", "50"))
+RESEARCH_MIN_TWEET_LIKES = int(os.getenv("RESEARCH_MIN_TWEET_LIKES", "5"))
+REQUIRE_CA_SOCIAL_CONFIRMATION = os.getenv("REQUIRE_CA_SOCIAL_CONFIRMATION", "true").lower() == "true"
+SOCIALDATA_SEARCH_MAX_PAGES = int(os.getenv("SOCIALDATA_SEARCH_MAX_PAGES", "4"))
+SOCIALDATA_SEARCH_CACHE_TTL_SEC = int(os.getenv("SOCIALDATA_SEARCH_CACHE_TTL_SEC", "900"))
+SOCIALDATA_SEARCH_EMPTY_CACHE_TTL_SEC = int(os.getenv("SOCIALDATA_SEARCH_EMPTY_CACHE_TTL_SEC", "300"))
+SOCIALDATA_SEARCH_STALE_TTL_SEC = int(os.getenv("SOCIALDATA_SEARCH_STALE_TTL_SEC", "86400"))
+SOCIALDATA_SEARCH_MAX_CALLS_PER_MIN = int(os.getenv("SOCIALDATA_SEARCH_MAX_CALLS_PER_MIN", "30"))
+SOCIALDATA_SEARCH_MAX_CALLS_PER_HOUR = int(os.getenv("SOCIALDATA_SEARCH_MAX_CALLS_PER_HOUR", "240"))
+NITTER_ENABLED = os.getenv("NITTER_ENABLED", "false").lower() == "true"
+NITTER_BASE_URLS = [
+    url.strip().rstrip("/")
+    for url in os.getenv("NITTER_BASE_URLS", "").split(",")
+    if url.strip()
+]
+NITTER_HEALTH_ENABLED = os.getenv("NITTER_HEALTH_ENABLED", "true").lower() == "true"
+NITTER_HEALTH_INTERVAL_SEC = int(os.getenv("NITTER_HEALTH_INTERVAL_SEC", "300"))
+NITTER_HEALTH_QUERY = os.getenv("NITTER_HEALTH_QUERY", "$GSPEED").strip() or "$GSPEED"
 MIN_MCAP = int(os.getenv("MIN_MCAP", "50000"))
 MIN_VOLUME_24H = int(os.getenv("MIN_VOLUME_24H", "30000"))
 MIN_LIQUIDITY = int(os.getenv("MIN_LIQUIDITY", "30000"))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
-
-# ─── Bankr Execution Config ───────────────────────────────────────────────────
-BANKR_EXECUTION_API_KEY = os.getenv("BANKR_EXECUTION_API_KEY", "")
-BANKR_BUY_AMOUNT = int(os.getenv("BANKR_BUY_AMOUNT", "100"))
-AUTO_EXECUTE = os.getenv("AUTO_EXECUTE", "false").lower() == "true"
+TELEGRAM_COMMAND_POLL_INTERVAL = float(os.getenv("TELEGRAM_COMMAND_POLL_INTERVAL", "0.5"))
+TELEGRAM_GET_UPDATES_TIMEOUT = int(os.getenv("TELEGRAM_GET_UPDATES_TIMEOUT", "1"))
+TELEGRAM_GET_UPDATES_LIMIT = int(os.getenv("TELEGRAM_GET_UPDATES_LIMIT", "25"))
+TELEGRAM_BACKGROUND_COMMAND_LIMIT = int(os.getenv("TELEGRAM_BACKGROUND_COMMAND_LIMIT", "8"))
 
 # ─── Pushover Config ──────────────────────────────────────────────────────────
 PUSHOVER_USER_KEY = os.getenv("PUSHOVER_USER_KEY", "")
 PUSHOVER_API_TOKEN = os.getenv("PUSHOVER_API_TOKEN", "")
 
-# ─── Trader Config ────────────────────────────────────────────────────────────
-TRADING_ENABLED = os.getenv("TRADING_ENABLED", "false").lower() == "true"
-if TRADING_ENABLED and not TRADER_USER_IDS:
-    logging.getLogger("whale-alert").error("TRADING_ENABLED=true but TRADER_USER_IDS is empty — disabling trading")
-    TRADING_ENABLED = False
 ALCHEMY_RPC_URL = os.getenv("ALCHEMY_RPC_URL", "")
-PRIVATE_KEY = os.getenv("PRIVATE_KEY", "")
 
 BANKR_API_URL = "https://api.bankr.bot/token-launches"
-BANKR_AGENT_API_URL = "https://api.bankr.bot/agent/prompt"
 CLANKER_API_URL = "https://www.clanker.world/api/tokens"
 VIRTUALS_API_URL = "https://api2.virtuals.io/api/virtuals"
 GECKOTERMINAL_API_URL = "https://api.geckoterminal.com/api/v2"
 SOCIALDATA_API_URL = "https://api.socialdata.tools/twitter/user"
 DEXSCREENER_API_URL = "https://api.dexscreener.com"
+COINGECKO_API_URL = "https://api.coingecko.com/api/v3"
 CLANKER_CHAIN_ID_BASE = 8453
 CLANKER_PAGE_SIZE = 10
 CLANKER_POLL_PAGES = int(os.getenv("CLANKER_POLL_PAGES", "5"))
@@ -130,6 +165,12 @@ DEXSCREENER_DISCOVERY_ENDPOINTS = (
     ("boosts", "/token-boosts/latest/v1"),
     ("community_takeovers", "/community-takeovers/latest/v1"),
 )
+COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "")
+COINGECKO_DISCOVERY_ENABLED = os.getenv("COINGECKO_DISCOVERY_ENABLED", "false").lower() == "true"
+COINGECKO_DISCOVERY_LIMIT = int(os.getenv("COINGECKO_DISCOVERY_LIMIT", "25"))
+COINGECKO_POLL_INTERVAL = int(os.getenv("COINGECKO_POLL_INTERVAL", "720"))
+COINGECKO_RATE_LIMIT_PER_MIN = int(os.getenv("COINGECKO_RATE_LIMIT_PER_MIN", "12"))
+COINGECKO_COOLDOWN_SEC = int(os.getenv("COINGECKO_COOLDOWN_SEC", "120"))
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -144,11 +185,23 @@ log = logging.getLogger("whale-alert")
 
 follower_cache: dict[str, int | None] = {}
 gecko_cache: dict[str, tuple[float, dict | None]] = {}
+socialdata_search_cache: dict[str, tuple[float, float, list[dict]]] = {}
+socialdata_search_inflight: dict[str, asyncio.Task] = {}
+telegram_background_tasks: set[asyncio.Task] = set()
+telegram_background_semaphore = asyncio.Semaphore(TELEGRAM_BACKGROUND_COMMAND_LIMIT)
+nitter_health_state: dict[str, object] = {
+    "ok": None,
+    "last_check": "",
+    "last_error": "",
+    "last_ok": "",
+    "base_url": "",
+}
 GECKO_CACHE_TTL_HIT = 120
 GECKO_CACHE_TTL_MISS = 60
+coingecko_calls: list[float] = []
+last_coingecko_poll_at: float = 0
 last_update_id: int = 0
 alert_count: int = 0
-execution_count: int = 0
 default_tenant_db_id: int | None = None
 
 # ─── Recheck queue ────────────────────────────────────────────────────────────
@@ -158,6 +211,16 @@ RECHECK_MAX_CHECKS = 12
 RECHECK_MAX_QUEUE = 300
 TELEGRAM_RETRY_BATCH = int(os.getenv("TELEGRAM_RETRY_BATCH", "20"))
 TELEGRAM_MAX_DELIVERY_ATTEMPTS = int(os.getenv("TELEGRAM_MAX_DELIVERY_ATTEMPTS", "3"))
+TELEGRAM_SIGNAL_DELIVERY_LIMIT = int(os.getenv("TELEGRAM_SIGNAL_DELIVERY_LIMIT", "2000"))
+WATCHLIST_CHECK_INTERVAL = int(os.getenv("WATCHLIST_CHECK_INTERVAL", "900"))
+WATCHLIST_CHECK_BATCH = int(os.getenv("WATCHLIST_CHECK_BATCH", "100"))
+WATCHLIST_NOTIFY_MCAP_CHANGE_PCT = float(os.getenv("WATCHLIST_NOTIFY_MCAP_CHANGE_PCT", "50"))
+WATCHLIST_NOTIFY_VOLUME_CHANGE_PCT = float(os.getenv("WATCHLIST_NOTIFY_VOLUME_CHANGE_PCT", "100"))
+WALLET_MONITOR_ENABLED = os.getenv("WALLET_MONITOR_ENABLED", "false").lower() == "true"
+WALLET_POLL_INTERVAL = int(os.getenv("WALLET_POLL_INTERVAL", "60"))
+WALLET_POLL_BATCH = int(os.getenv("WALLET_POLL_BATCH", "50"))
+WALLET_LOOKBACK_BLOCKS = int(os.getenv("WALLET_LOOKBACK_BLOCKS", "1200"))
+WALLET_EVENT_RECENT_MINUTES = int(os.getenv("WALLET_EVENT_RECENT_MINUTES", "60"))
 
 # ─── Blocklist ────────────────────────────────────────────────────────────────
 
@@ -266,53 +329,6 @@ def remove_tracked_wallet(address: str) -> bool:
     return True
 
 
-# ─── Bankr Auto-Execution ─────────────────────────────────────────────────────
-
-async def execute_bankr_buy(session: aiohttp.ClientSession, token_address: str, symbol: str, source: str) -> bool:
-    global execution_count
-
-    if not AUTO_EXECUTE:
-        return False
-
-    if not BANKR_EXECUTION_API_KEY:
-        log.warning("⚠️ AUTO_EXECUTE=true but BANKR_EXECUTION_API_KEY not set — skipping execution")
-        return False
-
-    try:
-        prompt = f"buy ${BANKR_BUY_AMOUNT} of {token_address} on base"
-        async with session.post(
-            BANKR_AGENT_API_URL,
-            headers={
-                "Content-Type": "application/json",
-                "X-API-Key": BANKR_EXECUTION_API_KEY,
-            },
-            json={"prompt": prompt},
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as resp:
-            data = await resp.json()
-
-            if resp.status == 202 and data.get("success"):
-                job_id = data.get("jobId", "?")
-                thread_id = data.get("threadId", "?")
-                execution_count += 1
-                log.info(f"  💸 EXECUTED: [{source}] ${symbol} — ${BANKR_BUY_AMOUNT} buy submitted | jobId: {job_id} | threadId: {thread_id}")
-                return True
-            elif resp.status == 403:
-                log.error(f"  ❌ Bankr execution forbidden (403) — check API key permissions at bankr.bot/api")
-                return False
-            elif resp.status == 429:
-                reset_at = data.get("resetAt", "")
-                log.warning(f"  ⚠️ Bankr rate limit hit — resets at {reset_at}")
-                return False
-            else:
-                log.error(f"  ❌ Bankr execution failed {resp.status}: {data}")
-                return False
-
-    except Exception as e:
-        log.error(f"  ❌ Bankr execution error for ${symbol}: {e}")
-        return False
-
-
 # ─── Telegram ─────────────────────────────────────────────────────────────────
 
 async def send_telegram(session: aiohttp.ClientSession, text: str, chat_id: str = "", reply_markup: dict = None) -> int | None:
@@ -391,52 +407,72 @@ async def answer_callback_query(session: aiohttp.ClientSession, callback_query_i
 # ─── Bot Commands ─────────────────────────────────────────────────────────────
 
 BOT_COMMANDS = [
-    {"command": "start", "description": "Show command menu"},
-    {"command": "help", "description": "Show command menu"},
+    {"command": "start", "description": "Subscribe and show introduction"},
+    {"command": "help", "description": "Show public command menu"},
     {"command": "status", "description": "Runtime status"},
     {"command": "research", "description": "Research ticker or Base CA"},
     {"command": "r", "description": "Short alias for research"},
     {"command": "verdict2", "description": "Run Verdict 2.0 for Base CA"},
     {"command": "spoof_check", "description": "Run spoof checks for Base CA"},
     {"command": "summary", "description": "AI summary stub for Base CA"},
-    {"command": "test", "description": "Send a test signal"},
-    {"command": "wallets", "description": "List tracked wallets"},
-    {"command": "track", "description": "Track wallet: /track 0x... label"},
-    {"command": "untrack", "description": "Stop tracking wallet"},
-    {"command": "block", "description": "Block X account"},
-    {"command": "unblock", "description": "Unblock X account"},
-    {"command": "blocklist", "description": "List blocked accounts"},
-    {"command": "wallet", "description": "Show bot trading wallet"},
-    {"command": "buy", "description": "Manual buy when trading enabled"},
-    {"command": "sell", "description": "Manual sell when trading enabled"},
+    {"command": "watch", "description": "Add Base CA to watchlist"},
+    {"command": "unwatch", "description": "Remove Base CA from watchlist"},
+    {"command": "watchlist", "description": "Show your watchlist"},
+    {"command": "settings", "description": "Show or update signal settings"},
 ]
 
+PUBLIC_COMMANDS = {
+    "/start",
+    "/help",
+    "/status",
+    "/research",
+    "/r",
+    "/verdict2",
+    "/spoof-check",
+    "/spoof_check",
+    "/summary",
+    "/watch",
+    "/unwatch",
+    "/watchlist",
+    "/settings",
+}
+
+ADMIN_COMMANDS = {
+    "/admin",
+    "/test",
+    "/block",
+    "/unblock",
+    "/blocklist",
+    "/track",
+    "/untrack",
+    "/wallets",
+    "/tracked_wallets",
+}
 
 def build_help_text() -> str:
-    auth = ", ".join(sorted(AUTHORIZED_USER_IDS)) if AUTHORIZED_USER_IDS else "none"
     return (
-        "🐋 <b>Base Bot Commands</b>\n\n"
+        "🐋 <b>Base Bot</b>\n"
+        "Early Base launch monitor with CA-verified X research.\n\n"
         "<b>Research</b>\n"
-        "• <code>/research $TICKER</code> — token research\n"
-        "• <code>/research 0xCONTRACT</code> — CA research on Base\n"
-        "• <code>/verdict2 0xCONTRACT</code> — Verdict 2.0\n"
-        "• <code>/spoof_check 0xCONTRACT</code> — spoof/risk checks\n"
-        "• <code>/summary 0xCONTRACT</code> — cached AI summary stub\n"
-        "• <code>/r $TICKER</code> — short research alias\n"
-        "• Signal buttons: X Research, Ticker X, Copy CA\n\n"
-        "<b>Wallet tracking</b>\n"
-        "• <code>/track 0xADDRESS [label]</code> — add wallet\n"
-        "• <code>/untrack 0xADDRESS</code> — remove wallet\n"
-        "• <code>/wallets</code> — list tracked wallets\n\n"
-        "<b>Bot control</b>\n"
-        "• <code>/status</code> — runtime status\n"
-        "• <code>/test</code> — send test signal\n"
-        "• <code>/block @user</code> / <code>/unblock @user</code>\n"
-        "• <code>/blocklist</code> — blocked X accounts\n\n"
-        "<b>Trading</b>\n"
-        "• <code>/wallet</code> — bot wallet, requires trading config\n"
-        "• <code>/buy 0xADDRESS 20</code> / <code>/sell 0xADDRESS 50</code>\n\n"
-        f"DM access: <code>{auth}</code>"
+        "<code>/research 0x...</code> or <code>/research $TICKER</code>\n"
+        "<code>/verdict2 0x...</code> · <code>/spoof_check 0x...</code> · <code>/summary 0x...</code>\n\n"
+        "<b>Watchlist</b>\n"
+        "<code>/watch 0x... [label]</code> · <code>/unwatch 0x...</code> · <code>/watchlist</code>\n\n"
+        "<b>Bot</b>\n"
+        "<code>/status</code> · <code>/settings</code>\n\n"
+        "Signals arrive here after <code>/start</code>."
+    )
+
+
+def build_welcome_text() -> str:
+    return (
+        "🚨 <b>Base Bot is active</b>\n\n"
+        "You are subscribed to early Base launch alerts.\n\n"
+        "<b>Start here</b>\n"
+        "<code>/research 0x...</code> — token research\n"
+        "<code>/watch 0x...</code> — save a token\n"
+        "<code>/status</code> — service health\n\n"
+        "Use <code>/help</code> for the full command list."
     )
 
 
@@ -455,13 +491,47 @@ def is_authorized_update(msg: dict) -> bool:
     return chat_id == TELEGRAM_CHAT_ID or user_id in AUTHORIZED_USER_IDS
 
 
-def is_trader_user(user_id: str) -> bool:
-    return bool(TRADER_USER_IDS) and user_id in TRADER_USER_IDS
+def is_private_chat(msg: dict) -> bool:
+    return (msg.get("chat", {}).get("type") or "") == "private"
 
 
-def is_fresh_telegram_message(msg: dict, max_age_sec: int = 60) -> bool:
-    msg_date = int(msg.get("date") or 0)
-    return bool(msg_date) and time.time() - msg_date <= max_age_sec
+def is_admin_update(msg: dict) -> bool:
+    user_id = str(msg.get("from", {}).get("id", ""))
+    return user_id == ADMIN_USER_ID or is_authorized_update(msg)
+
+
+def telegram_user_title(msg: dict) -> str:
+    user = msg.get("from", {}) or {}
+    username = user.get("username")
+    first_name = user.get("first_name") or ""
+    last_name = user.get("last_name") or ""
+    if username:
+        return f"@{username}"
+    return " ".join(part for part in (first_name, last_name) if part).strip() or str(msg.get("chat", {}).get("id", ""))
+
+
+async def register_public_telegram_tenant(msg: dict) -> bool:
+    chat_id = str(msg.get("chat", {}).get("id", ""))
+    if not chat_id or not is_private_chat(msg):
+        return False
+    async with db_session() as db:
+        await ensure_telegram_tenant(db, chat_id, title=telegram_user_title(msg))
+    return True
+
+
+async def ensure_tenant_for_chat(chat_id: str, title: str | None = None):
+    async with db_session() as db:
+        return await ensure_telegram_tenant(db, chat_id, title=title)
+
+
+def telegram_callback_title(callback_query: dict) -> str:
+    user = callback_query.get("from", {}) or {}
+    username = user.get("username")
+    first_name = user.get("first_name") or ""
+    last_name = user.get("last_name") or ""
+    if username:
+        return f"@{username}"
+    return " ".join(part for part in (first_name, last_name) if part).strip() or str(user.get("id", ""))
 
 
 async def set_bot_commands(session: aiohttp.ClientSession) -> bool:
@@ -504,14 +574,11 @@ async def delete_telegram_webhook(session: aiohttp.ClientSession, drop_pending_u
 
 def build_x_research_url(token_address: str, symbol: str) -> str:
     clean_symbol = (symbol or "").strip().lstrip("$")
-    query = f"{token_address} OR ${clean_symbol}" if clean_symbol else token_address
+    query = f"{token_address.lower()} OR ${clean_symbol.upper()}" if clean_symbol else token_address.lower()
     return f"https://x.com/search?q={quote(query, safe='$')}&src=typed_query"
 
 
-def build_trade_keyboard(token_address: str, symbol: str) -> dict:
-    addr = token_address[:20]
-    sym = symbol[:10]
-    banana_url = f"https://t.me/BananaGun_bot?start={token_address}"
+def build_signal_keyboard(token_address: str, symbol: str) -> dict:
     x_research_url = build_x_research_url(token_address, symbol)
     return {
         "inline_keyboard": [
@@ -519,21 +586,32 @@ def build_trade_keyboard(token_address: str, symbol: str) -> dict:
                 {"text": "🔎 X Research", "url": x_research_url},
             ],
             [
-                {"text": "📊 Gecko", "url": f"https://www.geckoterminal.com/base/tokens/{token_address}"},
-                {"text": "📈 GMGN", "url": f"https://gmgn.ai/base/token/{token_address}"},
+                {"text": "⭐ Worth watching", "callback_data": f"watch:{token_address.lower()}"},
+                {"text": "⏭ Skip", "callback_data": f"fb:skip:{token_address.lower()}"},
+            ],
+        ]
+    }
+
+
+def build_admin_keyboard() -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "Nitter Status", "callback_data": "adm:nitter_status"},
+                {"text": "Force Check", "callback_data": "adm:force_nitter"},
             ],
             [
-                {"text": "📋 Copy CA", "callback_data": f"copyca:0:{addr}"},
-                {"text": "🔎 Ticker X", "callback_data": f"xtickerx:{sym}:{addr}"},
-            ],
-            [
-                {"text": "🍌 Banana Gun", "url": banana_url},
+                {"text": "Update Nitter cookies", "callback_data": "adm:update_cookies"},
+                {"text": "SocialData Quota", "callback_data": "adm:socialdata_quota"},
             ],
         ]
     }
 
 
 _address_map: dict[str, str] = {}
+_xsignal_page_cache: dict[str, dict] = {}
+XSIGNAL_PAGE_SIZE = 6
+XSIGNAL_INLINE_THRESHOLD = 8
 
 
 # ─── WhatsApp via Whapi ───────────────────────────────────────────────────────
@@ -595,7 +673,7 @@ async def send_pushover(session: aiohttp.ClientSession, title: str, message: str
 
 async def send_alert_all(session: aiohttp.ClientSession, tg_text: str, wa_text: str, token_address: str = "", symbol: str = ""):
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        keyboard = build_trade_keyboard(token_address, symbol) if token_address else None
+        keyboard = build_signal_keyboard(token_address, symbol) if token_address else None
         await send_telegram(session, tg_text, reply_markup=keyboard)
     if WHAPI_TOKEN and WHATSAPP_GROUP_ID:
         await send_whatsapp(session, wa_text)
@@ -612,6 +690,157 @@ async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: 
     username = user.get("username", user.get("first_name", "unknown"))
 
     parts = data.split(":")
+    if parts and parts[0] == "adm":
+        if str(user.get("id", "")) != ADMIN_USER_ID:
+            await answer_callback_query(session, callback_id, "Admin only", show_alert=True)
+            return
+        action = parts[1] if len(parts) > 1 else ""
+        if action == "nitter_status":
+            await answer_callback_query(session, callback_id, "Nitter status")
+            await send_telegram(session, await build_admin_panel_text(), chat_id, reply_markup=build_admin_keyboard())
+            return
+        if action == "force_nitter":
+            ok, base_url, detail, response_ms, item_count = await check_nitter_health(session)
+            async with db_session() as db:
+                await record_nitter_health_log(
+                    db,
+                    base_url=base_url or (NITTER_BASE_URLS[0] if NITTER_BASE_URLS else ""),
+                    status="ok" if ok else "down",
+                    detail=detail,
+                    response_ms=response_ms,
+                    item_count=item_count,
+                )
+            now_iso = utc_now().isoformat()
+            nitter_health_state.update(
+                {
+                    "ok": ok,
+                    "last_check": now_iso,
+                    "last_error": "" if ok else detail,
+                    "last_ok": now_iso if ok else nitter_health_state.get("last_ok", ""),
+                    "base_url": base_url,
+                }
+            )
+            await answer_callback_query(session, callback_id, "Nitter checked")
+            status = "OK" if ok else "DOWN"
+            await send_telegram(
+                session,
+                f"{'✅' if ok else '🚨'} <b>Nitter {status}</b>\n\n{h(base_url or detail)}",
+                chat_id,
+                reply_markup=build_admin_keyboard(),
+            )
+            return
+        if action == "update_cookies":
+            await answer_callback_query(session, callback_id, "Cookie update instructions")
+            await send_telegram(
+                session,
+                "🍪 <b>Update Nitter cookies</b>\n\n"
+                "1. Export fresh X cookies/guest account cookies.\n"
+                "2. SSH to the VM and update the self-hosted Nitter cookie/guest config.\n"
+                "3. Restart the Nitter container.\n"
+                "4. Press <b>Force Check</b> here.\n\n"
+                "Do not paste cookies into Telegram.",
+                chat_id,
+                reply_markup=build_admin_keyboard(),
+            )
+            return
+        if action == "socialdata_quota":
+            async with db_session() as db:
+                now = utc_now()
+                minute_used = await get_api_budget_usage(db, provider="socialdata", since=now - timedelta(minutes=1))
+                hour_used = await get_api_budget_usage(db, provider="socialdata", since=now - timedelta(hours=1))
+            await answer_callback_query(session, callback_id, "SocialData quota")
+            await send_telegram(
+                session,
+                "📊 <b>SocialData Quota</b>\n\n"
+                f"Minute {minute_used}/{SOCIALDATA_SEARCH_MAX_CALLS_PER_MIN}\n"
+                f"Hour {hour_used}/{SOCIALDATA_SEARCH_MAX_CALLS_PER_HOUR}\n"
+                f"Cache keys {len(socialdata_search_cache)} · Inflight {len(socialdata_search_inflight)}",
+                chat_id,
+                reply_markup=build_admin_keyboard(),
+            )
+            return
+        await answer_callback_query(session, callback_id, "Unknown admin action", show_alert=True)
+        return
+
+    if len(parts) == 3 and parts[0] == "xpg":
+        key = parts[1].strip()
+        try:
+            page = int(parts[2])
+        except ValueError:
+            await answer_callback_query(session, callback_id, "Invalid page", show_alert=True)
+            return
+        ca = _address_map.get(key, key)
+        if not is_base_contract(ca):
+            await answer_callback_query(session, callback_id, "Invalid token address", show_alert=True)
+            return
+        social_evidence = await load_xsignal_evidence_for_ca(ca)
+        if not social_evidence:
+            await answer_callback_query(session, callback_id, "X signal page expired", show_alert=True)
+            return
+        page_count = xsignal_page_count(social_evidence)
+        page = max(1, min(page, page_count))
+        message = callback_query.get("message", {}) or {}
+        block = format_research_social_block(
+            str(social_evidence.get("ticker") or ""),
+            [],
+            [],
+            social_evidence=social_evidence,
+            address=ca,
+            page=page,
+        )
+        keyboard = merge_inline_keyboards(
+            strip_xsignal_keyboard(message.get("reply_markup") or {}),
+            build_xsignal_pagination_keyboard(ca, social_evidence, page),
+        )
+        ok = await edit_telegram_message(
+            session,
+            chat_id,
+            int(message_id),
+            replace_xsignal_block(message.get("text") or "", block),
+            reply_markup=keyboard,
+        )
+        await answer_callback_query(session, callback_id, f"Page {page}/{page_count}" if ok else "Page update failed")
+        return
+
+    if len(parts) == 2 and parts[0] == "watch":
+        ca = parts[1].strip().lower()
+        if not is_base_contract(ca):
+            await answer_callback_query(session, callback_id, "Invalid token address", show_alert=True)
+            return
+        tenant = await ensure_tenant_for_chat(chat_id, title=telegram_callback_title(callback_query))
+        dex = await fetch_geckoterminal(session, ca)
+        async with db_session() as db:
+            await upsert_watchlist_item(db, tenant_id=tenant.id, ca=ca, label="", market_json=dex)
+            await upsert_user_feedback(
+                db,
+                tenant_id=tenant.id,
+                ca=ca,
+                action="worth_watching",
+                payload_json={"message_id": message_id, "username": username},
+            )
+        await answer_callback_query(session, callback_id, "⭐ Added to watchlist")
+        await send_telegram(session, f"⭐ Watching\n<code>{ca}</code>\nUse /watchlist anytime.", chat_id=chat_id)
+        return
+
+    if len(parts) == 3 and parts[0] == "fb":
+        action = parts[1].strip().lower()
+        ca = parts[2].strip().lower()
+        if action not in {"skip", "worth_watching"} or not is_base_contract(ca):
+            await answer_callback_query(session, callback_id, "Invalid feedback", show_alert=True)
+            return
+        tenant = await ensure_tenant_for_chat(chat_id, title=telegram_callback_title(callback_query))
+        async with db_session() as db:
+            await upsert_user_feedback(
+                db,
+                tenant_id=tenant.id,
+                ca=ca,
+                action=action,
+                payload_json={"message_id": message_id, "username": username},
+            )
+        label = "Skipped" if action == "skip" else "Marked worth watching"
+        await answer_callback_query(session, callback_id, f"Saved: {label}")
+        return
+
     if len(parts) != 3:
         await answer_callback_query(session, callback_id, "Invalid callback data")
         return
@@ -633,21 +862,25 @@ async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: 
             try:
                 mentions = await search_x_mentions(session, symbol, address=full_address)
                 if not mentions:
-                    await send_telegram(session, f"🔍 <b>X Research: ${symbol}</b>\n\nNo notable mentions found (10K+ followers).", chat_id=chat_id)
+                    await send_telegram(
+                        session,
+                        f"🔍 <b>X Research: ${symbol}</b>\n\n"
+                        f"No CA-verified X mentions found after spam/engagement filters "
+                        f"(min {RESEARCH_MIN_QUALIFIED_TWEETS} tweets mentioning the contract).",
+                        chat_id=chat_id,
+                    )
                     return
 
                 lines = [f"🔍 <b>X Research: ${symbol}</b>\n"]
                 for m in mentions:
-                    f_count = m['followers']
-                    f_str = f"{f_count/1_000_000:.1f}M" if f_count >= 1_000_000 else f"{f_count/1_000:.0f}K"
                     text_clean = re.sub(r'https?://t\.co/\S+', '', m['text']).strip().replace('\n', ' ')
-                    text_clean = text_clean.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                    text_clean = h(hide_contract_mentions(text_clean, full_address))
                     if len(text_clean) > 200:
                         text_clean = text_clean[:197] + "..."
                     lines.extend([
                         f"",
-                        f"<a href='{m['url']}'>@{m['username']}</a> · {f_str} followers · {m['date']}",
-                        f"❤️ {m['likes']} 🔁 {m['retweets']}",
+                        f"<a href='{h(m['url'])}'>@{h(m['username'])}</a> · {h(m['date'])}",
+                        f"❤️ {fmt_compact_number(int(m['likes']))} · 👁 {fmt_compact_number(int(m.get('views') or 0))} · 🔄 {fmt_compact_number(int(m['retweets']))}",
                         f"<i>{text_clean}</i>" if text_clean else "<i>[media only]</i>",
                     ])
                 await send_telegram(session, "\n".join(lines), chat_id=chat_id)
@@ -660,33 +893,46 @@ async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: 
 
     if action == "xtickerx":
         symbol = second
-        await answer_callback_query(session, callback_id, f"🔎 Fetching latest ${symbol} tweets...")
-        full_address = _address_map.get(addr_truncated, addr_truncated)
+        await answer_callback_query(session, callback_id, f"🔎 Fetching Top ${symbol} tweets...")
 
         async def do_ticker_search():
             try:
-                tweets = await search_x_ticker_recent(session, symbol, full_address)
+                tweets = await search_x_mentions(
+                    session,
+                    symbol,
+                    address="",
+                    max_age_hours=24,
+                    allow_tier3=True,
+                    limit=12,
+                    min_count=0,
+                )
                 if not tweets:
-                    await send_telegram(session, f"🔎 <b>Latest tweets: ${symbol}</b>\n\nNo recent tweets found.", chat_id=chat_id)
+                    tweets = await search_x_ticker_recent(
+                        session,
+                        symbol,
+                        address="",
+                        limit=12,
+                        max_age_hours=24,
+                    )
+                if not tweets:
+                    await send_telegram(
+                        session,
+                        f"🔎 <b>Top tweets: ${symbol}</b>\n\n"
+                        f"No qualified ticker tweets found after language, spam, and engagement filters.",
+                        chat_id=chat_id,
+                    )
                     return
 
-                lines = [f"🔎 <b>Latest tweets: ${symbol}</b>\n"]
+                lines = [f"🔎 <b>Top tweets: ${symbol}</b>\n"]
                 for t in tweets:
-                    f_count = t['followers']
-                    if f_count >= 1_000_000:
-                        f_str = f"{f_count/1_000_000:.1f}M"
-                    elif f_count >= 1_000:
-                        f_str = f"{f_count/1_000:.0f}K"
-                    else:
-                        f_str = str(f_count)
                     text_clean = re.sub(r'https?://t\.co/\S+', '', t['text']).strip().replace('\n', ' ')
-                    text_clean = text_clean.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                    text_clean = h(hide_contract_mentions(text_clean))
                     if len(text_clean) > 200:
                         text_clean = text_clean[:197] + "..."
                     lines.extend([
                         f"",
-                        f"<a href='{t['url']}'>@{t['username']}</a> · {f_str} · {t['date']}",
-                        f"❤️ {t['likes']} 🔁 {t['retweets']}",
+                        f"<a href='{h(t['url'])}'>@{h(t['username'])}</a> · {h(t['date'])}",
+                        f"❤️ {fmt_compact_number(int(t['likes']))} · 👁 {fmt_compact_number(int(t.get('views') or 0))} · 🔄 {fmt_compact_number(int(t['retweets']))}",
                         f"<i>{text_clean}</i>" if text_clean else "<i>[media only]</i>",
                     ])
                 await send_telegram(session, "\n".join(lines), chat_id=chat_id)
@@ -697,59 +943,99 @@ async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: 
         asyncio.create_task(do_ticker_search())
         return
 
-    user_id = str(callback_query.get("from", {}).get("id", ""))
-    if not is_trader_user(user_id):
-        await answer_callback_query(session, callback_id, "⛔ Not authorized", show_alert=True)
-        return
 
-    if not TRADING_ENABLED:
-        await answer_callback_query(session, callback_id, "⚠️ Trading not enabled. Set TRADING_ENABLED=true", show_alert=True)
-        return
+def pct_change(old: float | None, new: float | None) -> float | None:
+    old = float(old or 0)
+    new = float(new or 0)
+    if old <= 0 or new <= 0:
+        return None
+    return ((new - old) / old) * 100
 
-    callback_msg_date = callback_query.get("message", {}).get("date", 0)
-    if callback_msg_date and time.time() - int(callback_msg_date) > 60:
-        await answer_callback_query(session, callback_id, "Command expired. Send it again.", show_alert=True)
-        return
 
-    percent_str = second
-    percent = int(percent_str)
+def format_pct(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:+.0f}%"
 
-    full_address = _address_map.get(addr_truncated)
-    if not full_address:
-        await answer_callback_query(session, callback_id, "⚠️ Token address not found — signal too old?", show_alert=True)
-        return
 
-    await answer_callback_query(session, callback_id, f"⏳ Executing {action.upper()} {percent}%...")
-    log.info(f"  🎯 [{username}] {action.upper()} {percent}% → {full_address[:12]}...")
+def format_watchlist_rows(items: list) -> str:
+    if not items:
+        return (
+            "⭐ <b>Watchlist</b>\n\n"
+            "No saved tokens yet.\n"
+            "<code>/watch 0x... [label]</code>"
+        )
+    lines = [f"⭐ <b>Watchlist</b> · {len(items)} token(s)", ""]
+    for idx, item in enumerate(items, 1):
+        label = f" · <b>{h(item.label)}</b>" if item.label else ""
+        mcap = fmt_usd(item.last_mcap or 0) if item.last_mcap else "n/a"
+        volume = fmt_usd(item.last_volume or 0) if item.last_volume else "n/a"
+        lines.append(f"{idx}. <code>{h(item.ca)}</code>{label}")
+        lines.append(f"   MC {mcap} · Vol {volume} · <code>/research {h(item.ca)}</code>")
+    return "\n".join(lines)[:3900]
 
-    try:
-        from trader import buy_token, sell_token, get_eth_balance, get_token_balance
 
-        if action == "buy":
-            eth_bal = await get_eth_balance()
-            result = await buy_token(full_address, percent)
-        else:
-            result = await sell_token(full_address, percent)
+def format_settings_text(min_score: float) -> str:
+    return (
+        "⚙️ <b>Settings</b>\n\n"
+        f"Min signal score: <b>{min_score:.1f}/10</b>\n\n"
+        "<code>/settings min_score 7.5</code>"
+    )
 
-        if result["success"]:
-            tx_hash = result["tx_hash"]
-            basescan_url = f"https://basescan.org/tx/{tx_hash}"
-            if action == "buy":
-                amount_eth = result.get("amount_eth", 0)
-                confirm_text = f"✅ <b>BUY executed</b> — {percent}% ({amount_eth:.4f} ETH)\n🔗 <a href='{basescan_url}'>View on BaseScan</a>"
-            else:
-                amount_tokens = result.get("amount_tokens", 0)
-                confirm_text = f"✅ <b>SELL executed</b> — {percent}% ({amount_tokens:.2f} tokens)\n🔗 <a href='{basescan_url}'>View on BaseScan</a>"
-            await send_telegram(session, confirm_text, chat_id=chat_id)
-            log.info(f"  ✅ Trade confirmed: {tx_hash}")
-        else:
-            error = result.get("error", "Unknown error")
-            await send_telegram(session, f"❌ <b>Trade failed</b> — {action.upper()} {percent}%\n<code>{error[:200]}</code>", chat_id=chat_id)
-            log.error(f"  ❌ Trade failed: {error}")
 
-    except Exception as e:
-        log.error(f"handle_trade_callback error: {e}")
-        await send_telegram(session, f"❌ Trade error: {str(e)[:150]}", chat_id=chat_id)
+async def build_admin_panel_text() -> str:
+    now = utc_now()
+    async with db_session() as db:
+        db_status = await get_status_snapshot(db)
+        social_min = await get_api_budget_usage(db, provider="socialdata", since=now - timedelta(minutes=1))
+        social_hour = await get_api_budget_usage(db, provider="socialdata", since=now - timedelta(hours=1))
+
+    nitter_ok = nitter_health_state.get("ok")
+    nitter_label = "OK" if nitter_ok is True else "DOWN" if nitter_ok is False else "unknown"
+    nitter_detail = (
+        str(nitter_health_state.get("base_url") or "")
+        if nitter_ok
+        else str(nitter_health_state.get("last_error") or "not checked yet")
+    )
+    cooldowns = ", ".join(db_status["provider_cooldowns"]) or "none"
+    return (
+        "🛠 <b>Admin</b>\n\n"
+        f"<b>Nitter</b>\n"
+        f"Status: <b>{h(nitter_label)}</b>\n"
+        f"Query: <code>{h(NITTER_HEALTH_QUERY)}</code>\n"
+        f"Last check: <code>{h(str(nitter_health_state.get('last_check') or 'never'))}</code>\n"
+        f"Last OK: <code>{h(str(nitter_health_state.get('last_ok') or 'never'))}</code>\n"
+        f"Detail: {h(nitter_detail[:220])}\n\n"
+        f"<b>SocialData</b>\n"
+        f"Minute {social_min}/{SOCIALDATA_SEARCH_MAX_CALLS_PER_MIN} · "
+        f"Hour {social_hour}/{SOCIALDATA_SEARCH_MAX_CALLS_PER_HOUR}\n"
+        f"Cache keys: {len(socialdata_search_cache)} · Inflight: {len(socialdata_search_inflight)}\n\n"
+        f"<b>Runtime</b>\n"
+        f"BG tasks {len(telegram_background_tasks)}/{TELEGRAM_BACKGROUND_COMMAND_LIMIT} · "
+        f"Recheck queue {db_status['queued_rechecks']}\n"
+        f"Deliveries pending/retry/failed: "
+        f"{db_status['deliveries_pending']}/{db_status['deliveries_retry']}/{db_status['deliveries_failed']}\n"
+        f"Tenants {db_status['tenants_active']} · Signals {db_status['signals_total']}\n"
+        f"Cooldowns: {h(cooldowns)}"
+    )
+
+
+def track_background_command(label: str, coro) -> None:
+    async def runner():
+        async with telegram_background_semaphore:
+            await coro
+
+    task = asyncio.create_task(runner())
+    telegram_background_tasks.add(task)
+
+    def cleanup(done: asyncio.Task) -> None:
+        telegram_background_tasks.discard(done)
+        try:
+            done.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log.error(f"Telegram background command failed [{label}]: {e}", exc_info=True)
+
+    task.add_done_callback(cleanup)
 
 
 # ─── Telegram Command Handler ─────────────────────────────────────────────────
@@ -760,7 +1046,11 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
-    params = {"offset": last_update_id + 1, "timeout": 0, "limit": 10}
+    params = {
+        "offset": last_update_id + 1,
+        "timeout": TELEGRAM_GET_UPDATES_TIMEOUT,
+        "limit": TELEGRAM_GET_UPDATES_LIMIT,
+    }
 
     try:
         async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=5)) as resp:
@@ -777,7 +1067,8 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
             last_update_id = update["update_id"]
 
             if "callback_query" in update:
-                await handle_trade_callback(session, update["callback_query"])
+                callback_id = update["callback_query"].get("id", "unknown")
+                track_background_command(f"callback {callback_id}", handle_trade_callback(session, update["callback_query"]))
                 continue
 
             msg = update.get("message", {})
@@ -790,120 +1081,54 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
             log.info(f"📩 Command from chat {chat_id}: {text[:50]}")
             cmd = command_name(text)
 
-            if not is_authorized_update(msg):
-                await send_telegram(session, "⛔ Not authorized for this bot.", chat_id=chat_id)
+            if cmd in ADMIN_COMMANDS and not is_admin_update(msg):
+                await send_telegram(session, "⛔ <b>Admin only</b>", chat_id=chat_id)
+                continue
+            if cmd not in PUBLIC_COMMANDS and cmd not in ADMIN_COMMANDS and not is_admin_update(msg):
+                await send_telegram(session, "Unknown command.\n<code>/help</code>", chat_id=chat_id)
                 continue
 
-            if cmd in ("/start", "/help"):
+            if cmd == "/start":
+                registered = await register_public_telegram_tenant(msg)
+                if registered:
+                    await send_telegram(session, build_welcome_text(), chat_id=chat_id)
+                else:
+                    await send_telegram(session, build_welcome_text(), chat_id=chat_id)
+
+            elif cmd == "/help":
+                if is_private_chat(msg):
+                    await register_public_telegram_tenant(msg)
                 await send_telegram(session, build_help_text(), chat_id=chat_id)
 
             elif cmd == "/block":
                 parts = text.split(maxsplit=1)
                 if len(parts) < 2:
-                    await send_telegram(session, "Usage: /block @username", chat_id)
+                    await send_telegram(session, "🚫 <b>Block account</b>\n<code>/block @username</code>", chat_id)
                     continue
                 username = parts[1].strip().lstrip("@").lower()
                 blocked_accounts.add(username)
                 save_blocklist(blocked_accounts)
                 follower_cache.pop(username, None)
                 log.info(f"🚫 Blocked @{username}")
-                await send_telegram(session, f"🚫 Blocked <b>@{username}</b> — future launches ignored", chat_id)
+                await send_telegram(session, f"🚫 <b>Blocked</b>\n@{h(username)}", chat_id)
 
             elif cmd == "/unblock":
                 parts = text.split(maxsplit=1)
                 if len(parts) < 2:
-                    await send_telegram(session, "Usage: /unblock @username", chat_id)
+                    await send_telegram(session, "✅ <b>Unblock account</b>\n<code>/unblock @username</code>", chat_id)
                     continue
                 username = parts[1].strip().lstrip("@").lower()
                 blocked_accounts.discard(username)
                 save_blocklist(blocked_accounts)
                 log.info(f"✅ Unblocked @{username}")
-                await send_telegram(session, f"✅ Unblocked <b>@{username}</b>", chat_id)
+                await send_telegram(session, f"✅ <b>Unblocked</b>\n@{h(username)}", chat_id)
 
             elif cmd == "/blocklist":
                 if blocked_accounts:
                     names = "\n".join(f"• @{u}" for u in sorted(blocked_accounts))
-                    await send_telegram(session, f"🚫 <b>Blocked ({len(blocked_accounts)}):</b>\n{names}", chat_id)
+                    await send_telegram(session, f"🚫 <b>Blocked Accounts</b> · {len(blocked_accounts)}\n\n{h(names)}", chat_id)
                 else:
-                    await send_telegram(session, "No accounts blocked.", chat_id)
-
-            elif cmd == "/buy":
-                user_id = str(msg.get("from", {}).get("id", ""))
-                if not is_trader_user(user_id):
-                    await send_telegram(session, "⛔ Not authorized for trading", chat_id=chat_id)
-                    continue
-                if not is_fresh_telegram_message(msg):
-                    await send_telegram(session, "Command expired. Send it again.", chat_id=chat_id)
-                    continue
-                parts = text.split()
-                if len(parts) != 3:
-                    await send_telegram(session, "Usage: /buy 0xADDRESS 20\n(percent = 20, 50, or 100)", chat_id=chat_id)
-                    continue
-                token_addr = parts[1].strip()
-                try:
-                    percent = int(parts[2].strip())
-                    if percent not in [20, 50, 100]:
-                        raise ValueError
-                except ValueError:
-                    await send_telegram(session, "❌ Percent must be 20, 50, or 100", chat_id=chat_id)
-                    continue
-                if not token_addr.startswith("0x") or len(token_addr) != 42:
-                    await send_telegram(session, "❌ Invalid token address", chat_id=chat_id)
-                    continue
-                if not TRADING_ENABLED:
-                    await send_telegram(session, "⚠️ Trading not enabled. Set TRADING_ENABLED=true", chat_id=chat_id)
-                    continue
-                await send_telegram(session, f"⏳ Buying {percent}% ETH of <code>{token_addr}</code>...", chat_id=chat_id)
-                try:
-                    from trader import buy_token
-                    result = await buy_token(token_addr, percent)
-                    if result["success"]:
-                        tx_hash = result["tx_hash"]
-                        amount_eth = result.get("amount_eth", 0)
-                        await send_telegram(session, f"✅ <b>BUY executed</b> — {percent}% ({amount_eth:.4f} ETH)\n🔗 <a href='https://basescan.org/tx/{tx_hash}'>View on BaseScan</a>", chat_id=chat_id)
-                    else:
-                        await send_telegram(session, f"❌ Buy failed: <code>{result.get('error','')[:200]}</code>", chat_id=chat_id)
-                except Exception as e:
-                    await send_telegram(session, f"❌ Buy error: {str(e)[:150]}", chat_id=chat_id)
-
-            elif cmd == "/sell":
-                user_id = str(msg.get("from", {}).get("id", ""))
-                if not is_trader_user(user_id):
-                    await send_telegram(session, "⛔ Not authorized for trading", chat_id=chat_id)
-                    continue
-                if not is_fresh_telegram_message(msg):
-                    await send_telegram(session, "Command expired. Send it again.", chat_id=chat_id)
-                    continue
-                parts = text.split()
-                if len(parts) != 3:
-                    await send_telegram(session, "Usage: /sell 0xADDRESS 50\n(percent = 20, 50, or 100)", chat_id=chat_id)
-                    continue
-                token_addr = parts[1].strip()
-                try:
-                    percent = int(parts[2].strip())
-                    if percent not in [20, 50, 100]:
-                        raise ValueError
-                except ValueError:
-                    await send_telegram(session, "❌ Percent must be 20, 50, or 100", chat_id=chat_id)
-                    continue
-                if not token_addr.startswith("0x") or len(token_addr) != 42:
-                    await send_telegram(session, "❌ Invalid token address", chat_id=chat_id)
-                    continue
-                if not TRADING_ENABLED:
-                    await send_telegram(session, "⚠️ Trading not enabled. Set TRADING_ENABLED=true", chat_id=chat_id)
-                    continue
-                await send_telegram(session, f"⏳ Selling {percent}% of <code>{token_addr}</code>...", chat_id=chat_id)
-                try:
-                    from trader import sell_token
-                    result = await sell_token(token_addr, percent)
-                    if result["success"]:
-                        tx_hash = result["tx_hash"]
-                        amount_tokens = result.get("amount_tokens", 0)
-                        await send_telegram(session, f"✅ <b>SELL executed</b> — {percent}% ({amount_tokens:.2f} tokens)\n🔗 <a href='https://basescan.org/tx/{tx_hash}'>View on BaseScan</a>", chat_id=chat_id)
-                    else:
-                        await send_telegram(session, f"❌ Sell failed: <code>{result.get('error','')[:200]}</code>", chat_id=chat_id)
-                except Exception as e:
-                    await send_telegram(session, f"❌ Sell error: {str(e)[:150]}", chat_id=chat_id)
+                    await send_telegram(session, "🚫 <b>Blocked Accounts</b>\n\nEmpty.", chat_id)
 
             elif cmd == "/test":
                 test_launch = {
@@ -927,138 +1152,204 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
                 }
                 _address_map["0x1234567890abcdef"] = "0x1234567890abcdef1234567890abcdef12345678"
                 await send_signal(session, test_launch, test_dex, "bankr", "TEST")
-                await send_telegram(session, "✅ Test signal sent", chat_id=chat_id)
+                await send_telegram(session, "✅ <b>Test signal sent</b>", chat_id=chat_id)
 
             elif cmd == "/status":
-                exec_status = f"✅ ON (${BANKR_BUY_AMOUNT}/trade)" if AUTO_EXECUTE else "❌ OFF"
-                trade_status = "✅ ON" if TRADING_ENABLED else "❌ OFF"
-                pushover_status = "✅ ON" if PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN else "❌ OFF"
-                verdict_status = (
-                    f"✅ ON ({AUTO_VERDICT_TIMEOUT_SEC:.0f}s timeout, {AUTO_VERDICT_MAX_CONCURRENT} concurrent)"
-                    if AUTO_VERDICT_ENABLED else "❌ OFF"
-                )
                 async with db_session() as db:
                     db_status = await get_status_snapshot(db)
+                cooldowns = ", ".join(db_status["provider_cooldowns"]) or "none"
                 await send_telegram(
                     session,
-                    f"📡 <b>Signal Bot</b>\n\n"
-                    f"• Sources: Bankr + Clanker + Virtuals + DexScreener\n"
-                    f"• Active tenants: {db_status['tenants_active']}\n"
-                    f"• Launches total: {db_status['launches_total']}\n"
-                    f"• Launches signaled: {db_status['launches_signaled']}\n"
-                    f"• Signals sent: {alert_count}\n"
-                    f"• DB signals: {db_status['signals_total']}\n"
-                    f"• Recheck queue: {db_status['queued_rechecks']}\n"
-                    f"• Deliveries pending/retry/failed: {db_status['deliveries_pending']}/{db_status['deliveries_retry']}/{db_status['deliveries_failed']}\n"
-                    f"• Provider cooldowns: {', '.join(db_status['provider_cooldowns']) or 'none'}\n"
-                    f"• Blocked: {len(blocked_accounts)} accounts\n"
-                    f"• Min MCap: ${MIN_MCAP:,}\n"
-                    f"• Min Volume: ${MIN_VOLUME_24H:,}\n"
-                    f"• Min Liquidity: ${MIN_LIQUIDITY:,} (DexScreener only)\n"
-                    f"• 🔓 Safe sources (no liq check): {', '.join(SAFE_LAUNCHPADS)}\n"
-                    f"• Poll interval: {POLL_INTERVAL}s\n"
-                    f"• Auto-execute: {exec_status}\n"
-                    f"• Executions: {execution_count}\n"
-                    f"• Inline trading: {trade_status}\n"
-                    f"• Auto-verdict: {verdict_status}\n"
-                    f"• Pushover alerts: {pushover_status}",
+                    f"📡 <b>Status</b>\n\n"
+                    f"<b>Runtime</b>\n"
+                    f"Scan {POLL_INTERVAL}s · Commands {TELEGRAM_COMMAND_POLL_INTERVAL}s · BG {len(telegram_background_tasks)}/{TELEGRAM_BACKGROUND_COMMAND_LIMIT}\n\n"
+                    f"<b>Signals</b>\n"
+                    f"Tenants {db_status['tenants_active']} · Sent {db_status['signals_total']} · Queue {db_status['queued_rechecks']}\n"
+                    f"Delivery {db_status['deliveries_pending']}/{db_status['deliveries_retry']}/{db_status['deliveries_failed']} pending/retry/failed\n\n"
+                    f"<b>Filters</b>\n"
+                    f"MC {fmt_usd(MIN_MCAP)} · Vol {fmt_usd(MIN_VOLUME_24H)} · Liq {fmt_usd(MIN_LIQUIDITY)}\n\n"
+                    f"<b>Providers</b>\n"
+                    f"CoinGecko {'ON' if COINGECKO_DISCOVERY_ENABLED and COINGECKO_API_KEY else 'OFF'} · "
+                    f"Verdict {'ON' if AUTO_VERDICT_ENABLED else 'OFF'} · "
+                    f"Wallets {'ON' if WALLET_MONITOR_ENABLED and ALCHEMY_RPC_URL else 'OFF'}\n"
+                    f"Cooldowns: {h(cooldowns)}",
                     chat_id,
                 )
+
+            elif cmd == "/admin":
+                await send_telegram(session, await build_admin_panel_text(), chat_id, reply_markup=build_admin_keyboard())
 
             elif cmd == "/verdict2":
                 parts = text.split(maxsplit=1)
                 ca = parts[1].strip() if len(parts) == 2 else ""
                 if not is_base_contract(ca):
-                    await send_telegram(session, "Usage: /verdict2 0xCONTRACT", chat_id)
+                    await send_telegram(session, "🤖 <b>Verdict 2.0</b>\n<code>/verdict2 0x...</code>", chat_id)
                     continue
-                await send_telegram(session, f"🤖 Running Verdict 2.0 for <code>{ca.lower()}</code>...", chat_id)
-                try:
-                    result = await analyze_ca_for_command(session, ca, requested_by="telegram_verdict2", include_summary=True)
-                    await send_telegram(session, format_verdict2_report(result), chat_id)
-                except Exception as e:
-                    log.error(f"Verdict2 command failed for {ca}: {e}", exc_info=True)
-                    await send_telegram(session, f"❌ Verdict 2.0 failed: {h(str(e)[:160])}", chat_id)
+                await send_telegram(session, f"🤖 <b>Verdict queued</b>\n<code>{ca.lower()}</code>", chat_id)
+
+                async def do_verdict2():
+                    try:
+                        result = await analyze_ca_for_command(session, ca, requested_by="telegram_verdict2", include_summary=True)
+                        await send_telegram(session, format_verdict2_report(result), chat_id)
+                    except Exception as e:
+                        log.error(f"Verdict2 command failed for {ca}: {e}", exc_info=True)
+                        await send_telegram(session, f"❌ <b>Verdict failed</b>\n{h(str(e)[:160])}", chat_id)
+
+                track_background_command(f"verdict2 {ca.lower()}", do_verdict2())
 
             elif cmd in ("/spoof-check", "/spoof_check"):
                 parts = text.split(maxsplit=1)
                 ca = parts[1].strip() if len(parts) == 2 else ""
                 if not is_base_contract(ca):
-                    await send_telegram(session, "Usage: /spoof_check 0xCONTRACT", chat_id)
+                    await send_telegram(session, "🕵️ <b>Spoof Check</b>\n<code>/spoof_check 0x...</code>", chat_id)
                     continue
-                await send_telegram(session, f"🕵️ Running spoof checks for <code>{ca.lower()}</code>...", chat_id)
-                try:
-                    result = await analyze_ca_for_command(session, ca, requested_by="telegram_spoof", include_summary=False)
-                    await send_telegram(session, format_spoof_report(result), chat_id)
-                except Exception as e:
-                    log.error(f"Spoof command failed for {ca}: {e}", exc_info=True)
-                    await send_telegram(session, f"❌ Spoof check failed: {h(str(e)[:160])}", chat_id)
+                await send_telegram(session, f"🕵️ <b>Spoof check queued</b>\n<code>{ca.lower()}</code>", chat_id)
+
+                async def do_spoof_check():
+                    try:
+                        result = await analyze_ca_for_command(session, ca, requested_by="telegram_spoof", include_summary=False)
+                        await send_telegram(session, format_spoof_report(result), chat_id)
+                    except Exception as e:
+                        log.error(f"Spoof command failed for {ca}: {e}", exc_info=True)
+                        await send_telegram(session, f"❌ <b>Spoof check failed</b>\n{h(str(e)[:160])}", chat_id)
+
+                track_background_command(f"spoof {ca.lower()}", do_spoof_check())
 
             elif cmd == "/summary":
                 parts = text.split(maxsplit=1)
                 ca = parts[1].strip() if len(parts) == 2 else ""
                 if not is_base_contract(ca):
-                    await send_telegram(session, "Usage: /summary 0xCONTRACT", chat_id)
+                    await send_telegram(session, "🧠 <b>Summary</b>\n<code>/summary 0x...</code>", chat_id)
                     continue
-                await send_telegram(session, f"🧠 Building summary for <code>{ca.lower()}</code>...", chat_id)
-                try:
-                    result = await analyze_ca_for_command(session, ca, requested_by="telegram_summary", include_summary=True)
-                    await send_telegram(session, format_summary_report(result), chat_id)
-                except Exception as e:
-                    log.error(f"Summary command failed for {ca}: {e}", exc_info=True)
-                    await send_telegram(session, f"❌ Summary failed: {h(str(e)[:160])}", chat_id)
+                await send_telegram(session, f"🧠 <b>Summary queued</b>\n<code>{ca.lower()}</code>", chat_id)
 
-            elif cmd == "/wallet":
-                user_id = str(msg.get("from", {}).get("id", ""))
-                if not is_trader_user(user_id):
-                    await send_telegram(session, "⛔ Not authorized for trading wallet", chat_id)
+                async def do_summary():
+                    try:
+                        result = await analyze_ca_for_command(session, ca, requested_by="telegram_summary", include_summary=True)
+                        await send_telegram(session, format_summary_report(result), chat_id)
+                    except Exception as e:
+                        log.error(f"Summary command failed for {ca}: {e}", exc_info=True)
+                        await send_telegram(session, f"❌ <b>Summary failed</b>\n{h(str(e)[:160])}", chat_id)
+
+                track_background_command(f"summary {ca.lower()}", do_summary())
+
+            elif cmd == "/watch":
+                parts = text.split(maxsplit=2)
+                ca = parts[1].strip().lower() if len(parts) >= 2 else ""
+                label = parts[2].strip() if len(parts) >= 3 else ""
+                if not is_base_contract(ca):
+                    await send_telegram(session, "⭐ <b>Watch token</b>\n<code>/watch 0x... [label]</code>", chat_id)
                     continue
-                if not TRADING_ENABLED:
-                    await send_telegram(session, "⚠️ Trading not enabled.", chat_id)
+                tenant = await ensure_tenant_for_chat(chat_id, title=telegram_user_title(msg))
+                await send_telegram(session, f"⭐ <b>Watchlist update queued</b>\n<code>{ca}</code>", chat_id)
+
+                async def do_watch():
+                    try:
+                        _, dex = await ensure_launch_for_analysis(session, ca)
+                        async with db_session() as db:
+                            _, inserted = await upsert_watchlist_item(db, tenant_id=tenant.id, ca=ca, label=label, market_json=dex)
+                            await upsert_user_feedback(
+                                db,
+                                tenant_id=tenant.id,
+                                ca=ca,
+                                action="worth_watching",
+                                payload_json={"command": "/watch", "label": label},
+                            )
+                        status = "Added to" if inserted else "Updated in"
+                        label_text = f" · {h(label)}" if label else ""
+                        await send_telegram(
+                            session,
+                            f"⭐ <b>{status} watchlist</b>{label_text}\n\n"
+                            f"<code>{ca}</code>\n"
+                            f"{h(command_market_line({'verdict': {'research': {'market': dex or {}}}}))}",
+                            chat_id,
+                        )
+                    except Exception as e:
+                        log.error(f"Watch command failed for {ca}: {e}", exc_info=True)
+                        await send_telegram(session, f"❌ <b>Watch failed</b>\n{h(str(e)[:160])}", chat_id)
+
+                track_background_command(f"watch {ca}", do_watch())
+
+            elif cmd == "/unwatch":
+                parts = text.split(maxsplit=1)
+                ca = parts[1].strip().lower() if len(parts) == 2 else ""
+                if not is_base_contract(ca):
+                    await send_telegram(session, "⭐ <b>Unwatch token</b>\n<code>/unwatch 0x...</code>", chat_id)
                     continue
-                try:
-                    from trader import get_eth_balance, get_web3, get_wallet
-                    w3 = get_web3()
-                    account = get_wallet(w3)
-                    eth_bal = await get_eth_balance(w3)
-                    await send_telegram(
-                        session,
-                        f"💼 <b>Bot Wallet</b>\n\n"
-                        f"<code>{account.address}</code>\n"
-                        f"💎 ETH: <b>{eth_bal:.4f}</b>\n"
-                        f"🔗 <a href='https://basescan.org/address/{account.address}'>BaseScan</a>",
-                        chat_id,
-                    )
-                except Exception as e:
-                    await send_telegram(session, f"❌ Wallet error: {e}", chat_id)
+                tenant = await ensure_tenant_for_chat(chat_id, title=telegram_user_title(msg))
+                async with db_session() as db:
+                    removed = await deactivate_watchlist_item(db, tenant_id=tenant.id, ca=ca)
+                if removed:
+                    await send_telegram(session, f"✅ <b>Removed from watchlist</b>\n<code>{ca}</code>", chat_id)
+                else:
+                    await send_telegram(session, f"⭐ <b>Not in watchlist</b>\n<code>{ca}</code>", chat_id)
+
+            elif cmd == "/watchlist":
+                tenant = await ensure_tenant_for_chat(chat_id, title=telegram_user_title(msg))
+                async with db_session() as db:
+                    items = await list_watchlist_items(db, tenant_id=tenant.id, limit=50)
+                await send_telegram(session, format_watchlist_rows(items), chat_id)
+
+            elif cmd == "/settings":
+                tenant = await ensure_tenant_for_chat(chat_id, title=telegram_user_title(msg))
+                parts = text.split()
+                async with db_session() as db:
+                    if len(parts) == 3 and parts[1].lower() == "min_score":
+                        try:
+                            min_score = float(parts[2])
+                        except ValueError:
+                            await send_telegram(session, "⚙️ <b>Settings</b>\n<code>/settings min_score 7.5</code>", chat_id)
+                            continue
+                        settings_row = await update_tenant_min_score(db, tenant_id=tenant.id, min_score=min_score)
+                    elif len(parts) == 1:
+                        settings_row = await get_tenant_settings(db, tenant_id=tenant.id)
+                    else:
+                        await send_telegram(session, "⚙️ <b>Settings</b>\n<code>/settings</code>\n<code>/settings min_score 7.5</code>", chat_id)
+                        continue
+                await send_telegram(session, format_settings_text(float(settings_row.min_score)), chat_id)
 
             elif cmd == "/track":
                 parts = text.split(maxsplit=2)
                 address = parts[1].strip() if len(parts) >= 2 else ""
                 label = parts[2].strip() if len(parts) >= 3 else ""
-                if add_tracked_wallet(address, label):
-                    label_text = f" — {html.escape(label)}" if label else ""
-                    await send_telegram(session, f"✅ Tracking wallet\n<code>{address.lower()}</code>{label_text}", chat_id)
+                if not is_base_contract(address):
+                    await send_telegram(session, "🐋 <b>Track wallet</b>\n<code>/track 0x... [label]</code>", chat_id)
+                    continue
+                tenant = await ensure_tenant_for_chat(chat_id, title=telegram_user_title(msg))
+                async with db_session() as db:
+                    _, inserted = await upsert_tracked_wallet(db, tenant_id=tenant.id, address=address, label=label)
+                if inserted:
+                    label_text = f"\n{h(label)}" if label else ""
+                    await send_telegram(session, f"✅ <b>Tracking wallet</b>{label_text}\n<code>{address.lower()}</code>", chat_id)
                 else:
-                    await send_telegram(session, "Usage: /track 0xADDRESS [label]", chat_id)
+                    await send_telegram(session, f"✅ <b>Wallet tracking updated</b>\n<code>{address.lower()}</code>", chat_id)
 
             elif cmd == "/untrack":
                 parts = text.split(maxsplit=1)
                 address = parts[1].strip() if len(parts) == 2 else ""
-                if remove_tracked_wallet(address):
-                    await send_telegram(session, f"✅ Untracked wallet\n<code>{address.lower()}</code>", chat_id)
+                if not is_base_contract(address):
+                    await send_telegram(session, "🐋 <b>Untrack wallet</b>\n<code>/untrack 0x...</code>", chat_id)
+                    continue
+                tenant = await ensure_tenant_for_chat(chat_id, title=telegram_user_title(msg))
+                async with db_session() as db:
+                    removed = await deactivate_tracked_wallet(db, tenant_id=tenant.id, address=address)
+                if removed:
+                    await send_telegram(session, f"✅ <b>Untracked wallet</b>\n<code>{address.lower()}</code>", chat_id)
                 else:
-                    await send_telegram(session, "Wallet not found. Usage: /untrack 0xADDRESS", chat_id)
+                    await send_telegram(session, "🐋 <b>Wallet not found</b>\n<code>/wallets</code>", chat_id)
 
             elif cmd in ("/wallets", "/tracked_wallets"):
-                wallets = load_tracked_wallets()
+                tenant = await ensure_tenant_for_chat(chat_id, title=telegram_user_title(msg))
+                async with db_session() as db:
+                    wallets = await list_tracked_wallets(db, tenant_id=tenant.id, limit=50)
                 if not wallets:
-                    await send_telegram(session, "No wallets tracked yet.\nUse /track 0xADDRESS [label] to add one.", chat_id)
+                    await send_telegram(session, "🐋 <b>Tracked Wallets</b>\n\nEmpty.\n<code>/track 0x... [label]</code>", chat_id)
                     continue
-                lines = [f"🐋 <b>Tracked Wallets ({len(wallets)})</b>"]
+                lines = [f"🐋 <b>Tracked Wallets</b> · {len(wallets)}", ""]
                 for idx, wallet in enumerate(wallets[:30], 1):
-                    label = html.escape(wallet.get("label", ""))
-                    suffix = f" — {label}" if label else ""
-                    address = wallet["address"]
+                    label = html.escape(wallet.label or "")
+                    suffix = f" · <b>{label}</b>" if label else ""
+                    address = wallet.address
                     lines.append(f"{idx}. <code>{address}</code>{suffix}")
                     lines.append(f"   <a href='https://basescan.org/address/{address}'>BaseScan</a>")
                 await send_telegram(session, "\n".join(lines), chat_id)
@@ -1066,22 +1357,43 @@ async def handle_telegram_commands(session: aiohttp.ClientSession):
             elif cmd in ("/research", "/r"):
                 parts = text.split(maxsplit=1)
                 if len(parts) < 2:
-                    await send_telegram(session, "Usage: /research $TICKER or /research 0x...", chat_id)
+                    await send_telegram(session, "🔍 <b>Research</b>\n<code>/research 0x...</code>\n<code>/research $TICKER</code>", chat_id)
                     continue
                 ticker_query = parts[1].strip()
-                await send_telegram(session, f"🔍 Researching <b>{ticker_query}</b>...", chat_id)
-                try:
-                    report = await research_token(session, ticker_query)
-                    await send_telegram(session, report, chat_id)
-                except Exception as re:
-                    log.error(f"Research error for {ticker_query}: {re}")
-                    await send_telegram(session, f"❌ Research failed for {ticker_query}: {str(re)[:100]}", chat_id)
+                await send_telegram(session, f"🔍 <b>Research queued</b>\n<code>{h(ticker_query)}</code>", chat_id)
+
+                async def do_research():
+                    try:
+                        report = await research_token(session, ticker_query)
+                        ca_query = ticker_query.strip().lower()
+                        social_evidence = (
+                            _xsignal_page_cache.get(xsignal_cache_key(ca_query))
+                            if is_base_contract(ca_query)
+                            else None
+                        )
+                        await send_telegram(
+                            session,
+                            report,
+                            chat_id,
+                            reply_markup=build_xsignal_pagination_keyboard(ca_query, social_evidence, 1),
+                        )
+                    except Exception as re:
+                        log.error(f"Research error for {ticker_query}: {re}")
+                        await send_telegram(session, f"❌ <b>Research failed</b>\n<code>{h(ticker_query)}</code>\n{h(str(re)[:120])}", chat_id)
+
+                track_background_command(f"research {ticker_query}", do_research())
 
             else:
-                await send_telegram(session, "Unknown command. Use /help.", chat_id=chat_id)
+                await send_telegram(session, "Unknown command.\n<code>/help</code>", chat_id=chat_id)
 
     except Exception as e:
         log.warning(f"Telegram command check error: {e}")
+
+
+async def telegram_command_loop(session: aiohttp.ClientSession) -> None:
+    while True:
+        await handle_telegram_commands(session)
+        await asyncio.sleep(TELEGRAM_COMMAND_POLL_INTERVAL)
 
 
 # ─── SocialData.tools Follower Lookup ─────────────────────────────────────────
@@ -1200,6 +1512,19 @@ def normalize_dexscreener_pair(best: dict, token_address: str) -> dict:
         "socials": info.get("socials") or [],
         "_source": "dexscreener",
     }
+
+
+def to_float(value, default: float = 0.0) -> float:
+    try:
+        if value in (None, ""):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def non_negative_float(value, default: float = 0.0) -> float:
+    return max(0.0, to_float(value, default))
 
 
 async def _fetch_dexscreener(session: aiohttp.ClientSession, token_address: str) -> dict | None:
@@ -1328,10 +1653,10 @@ async def _fetch_geckoterminal_api(session: aiohttp.ClientSession, token_address
             return None
 
         # Parse GeckoTerminal pool format
-        mcap = float(best.get("market_cap_usd") or best.get("fdv_usd") or 0)
+        mcap = to_float(best.get("market_cap_usd") or best.get("fdv_usd") or 0)
         vol_raw = best.get("volume_usd") or {}
-        vol_24h = float(vol_raw.get("h24") or 0)
-        liquidity = float(best.get("reserve_in_usd") or 0)
+        vol_24h = to_float(vol_raw.get("h24") or 0)
+        liquidity = to_float(best.get("reserve_in_usd") or 0)
         price_changes = best.get("price_change_percentage") or {}
 
         token_name = attrs.get("name", "")
@@ -1488,6 +1813,33 @@ RESEARCH_METRIC_KEYWORDS = {
     "whale", "dominance", "holders", "burn", "deflationary",
     "onchain", "circulating supply",
 }
+RESEARCH_NOISE_PENALTIES = {
+    "gm": 2,
+    "gn": 2,
+    "lfg": 1,
+    "lol": 1,
+    "lmao": 1,
+    "meme": 2,
+    "bro": 1,
+    "vibes": 1,
+    "shitpost": 2,
+    "just vibes": 2,
+    "not crypto advice": 1,
+}
+RESEARCH_TOP_AUTHORS = {
+    "supercontraa",
+    "game_for_one",
+    "moneylord",
+    "0xunihax0r",
+    "decentrlizordie",
+    "0xsammy",
+    "aixbt_agent",
+}
+RESEARCH_GENERIC_HASHTAGS = {"crypto", "bitcoin", "ethereum", "web3", "blockchain", "defi", "base"}
+RESEARCH_EXCLUDED_TOKENS = {"BTC", "ETH", "USDT", "USDC", "USD", "GM", "SOL"}
+RESEARCH_HARD_SPAM_URLS = ("okai.hk/alpha",)
+RESEARCH_TOKEN_RE = re.compile(r"\$([A-Za-z0-9]{2,10})\b")
+RESEARCH_HASHTAG_RE = re.compile(r"#([A-Za-z][A-Za-z0-9_]{2,20})\b")
 
 
 def contains_term(text_lower: str, term: str) -> bool:
@@ -1495,22 +1847,122 @@ def contains_term(text_lower: str, term: str) -> bool:
 
 
 def build_research_query(ticker: str, address: str = "") -> str:
-    clean_ticker = (ticker or "").strip().lstrip("$")
-    terms = []
     if address:
-        terms.append(address.lower())
-    if clean_ticker:
-        terms.append(f"${clean_ticker.upper()}")
-    if not terms:
-        return ""
-    return terms[0] if len(terms) == 1 else "(" + " OR ".join(terms) + ")"
+        return address.lower()
+    return build_ticker_research_query(ticker)
+
+
+def build_ticker_research_query(ticker: str) -> str:
+    clean_ticker = (ticker or "").strip().lstrip("$")
+    return f"${clean_ticker.upper()}" if clean_ticker else ""
+
+
+def build_address_research_query(address: str) -> str:
+    return address.lower() if address else ""
+
+
+def research_clean_text(text: str) -> str:
+    text = re.sub(r"https?://\S+", "", str(text or ""))
+    return " ".join(text.split())
+
+
+def research_tokens(text: str) -> list[str]:
+    found = {token.upper() for token in RESEARCH_TOKEN_RE.findall(text)}
+    return sorted(
+        token for token in found
+        if token not in RESEARCH_EXCLUDED_TOKENS
+        and not token.isdigit()
+        and not re.fullmatch(r"\d+[KMB]?", token)
+    )
+
+
+def research_thesis_quality(text: str, tokens: list[str]) -> float:
+    clean = research_clean_text(text)
+    lower = clean.lower()
+    words = len(clean.split())
+    score = 0.0
+    if words >= 40:
+        score += 4
+    elif words >= 25:
+        score += 3
+    elif words >= 15:
+        score += 2
+    elif words >= 8:
+        score += 1
+    if tokens:
+        score += 2
+    if re.search(r"\d+[%xXkKmMbB]|\$\d|\d+\.\d", clean):
+        score += 2
+    score += min(sum(1 for kw in RESEARCH_TIER1_KEYWORDS if contains_term(lower, kw)) * 2.0, 6.0)
+    score += min(sum(1 for kw in RESEARCH_TIER2_KEYWORDS if contains_term(lower, kw)) * 1.0, 3.0)
+    score += min(sum(1 for kw in RESEARCH_METRIC_KEYWORDS if contains_term(lower, kw)) * 1.5, 4.5)
+    return score
+
+
+def research_text_hash(text: str) -> str:
+    clean = research_clean_text(text).lower().encode("utf-8")
+    return hashlib.sha256(clean).hexdigest()[:16]
+
+
+def research_word_set(text: str) -> set[str]:
+    clean = research_clean_text(text).lower()
+    return {w for w in clean.split() if len(w) > 2 and not w.startswith(("@", "#", "$"))}
+
+
+def research_near_duplicate(a: str, b: str, threshold: float = 0.75) -> bool:
+    left = research_word_set(a)
+    right = research_word_set(b)
+    if not left or not right:
+        return False
+    return len(left & right) / len(left | right) >= threshold
+
+
+def research_has_spam_hashtag(text: str) -> bool:
+    tags = [tag.lower() for tag in RESEARCH_HASHTAG_RE.findall(text)]
+    if not tags:
+        return False
+    meaningful = [tag for tag in tags if tag not in RESEARCH_GENERIC_HASHTAGS]
+    return len(tags) >= 2 or bool(meaningful)
+
+
+def research_is_hard_spam(text: str) -> bool:
+    normalized = str(text or "").lower().replace("https://", "").replace("http://", "")
+    return any(url in normalized for url in RESEARCH_HARD_SPAM_URLS)
+
+
+def research_has_min_engagement(tweet: dict) -> bool:
+    return (
+        int(tweet.get("views") or 0) >= RESEARCH_MIN_TWEET_VIEWS
+        and int(tweet.get("likes") or 0) >= RESEARCH_MIN_TWEET_LIKES
+    )
+
+
+def research_relevance(tweet: dict, ticker: str, address: str = "") -> bool:
+    text = tweet.get("text", "")
+    upper = text.upper()
+    lower = text.lower()
+    clean_ticker = (ticker or "").strip().lstrip("$").upper()
+    has_ticker = bool(clean_ticker and (f"${clean_ticker}" in upper or clean_ticker in tweet.get("tokens", [])))
+    has_ca = bool(address and address.lower() in lower)
+    if address:
+        return has_ca
+    return has_ticker or has_ca or bool(tweet.get("watched_influencer") and tweet.get("score", 0) >= 2)
 
 
 def score_research_tweet(tweet: dict) -> dict:
-    text = re.sub(r"https?://t\.co/\S+", "", tweet.get("text", "")).strip()
+    text = research_clean_text(tweet.get("text", ""))
     lower = text.lower()
     score = 0
     tier = 3
+    tokens = research_tokens(text)
+    tweet["tokens"] = tokens
+    tweet["text_hash"] = research_text_hash(text)
+
+    if len(text) < 20:
+        tweet["score"] = 0
+        tweet["tier"] = 3
+        tweet["low_content"] = True
+        return tweet
 
     tier1_hits = sum(1 for kw in RESEARCH_TIER1_KEYWORDS if contains_term(lower, kw))
     tier2_hits = sum(1 for kw in RESEARCH_TIER2_KEYWORDS if contains_term(lower, kw))
@@ -1524,7 +1976,7 @@ def score_research_tweet(tweet: dict) -> dict:
             tier = 2
     score += metric_hits * 2
 
-    if tweet.get("high_priority"):
+    if tweet.get("high_priority") or tweet.get("username", "").lower() in RESEARCH_TOP_AUTHORS:
         score += 5
         if tier == 3:
             tier = 2
@@ -1533,19 +1985,44 @@ def score_research_tweet(tweet: dict) -> dict:
     retweets = int(tweet.get("retweets") or 0)
     replies = int(tweet.get("replies") or 0)
     views = int(tweet.get("views") or 0)
+    bookmarks = int(tweet.get("bookmarks") or 0)
+    quotes = int(tweet.get("quotes") or 0)
     followers = int(tweet.get("followers") or 0)
 
     score += 6 if likes >= 200 else 4 if likes >= 50 else 2 if likes >= 10 else 0
     score += 4 if retweets >= 100 else 2 if retweets >= 25 else 1 if retweets >= 5 else 0
     score += 3 if replies >= 100 else 2 if replies >= 50 else 1 if replies >= 10 else 0
     score += 3 if views >= 100_000 else 2 if views >= 10_000 else 1 if views >= 1_000 else 0
+    score += 3 if bookmarks >= 50 else 2 if bookmarks >= 10 else 1 if bookmarks >= 3 else 0
+    score += 2 if quotes >= 20 else 1 if quotes >= 5 else 0
     score += 4 if followers >= 100_000 else 3 if followers >= 50_000 else 2 if followers >= 10_000 else 1 if followers >= 1_000 else 0
 
-    if any(contains_term(lower, noise) for noise in ("gm", "gn", "lol", "lmao", "vibes", "shitpost")):
-        score -= 2
+    created_at = tweet.get("created_at")
+    if isinstance(created_at, datetime):
+        dt = created_at if created_at.tzinfo else created_at.replace(tzinfo=timezone.utc)
+        age_hours = max(0.5, (datetime.now(timezone.utc) - dt).total_seconds() / 3600)
+        likes_per_hour = likes / age_hours
+        score += 3 if likes_per_hour >= 100 else 2 if likes_per_hour >= 30 else 1 if likes_per_hour >= 10 else 0
+
+    for term, penalty in RESEARCH_NOISE_PENALTIES.items():
+        if contains_term(lower, term):
+            score -= penalty
+
+    signal_hits = len(tokens) + tier1_hits + tier2_hits + metric_hits
+    thesis_quality = research_thesis_quality(text, tokens)
+    if signal_hits == 0:
+        score = max(0, score) if tweet.get("watched_influencer") else 0
+        tier = 3
+    elif tier == 3 and (tokens or thesis_quality >= 4):
+        tier = 2 if score >= 8 else 3
+    if thesis_quality < 2 and not tweet.get("high_priority"):
+        tier = 3
 
     tweet["score"] = max(score, 0)
     tweet["tier"] = tier
+    tweet["thesis_quality"] = round(thesis_quality, 1)
+    tweet["signal_hits"] = signal_hits
+    tweet["low_content"] = thesis_quality < 2
     return tweet
 
 
@@ -1556,49 +2033,194 @@ def parse_socialdata_tweet(tweet: dict) -> dict | None:
     text = (tweet.get("full_text") or tweet.get("text") or "").strip()
     if not username or not tweet_id or not text:
         return None
+    if research_is_hard_spam(text):
+        return None
+    created_raw = tweet.get("tweet_created_at") or tweet.get("created_at") or ""
+    created_dt = None
+    if created_raw:
+        try:
+            created_dt = datetime.fromisoformat(str(created_raw).replace("Z", "+00:00"))
+        except ValueError:
+            created_dt = None
     item = {
         "username": username,
         "name": user.get("name", ""),
+        "bio": user.get("description", ""),
         "followers": int(user.get("followers_count") or 0),
         "text": text[:500],
         "likes": int(tweet.get("favorite_count") or 0),
         "retweets": int(tweet.get("retweet_count") or 0),
         "replies": int(tweet.get("reply_count") or 0),
         "views": int(tweet.get("views_count") or 0),
-        "date": (tweet.get("tweet_created_at") or "")[:16],
+        "bookmarks": int(tweet.get("bookmark_count") or 0),
+        "quotes": int(tweet.get("quote_count") or 0),
+        "date": str(created_raw)[:16],
+        "created_at": created_dt,
         "url": f"https://x.com/{username}/status/{tweet_id}",
         "high_priority": username.lower() in HIGH_PRIORITY_INFLUENCERS,
     }
+    if not passes_social_intelligence_filters(item):
+        return None
+    if not research_has_min_engagement(item):
+        return None
     return score_research_tweet(item)
 
 
-async def socialdata_search(
+def socialdata_normalize_query(query: str) -> str:
+    return " ".join(str(query or "").strip().split()).lower()
+
+
+def socialdata_search_cache_key(query: str, search_type: str, limit: int, max_pages: int) -> str:
+    payload = {
+        "query": socialdata_normalize_query(query),
+        "type": (search_type or "Top").strip().lower(),
+        "limit": int(limit),
+        "max_pages": int(max_pages),
+        "filters": {
+            "version": "hermes-social-intelligence-v2",
+            "min_tweets": RESEARCH_MIN_QUALIFIED_TWEETS,
+            "min_views": RESEARCH_MIN_TWEET_VIEWS,
+            "min_likes": RESEARCH_MIN_TWEET_LIKES,
+            "spam_urls": RESEARCH_HARD_SPAM_URLS,
+        },
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:24]
+    return f"socialdata:search:{digest}"
+
+
+def socialdata_serialize_tweets(tweets: list[dict]) -> list[dict]:
+    serialized = []
+    for item in tweets:
+        copy = dict(item)
+        created_at = copy.get("created_at")
+        if isinstance(created_at, datetime):
+            copy["created_at"] = created_at.isoformat()
+        serialized.append(copy)
+    return serialized
+
+
+def socialdata_deserialize_tweets(tweets: list[dict]) -> list[dict]:
+    deserialized = []
+    for item in tweets:
+        copy = dict(item)
+        created_at = copy.get("created_at")
+        if isinstance(created_at, str) and created_at:
+            try:
+                copy["created_at"] = datetime.fromisoformat(created_at)
+            except ValueError:
+                copy["created_at"] = None
+        deserialized.append(copy)
+    return deserialized
+
+
+async def get_socialdata_search_cache(cache_key: str, *, allow_stale: bool = False) -> list[dict] | None:
+    now_ts = time.time()
+    cached = socialdata_search_cache.get(cache_key)
+    if cached:
+        expires_ts, stale_ts, tweets = cached
+        if now_ts <= expires_ts or (allow_stale and now_ts <= stale_ts):
+            return socialdata_deserialize_tweets(tweets)
+
+    async with db_session() as db:
+        raw = await get_bot_state(db, cache_key)
+    if not raw:
+        return None
+
+    try:
+        payload = json.loads(raw)
+        expires_at = datetime.fromisoformat(payload["expires_at"])
+        stale_until = datetime.fromisoformat(payload["stale_until"])
+        expires_ts = expires_at.timestamp()
+        stale_ts = stale_until.timestamp()
+        tweets = payload.get("tweets") or []
+    except Exception:
+        return None
+
+    if now_ts <= expires_ts or (allow_stale and now_ts <= stale_ts):
+        socialdata_search_cache[cache_key] = (expires_ts, stale_ts, tweets)
+        return socialdata_deserialize_tweets(tweets)
+    return None
+
+
+async def set_socialdata_search_cache(cache_key: str, tweets: list[dict]) -> None:
+    now = utc_now()
+    ttl = SOCIALDATA_SEARCH_CACHE_TTL_SEC if tweets else SOCIALDATA_SEARCH_EMPTY_CACHE_TTL_SEC
+    expires_at = now + timedelta(seconds=ttl)
+    stale_until = now + timedelta(seconds=max(ttl, SOCIALDATA_SEARCH_STALE_TTL_SEC))
+    serialized = socialdata_serialize_tweets(tweets)
+    socialdata_search_cache[cache_key] = (expires_at.timestamp(), stale_until.timestamp(), serialized)
+    async with db_session() as db:
+        await set_bot_state(
+            db,
+            cache_key,
+            {
+                "expires_at": expires_at.isoformat(),
+                "stale_until": stale_until.isoformat(),
+                "tweets": serialized,
+            },
+        )
+
+
+async def socialdata_search_budget_available() -> bool:
+    now = utc_now()
+    async with db_session() as db:
+        minute_used = await get_api_budget_usage(
+            db,
+            provider="socialdata",
+            since=now - timedelta(minutes=1),
+        )
+        hour_used = await get_api_budget_usage(
+            db,
+            provider="socialdata",
+            since=now - timedelta(hours=1),
+        )
+        if minute_used >= SOCIALDATA_SEARCH_MAX_CALLS_PER_MIN or hour_used >= SOCIALDATA_SEARCH_MAX_CALLS_PER_HOUR:
+            await set_provider_cooldown(
+                db,
+                provider="socialdata",
+                cooldown_until=now + timedelta(seconds=60),
+                reason=f"local budget cap minute={minute_used}, hour={hour_used}",
+            )
+            return False
+    return True
+
+
+async def socialdata_search_uncached(
     session: aiohttp.ClientSession,
     query: str,
     search_type: str = "Top",
     limit: int = 20,
     timeout_sec: int = 10,
+    max_pages: int = SOCIALDATA_SEARCH_MAX_PAGES,
 ) -> list[dict]:
-    if not SOCIALDATA_API_KEY:
-        return []
-
     results = []
-    try:
-        url = "https://api.socialdata.tools/twitter/search"
-        headers = {
-            "Authorization": f"Bearer {SOCIALDATA_API_KEY}",
-            "Accept": "application/json",
-        }
+    url = "https://api.socialdata.tools/twitter/search"
+    headers = {
+        "Authorization": f"Bearer {SOCIALDATA_API_KEY}",
+        "Accept": "application/json",
+    }
+
+    cursor = None
+    seen_urls = set()
+    pages = 0
+    while pages < max(1, max_pages) and len(results) < limit:
+        if not await socialdata_search_budget_available():
+            log.debug("SocialData search budget exhausted; using cache/fallback only")
+            break
+
         params = {"query": query, "type": search_type}
+        if cursor:
+            params["cursor"] = cursor
 
         async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=timeout_sec)) as resp:
+            await record_provider_response("socialdata", endpoint="twitter/search", status_code=resp.status, cooldown_seconds=120)
             if resp.status != 200:
                 body = await resp.text()
                 log.debug(f"SocialData search {resp.status}: {body[:160]}")
-                return []
+                break
             data = await resp.json()
 
-        seen_urls = set()
+        pages += 1
         for tweet in data.get("tweets", []):
             item = parse_socialdata_tweet(tweet)
             if not item or item["url"] in seen_urls:
@@ -1607,37 +2229,186 @@ async def socialdata_search(
             results.append(item)
             if len(results) >= limit:
                 break
-    except Exception as e:
-        log.debug(f"SocialData search error for '{query[:60]}': {e}")
+
+        cursor = data.get("next_cursor")
+        if not cursor:
+            break
 
     return results
 
 
-async def search_x_mentions(session: aiohttp.ClientSession, ticker: str, token_name: str = "", address: str = "") -> list[dict]:
+async def socialdata_search(
+    session: aiohttp.ClientSession,
+    query: str,
+    search_type: str = "Top",
+    limit: int = 20,
+    timeout_sec: int = 10,
+    max_pages: int = SOCIALDATA_SEARCH_MAX_PAGES,
+) -> list[dict]:
+    if not SOCIALDATA_API_KEY:
+        return []
+
+    cache_key = socialdata_search_cache_key(query, search_type, limit, max_pages)
+    cached = await get_socialdata_search_cache(cache_key)
+    if cached is not None:
+        log.debug(f"SocialData search cache hit: {socialdata_normalize_query(query)[:80]}")
+        return cached[:limit]
+
+    if not await is_provider_available("socialdata"):
+        stale = await get_socialdata_search_cache(cache_key, allow_stale=True)
+        return (stale or [])[:limit]
+
+    if not await socialdata_search_budget_available():
+        stale = await get_socialdata_search_cache(cache_key, allow_stale=True)
+        return (stale or [])[:limit]
+
+    existing_task = socialdata_search_inflight.get(cache_key)
+    if existing_task:
+        try:
+            return (await asyncio.shield(existing_task))[:limit]
+        except Exception:
+            return []
+
+    async def run_search() -> list[dict]:
+        results = await socialdata_search_uncached(
+            session,
+            query,
+            search_type=search_type,
+            limit=limit,
+            timeout_sec=timeout_sec,
+            max_pages=max_pages,
+        )
+        await set_socialdata_search_cache(cache_key, results)
+        return socialdata_deserialize_tweets(socialdata_serialize_tweets(results))
+
+    task = asyncio.create_task(run_search())
+    socialdata_search_inflight[cache_key] = task
+    try:
+        return (await task)[:limit]
+    except Exception as e:
+        log.debug(f"SocialData search error for '{query[:60]}': {e}")
+        stale = await get_socialdata_search_cache(cache_key, allow_stale=True)
+        return (stale or [])[:limit]
+    finally:
+        socialdata_search_inflight.pop(cache_key, None)
+
+
+def filter_research_tweets(
+    tweets: list[dict],
+    *,
+    ticker: str,
+    address: str = "",
+    limit: int = 6,
+    allow_tier3: bool = False,
+    min_count: int = RESEARCH_MIN_QUALIFIED_TWEETS,
+    max_age_hours: int = 24,
+) -> list[dict]:
+    selected: list[dict] = []
+    seen_urls: set[str] = set()
+    seen_hashes: set[str] = set()
+    for tweet in tweets:
+        if not tweet or tweet.get("url") in seen_urls:
+            continue
+        text = tweet.get("text", "")
+        if (
+            research_is_hard_spam(text)
+            or not research_has_min_engagement(tweet)
+            or not passes_social_intelligence_filters(tweet)
+        ):
+            continue
+        if not is_recent_tweet(tweet, max_age_hours=max_age_hours):
+            continue
+        if research_has_spam_hashtag(text) and not tweet.get("high_priority") and not tweet.get("watched_influencer"):
+            continue
+        if not research_relevance(tweet, ticker, address):
+            continue
+        if tweet.get("text_hash") in seen_hashes:
+            continue
+        if any(research_near_duplicate(text, existing.get("text", "")) for existing in selected):
+            continue
+        score = int(tweet.get("score") or 0)
+        tier = int(tweet.get("tier") or 3)
+        qualifies = (
+            tweet.get("high_priority")
+            or tweet.get("watched_influencer")
+            or tweet.get("followers", 0) >= RESEARCH_MIN_FOLLOWERS
+            or score >= RESEARCH_HIGH_SIGNAL_SCORE
+            or (allow_tier3 and score >= 2 and not tweet.get("low_content"))
+        )
+        if not qualifies:
+            continue
+        if tier <= 2 or allow_tier3 or tweet.get("high_priority") or tweet.get("watched_influencer"):
+            selected.append(tweet)
+            seen_urls.add(tweet["url"])
+            seen_hashes.add(tweet.get("text_hash", ""))
+        if len(selected) >= limit:
+            break
+    selected.sort(
+        key=lambda m: (
+            1 if int(m.get("tier") or 3) == 1 else 0,
+            int(m.get("score") or 0),
+            float(m.get("thesis_quality") or 0),
+            int(m.get("followers") or 0),
+            int(m.get("likes") or 0),
+        ),
+        reverse=True,
+    )
+    if min_count and len(selected) < min_count:
+        return []
+    return selected[:limit]
+
+
+async def search_x_mentions(
+    session: aiohttp.ClientSession,
+    ticker: str,
+    token_name: str = "",
+    address: str = "",
+    max_age_hours: int = 24,
+    allow_tier3: bool = False,
+    limit: int = 24,
+    min_count: int = RESEARCH_MIN_QUALIFIED_TWEETS,
+) -> list[dict]:
     query = build_research_query(ticker, address)
     if not query:
         return []
 
-    mentions = await socialdata_search(session, f"{query} min_faves:5", search_type="Top", limit=20)
-    mentions = [
-        m for m in mentions
-        if m["followers"] >= RESEARCH_MIN_FOLLOWERS
-        or m.get("high_priority")
-        or m.get("score", 0) >= RESEARCH_HIGH_SIGNAL_SCORE
-    ]
-    mentions.sort(key=lambda m: (m.get("tier", 3) == 1, m.get("score", 0), m["followers"], m["likes"]), reverse=True)
-    return mentions[:6]
+    raw_mentions = await socialdata_search(session, f"{query} min_faves:5", search_type="Top", limit=80)
+    mentions = filter_research_tweets(
+        raw_mentions,
+        ticker=ticker,
+        address=address,
+        limit=limit,
+        max_age_hours=max_age_hours,
+        allow_tier3=allow_tier3,
+        min_count=min_count,
+    )
+    return mentions
 
 
-async def search_x_ticker_recent(session: aiohttp.ClientSession, ticker: str, address: str = "", limit: int = 8) -> list[dict]:
-    """Search X for most recent tweets mentioning $TICKER or contract."""
-    query = build_research_query(ticker, address)
-    if not query:
-        return []
-    return await socialdata_search(session, query, search_type="Latest", limit=limit)
+async def search_x_ticker_recent(
+    session: aiohttp.ClientSession,
+    ticker: str,
+    address: str = "",
+    limit: int = 8,
+    max_age_hours: int = 24,
+) -> list[dict]:
+    """Search latest tweets through Nitter only; SocialData is reserved for Top tweets."""
+    return await search_nitter_mentions(
+        session,
+        ticker,
+        address=address,
+        limit=limit,
+        max_age_hours=max_age_hours,
+    )
 
 
-async def search_influencer_mentions(session: aiohttp.ClientSession, ticker: str, address: str = "", limit: int = 8) -> list[dict]:
+async def search_influencer_mentions(
+    session: aiohttp.ClientSession,
+    ticker: str,
+    address: str = "",
+    limit: int = 8,
+    max_age_hours: int = 24,
+) -> list[dict]:
     """Search watched influencer accounts imported from Jarvis."""
     if not WATCHED_INFLUENCERS:
         return []
@@ -1652,17 +2423,363 @@ async def search_influencer_mentions(session: aiohttp.ClientSession, ticker: str
     for i in range(0, len(WATCHED_INFLUENCERS), batch_size):
         batch = WATCHED_INFLUENCERS[i:i + batch_size]
         from_query = "(" + " OR ".join(f"from:{account}" for account in batch) + ")"
-        tweets = await socialdata_search(session, f"{token_query} {from_query}", search_type="Latest", limit=limit)
+        tweets = await socialdata_search(session, f"{token_query} {from_query}", search_type="Latest", limit=max(limit * 2, RESEARCH_MIN_QUALIFIED_TWEETS))
         for tweet in tweets:
             if tweet["url"] in seen:
                 continue
             tweet["watched_influencer"] = True
+            tweet = score_research_tweet(tweet)
             seen.add(tweet["url"])
             found.append(tweet)
         if len(found) >= limit:
             break
-    found.sort(key=lambda m: (m.get("high_priority", False), m.get("score", 0), m["followers"], m["likes"]), reverse=True)
-    return found[:limit]
+    return filter_research_tweets(
+        found,
+        ticker=ticker,
+        address=address,
+        limit=limit,
+        allow_tier3=True,
+        max_age_hours=max_age_hours,
+    )
+
+
+def parse_nitter_rss_item(item: ET.Element, *, max_age_hours: int = 24) -> dict | None:
+    title = item.findtext("title") or ""
+    link = item.findtext("link") or ""
+    pub_date = item.findtext("pubDate") or ""
+    if not title or not link:
+        return None
+    username = ""
+    match = re.search(r"/([^/]+)/status/", link)
+    if match:
+        username = match.group(1)
+    created_at = None
+    if pub_date:
+        try:
+            from email.utils import parsedate_to_datetime
+            created_at = parsedate_to_datetime(pub_date)
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+        except Exception:
+            created_at = None
+    tweet = {
+        "username": username or "unknown",
+        "name": username or "unknown",
+        "bio": "",
+        "followers": 0,
+        "text": research_clean_text(title)[:500],
+        "likes": 0,
+        "retweets": 0,
+        "replies": 0,
+        "views": 0,
+        "bookmarks": 0,
+        "quotes": 0,
+        "date": pub_date[:16],
+        "created_at": created_at,
+        "url": link.replace("nitter.net", "x.com"),
+        "source": "nitter",
+    }
+    if not is_recent_tweet(tweet, max_age_hours=max_age_hours):
+        return None
+    if not passes_social_intelligence_filters(tweet):
+        return None
+    return score_research_tweet(tweet)
+
+
+async def search_nitter_mentions(
+    session: aiohttp.ClientSession,
+    ticker: str,
+    address: str = "",
+    limit: int = 12,
+    max_age_hours: int = 24,
+) -> list[dict]:
+    if not NITTER_ENABLED or not NITTER_BASE_URLS:
+        return []
+    query = build_research_query(ticker, address)
+    if not query:
+        return []
+    for base_url in NITTER_BASE_URLS:
+        try:
+            url = f"{base_url}/search/rss?f=tweets&q={quote(query)}"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status != 200:
+                    continue
+                body = await resp.text()
+            root = ET.fromstring(body)
+            parsed = []
+            for item in root.findall("./channel/item"):
+                tweet = parse_nitter_rss_item(item, max_age_hours=max_age_hours)
+                if not tweet:
+                    continue
+                if address and address.lower() not in tweet.get("text", "").lower():
+                    continue
+                parsed.append(tweet)
+                if len(parsed) >= limit:
+                    break
+            return parsed
+        except Exception as e:
+            log.debug(f"Nitter search failed via {base_url}: {e}")
+    return []
+
+
+async def check_nitter_health(session: aiohttp.ClientSession) -> tuple[bool, str, str, int | None, int]:
+    if not NITTER_ENABLED:
+        return False, "", "Nitter disabled", None, 0
+    if not NITTER_BASE_URLS:
+        return False, "", "NITTER_BASE_URLS empty", None, 0
+
+    errors: list[str] = []
+    for base_url in NITTER_BASE_URLS:
+        try:
+            started = time.perf_counter()
+            url = f"{base_url}/search/rss?f=tweets&q={quote(NITTER_HEALTH_QUERY)}"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                response_ms = int((time.perf_counter() - started) * 1000)
+                if resp.status != 200:
+                    errors.append(f"{base_url}: HTTP {resp.status}")
+                    continue
+                body = await resp.text()
+            root = ET.fromstring(body)
+            items = root.findall("./channel/item")
+            if not items:
+                errors.append(f"{base_url}: RSS ok, 0 items")
+                continue
+            return True, base_url, f"{len(items)} RSS item(s)", response_ms, len(items)
+        except Exception as e:
+            errors.append(f"{base_url}: {str(e)[:90]}")
+    return False, "", "; ".join(errors[:3]) or "unknown Nitter error", None, 0
+
+
+async def nitter_health_loop(session: aiohttp.ClientSession) -> None:
+    if not NITTER_HEALTH_ENABLED or not NITTER_ENABLED or not NITTER_BASE_URLS:
+        nitter_health_state.update(
+            {
+                "ok": None,
+                "last_error": "disabled" if not NITTER_ENABLED else "NITTER_BASE_URLS empty",
+            }
+        )
+        return
+    previous_ok: bool | None = None
+    while True:
+        ok, base_url, detail, response_ms, item_count = await check_nitter_health(session)
+        async with db_session() as db:
+            await record_nitter_health_log(
+                db,
+                base_url=base_url or (NITTER_BASE_URLS[0] if NITTER_BASE_URLS else ""),
+                status="ok" if ok else "down",
+                detail=detail,
+                response_ms=response_ms,
+                item_count=item_count,
+            )
+        now_iso = utc_now().isoformat()
+        nitter_health_state.update(
+            {
+                "ok": ok,
+                "last_check": now_iso,
+                "last_error": "" if ok else detail,
+                "base_url": base_url,
+            }
+        )
+        if ok:
+            nitter_health_state["last_ok"] = now_iso
+
+        if previous_ok is not False and not ok and ADMIN_USER_ID:
+            await send_telegram(
+                session,
+                "⚠️ <b>Nitter health failed</b>\n\n"
+                f"{h(detail)}\n\n"
+                "Cookies/profile likely need refresh.",
+                chat_id=ADMIN_USER_ID,
+                reply_markup=build_admin_keyboard(),
+            )
+        elif previous_ok is False and ok and ADMIN_USER_ID:
+            await send_telegram(
+                session,
+                f"✅ <b>Nitter recovered</b>\n\n{h(base_url)} · {h(detail)}",
+                chat_id=ADMIN_USER_ID,
+                reply_markup=build_admin_keyboard(),
+            )
+        previous_ok = ok
+        await asyncio.sleep(max(60, NITTER_HEALTH_INTERVAL_SEC))
+
+
+def build_smart_fetch_orchestrator(session: aiohttp.ClientSession) -> SmartFetchOrchestrator:
+    async def fetch_latest(*, ticker: str, address: str = "", limit: int = 12, max_age_hours: int = 24) -> list[dict]:
+        return await search_nitter_mentions(
+            session,
+            ticker,
+            address=address,
+            limit=limit,
+            max_age_hours=max_age_hours,
+        )
+
+    async def fetch_top(
+        *,
+        ticker: str,
+        address: str = "",
+        limit: int = 24,
+        max_age_hours: int = 24,
+        allow_tier3: bool = True,
+        min_count: int = 0,
+    ) -> list[dict]:
+        return await search_x_mentions(
+            session,
+            ticker,
+            address=address,
+            max_age_hours=max_age_hours,
+            allow_tier3=allow_tier3,
+            limit=limit,
+            min_count=min_count,
+        )
+
+    return SmartFetchOrchestrator(
+        nitter=NitterFetcher(fetch_latest),
+        socialdata=SocialDataFetcher(fetch_top),
+        alpha_detector=AlphaDetector(),
+    )
+
+
+async def build_deep_social_evidence(
+    session: aiohttp.ClientSession,
+    *,
+    ticker: str,
+    address: str,
+    seed_mentions: list[dict] | None = None,
+    max_age_hours: int = 24,
+) -> dict:
+    seed_mentions = seed_mentions or []
+    smart = await build_smart_fetch_orchestrator(session).fetch(
+        ticker=ticker,
+        address=address,
+        latest_limit=12,
+        top_limit=24,
+        max_age_hours=max_age_hours,
+        top_min_count=0,
+    )
+
+    combined: list[dict] = []
+    seen: set[str] = set()
+    for item in seed_mentions + smart.latest + smart.top:
+        url = item.get("url", "")
+        if not item or url in seen:
+            continue
+        seen.add(url)
+        combined.append(item)
+    evidence = build_social_evidence(
+        combined,
+        ticker=ticker,
+        address=address,
+        min_count=RESEARCH_MIN_QUALIFIED_TWEETS,
+        max_tweets=24,
+        max_age_hours=max_age_hours,
+    )
+    evidence["fetch_strategy"] = {
+        "latest_provider": "nitter",
+        "top_provider": "socialdata",
+        "alpha_found": smart.alpha_found,
+        "alpha_reason": smart.alpha_reason,
+        "socialdata_called": smart.socialdata_called,
+        "latest_count": len(smart.latest),
+        "top_count": len(smart.top),
+    }
+    if smart.socialdata_called:
+        async with db_session() as db:
+            await record_socialdata_usage_log(
+                db,
+                endpoint="twitter/search",
+                query_hash=hashlib.sha256(f"{ticker}:{address}:top".encode("utf-8")).hexdigest()[:24],
+                mode="Top",
+                result_count=len(smart.top),
+                triggered_by_alpha=smart.alpha_found,
+                alpha_reason=smart.alpha_reason,
+            )
+    return evidence
+
+
+async def validate_ca_social_confirmation(
+    session: aiohttp.ClientSession,
+    *,
+    ticker: str,
+    address: str,
+) -> tuple[bool, str, dict]:
+    """Require social evidence to mention the exact contract, not only the ticker."""
+    if not REQUIRE_CA_SOCIAL_CONFIRMATION:
+        return True, "CA social confirmation disabled", {"enabled": False}
+    if not address:
+        return False, "missing contract address for CA social confirmation", {}
+    if not SOCIALDATA_API_KEY:
+        return False, "SocialData key missing; CA social confirmation unavailable", {}
+
+    social_evidence = await build_deep_social_evidence(
+        session,
+        ticker=ticker,
+        address=address,
+    )
+    ca_mentions = social_evidence.get("top_tweets") or []
+    if social_evidence.get("qualified") and ca_mentions:
+        top = sorted(
+            ca_mentions,
+            key=lambda item: (
+                int(item.get("tweet_tier_score") or item.get("score") or 0),
+                int(item.get("followers") or 0),
+                int(item.get("likes") or 0),
+            ),
+            reverse=True,
+        )[:5]
+        evidence = {
+            "enabled": True,
+            "verified": True,
+            "query_mode": "ca_only",
+            "qualified_tweets": len(ca_mentions),
+            "min_required": RESEARCH_MIN_QUALIFIED_TWEETS,
+            "total_followers": sum(int(item.get("followers") or 0) for item in ca_mentions),
+            "total_likes": sum(int(item.get("likes") or 0) for item in ca_mentions),
+            "total_retweets": sum(int(item.get("retweets") or 0) for item in ca_mentions),
+            "max_score": max((int(item.get("score") or 0) for item in ca_mentions), default=0),
+            "avg_thesis_quality": round(
+                sum(float(item.get("thesis_quality") or 0) for item in ca_mentions) / max(len(ca_mentions), 1),
+                1,
+            ),
+            "social_evidence": social_evidence,
+            "top_authors": [
+                {
+                    "username": item.get("username", ""),
+                    "followers": int(item.get("followers") or 0),
+                    "score": int(item.get("score") or 0),
+                    "tier": int(item.get("tier") or 3),
+                    "url": item.get("url", ""),
+                }
+                for item in top
+            ],
+        }
+        return True, f"{len(ca_mentions)} CA-qualified X mention(s)", evidence
+
+    fetch_strategy = social_evidence.get("fetch_strategy") or {}
+    if not fetch_strategy.get("socialdata_called"):
+        return (
+            False,
+            f"no Nitter alpha for CA; SocialData Top skipped ({fetch_strategy.get('alpha_reason') or 'no_alpha'})",
+            {
+                "enabled": True,
+                "verified": False,
+                "query_mode": "ca_only",
+                "social_evidence": social_evidence,
+            },
+        )
+
+    ticker_mentions = await search_x_mentions(session, ticker, address="", min_count=0)
+    if ticker_mentions:
+        return (
+            False,
+            f"ticker-qualified tweets found but no CA-qualified tweets; possible false contract/ticker hijack",
+            {
+                "enabled": True,
+                "verified": False,
+                "query_mode": "ca_only",
+                "ticker_only_tweets": len(ticker_mentions),
+            },
+        )
+    return False, "no CA-qualified X mentions passed filters", {"enabled": True, "verified": False, "query_mode": "ca_only"}
 
 
 async def resolve_deployer_x(session: aiohttp.ClientSession, address: str) -> dict:
@@ -1747,7 +2864,7 @@ async def resolve_deployer_x(session: aiohttp.ClientSession, address: str) -> di
 async def research_token(session: aiohttp.ClientSession, query: str) -> str:
     query = query.strip().lstrip("$").upper()
     if not query:
-        return "Usage: /research $TICKER or /research 0x..."
+        return "🔍 <b>Research</b>\n<code>/research 0x...</code>\n<code>/research $TICKER</code>"
 
     is_address = query.lower().startswith("0x") and len(query) == 42
     ticker = query
@@ -1814,142 +2931,69 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
     if address:
         deployer_info = await resolve_deployer_x(session, address)
 
-    x_mentions = await search_x_mentions(session, ticker, token_name, address)
-    influencer_mentions = await search_influencer_mentions(session, ticker, address)
-    existing_urls = {m["url"] for m in x_mentions}
-    influencer_mentions = [m for m in influencer_mentions if m["url"] not in existing_urls]
+    research_tweet_age_hours = 24
+    smart_fetch = await build_smart_fetch_orchestrator(session).fetch(
+        ticker=ticker,
+        address=address,
+        latest_limit=12,
+        top_limit=24,
+        max_age_hours=research_tweet_age_hours,
+        top_min_count=0,
+    )
+    x_mentions = smart_fetch.top
+    influencer_mentions: list[dict] = []
+    nitter_mentions = smart_fetch.latest
+    social_evidence = build_social_evidence(
+        x_mentions + influencer_mentions + nitter_mentions,
+        ticker=ticker,
+        address=address,
+        min_count=RESEARCH_MIN_QUALIFIED_TWEETS,
+        max_tweets=24,
+        max_age_hours=research_tweet_age_hours,
+    )
+    social_evidence["fetch_strategy"] = {
+        "latest_provider": "nitter",
+        "top_provider": "socialdata",
+        "alpha_found": smart_fetch.alpha_found,
+        "alpha_reason": smart_fetch.alpha_reason,
+        "socialdata_called": smart_fetch.socialdata_called,
+        "latest_count": len(smart_fetch.latest),
+        "top_count": len(smart_fetch.top),
+    }
+    if smart_fetch.socialdata_called:
+        async with db_session() as db:
+            await record_socialdata_usage_log(
+                db,
+                endpoint="twitter/search",
+                query_hash=hashlib.sha256(f"{ticker}:{address}:manual_top".encode("utf-8")).hexdigest()[:24],
+                mode="Top",
+                result_count=len(smart_fetch.top),
+                triggered_by_alpha=smart_fetch.alpha_found,
+                alpha_reason=smart_fetch.alpha_reason,
+            )
     launch_status = None
     if address:
         async with db_session() as db:
             launch_status = await get_launch_status(db, address)
-    was_alerted = launch_status == "signaled"
-
-    if not dex and not x_mentions and not influencer_mentions:
+    if not dex and not x_mentions and not influencer_mentions and not nitter_mentions:
         return (
             f"🔍 <b>No data found for ${ticker}</b>\n\n"
-            f"No market data on Base or notable X mentions.\n"
-            f"Token might be on another chain.\n"
+            f"No Base market data or CA-verified X mentions found after spam/engagement filters.\n"
             f"Try: /research 0x..."
         )
 
-    safe_name = h(token_name or ticker)
-    safe_ticker = h(ticker)
-    lines = [f"🔍 <b>Research: {safe_name}</b> (${safe_ticker})\n"]
-
-    if address:
-        lines.append(f"📋 <code>{address}</code>\n")
-        lines.append(f"🔎 <a href='{build_x_research_url(address, ticker)}'>X Research</a>\n")
-
-    lines.extend([
-        "🧠 <b>Quick take</b> <i>(stub)</i>",
-        f"└ {h(build_research_takeaway(dex, x_mentions, influencer_mentions))}",
-        "",
-    ])
-
-    if dex:
-        change_1h = dex.get("price_change_1h", 0)
-        change_24h = dex.get("price_change_24h", 0)
-        lines.extend([
-            f"📊 <b>Market Data:</b>",
-            f"├ 💰 MCap: {fmt_usd(dex['mcap'])}",
-            f"├ 💧 Liquidity: {fmt_usd(dex['liquidity'])}",
-            f"├ 📈 Volume 24h: {fmt_usd(dex['volume_24h'])}",
-            f"├ 💵 Price: ${float(dex.get('price_usd') or 0):.6f}",
-            f"├ {'🟢' if change_1h >= 0 else '🔴'} 1h: {change_1h:+.1f}%",
-            f"└ {'🟢' if change_24h >= 0 else '🔴'} 24h: {change_24h:+.1f}%",
-            "",
-        ])
-        passes, reason = passes_market_filters(dex)
-        lines.append(("✅ Passes market filters\n") if passes else (f"❌ Fails filter: {reason}\n"))
-    else:
-        lines.append("⚠️ No market data found\n")
-
-    if was_alerted:
-        lines.append("📡 Token already signaled by scanner\n")
-    elif launch_status:
-        lines.append(f"🗂 Scanner status: <code>{h(launch_status)}</code>\n")
-
-    if deployer_info:
-        x_user = deployer_info.get("x_username", "")
-        fc_user = deployer_info.get("farcaster_username", "")
-        fc_display = deployer_info.get("farcaster_display", "")
-        method = deployer_info.get("source_method", "")
-        d_followers = deployer_info.get("follower_count")
-
-        lines.append("👤 <b>Deployer Identity:</b>")
-        if x_user:
-            f_str = ""
-            if d_followers is not None:
-                if d_followers >= 1_000_000:
-                    f_str = f" — <b>{d_followers/1_000_000:.1f}M followers</b>"
-                elif d_followers >= 1_000:
-                    f_str = f" — <b>{d_followers/1_000:.0f}K followers</b>"
-                else:
-                    f_str = f" — {d_followers:,} followers"
-                if d_followers >= 10_000:
-                    f_str += " 🐋"
-                elif d_followers >= 5_000:
-                    f_str += " 🔥"
-            lines.append(f"├ 𝕏 <a href='https://x.com/{x_user}'>@{x_user}</a>{f_str}")
-        else:
-            lines.append("├ 𝕏 No X account found")
-
-        if fc_user:
-            display = f" ({fc_display})" if fc_display and fc_display != fc_user else ""
-            lines.append(f"├ 🟣 Farcaster: @{fc_user}{display}")
-
-        lines.append(f"└ 🔎 Found via: {method}" if method else "└ 🔎 No deployer info in API metadata")
-        lines.append("")
-
-    if x_mentions:
-        lines.append(f"🐦 <b>Notable X mentions (${ticker} / CA):</b>")
-        for m in x_mentions:
-            f_count = m['followers']
-            f_str = f"{f_count/1_000_000:.1f}M" if f_count >= 1_000_000 else f"{f_count/1_000:.0f}K" if f_count >= 1_000 else str(f_count)
-            text_clean = re.sub(r'https?://t\.co/\S+', '', m['text']).strip().replace('\n', ' ').replace('  ', ' ')
-            text_clean = html.escape(text_clean)
-            if len(text_clean) > 280:
-                text_clean = text_clean[:277] + "..."
-            tier = m.get("tier", 3)
-            score = m.get("score", 0)
-            hp = " ★" if m.get("high_priority") else ""
-            lines.extend([
-                f"",
-                f"├ <a href='{m['url']}'>@{html.escape(m['username'])}</a>{hp} ({f_str} followers) · T{tier}/S{score} · {m['date']}",
-                f"│ ❤️ {m['likes']} 🔁 {m['retweets']} 💬 {m.get('replies', 0)}",
-                f"│ <i>{text_clean}</i>" if text_clean else f"│ <i>[media only]</i>",
-            ])
-        lines.append("")
-    else:
-        lines.append(f"\n🐦 No notable X mentions found for ${ticker}\n")
-
-    if influencer_mentions:
-        lines.append(f"👀 <b>Watched influencer mentions:</b>")
-        for m in influencer_mentions[:6]:
-            f_count = m['followers']
-            f_str = f"{f_count/1_000_000:.1f}M" if f_count >= 1_000_000 else f"{f_count/1_000:.0f}K" if f_count >= 1_000 else str(f_count)
-            text_clean = re.sub(r'https?://t\.co/\S+', '', m['text']).strip().replace('\n', ' ').replace('  ', ' ')
-            text_clean = html.escape(text_clean)
-            if len(text_clean) > 220:
-                text_clean = text_clean[:217] + "..."
-            hp = " ★" if m.get("high_priority") else ""
-            lines.extend([
-                f"",
-                f"├ <a href='{m['url']}'>@{html.escape(m['username'])}</a>{hp} ({f_str}) · S{m.get('score', 0)} · {m['date']}",
-                f"│ <i>{text_clean}</i>" if text_clean else f"│ <i>[media only]</i>",
-            ])
-        lines.append("")
-
-    if address:
-        lines.extend([
-            f"🔗 <b>Links:</b>",
-            f"├ <a href='https://www.geckoterminal.com/base/tokens/{address}'>GeckoTerminal</a>",
-            f"├ <a href='https://basescan.org/token/{address}'>BaseScan</a>",
-            f"├ <a href='https://gmgn.ai/base/token/{address}'>GMGN</a>",
-            f"└ <a href='https://app.uniswap.org/swap?chain=base&outputCurrency={address}'>Uniswap</a>",
-        ])
-
-    return "\n".join(lines)
+    return format_research_card(
+        token_name=token_name or (dex or {}).get("token_name") or ticker,
+        ticker=ticker,
+        address=address,
+        dex=dex,
+        deployer_info=deployer_info,
+        x_mentions=x_mentions,
+        influencer_mentions=influencer_mentions,
+        nitter_mentions=nitter_mentions,
+        social_evidence=social_evidence,
+        launch_status=launch_status,
+    )
 
 
 # ─── Bankr API ────────────────────────────────────────────────────────────────
@@ -2225,6 +3269,169 @@ async def fetch_dexscreener_discoveries(session: aiohttp.ClientSession) -> list[
         return []
 
 
+# ─── CoinGecko Onchain Discovery API ─────────────────────────────────────────
+
+def _coingecko_rate_ok() -> bool:
+    now = time.time()
+    while coingecko_calls and coingecko_calls[0] < now - 60:
+        coingecko_calls.pop(0)
+    return len(coingecko_calls) < COINGECKO_RATE_LIMIT_PER_MIN
+
+
+def _coingecko_included_map(included: list[dict]) -> dict[str, dict]:
+    return {
+        item.get("id", ""): item
+        for item in included
+        if isinstance(item, dict) and item.get("id")
+    }
+
+
+def _coingecko_related(item: dict, included_by_id: dict[str, dict], relation: str) -> dict:
+    rel = ((item.get("relationships") or {}).get(relation) or {}).get("data") or {}
+    if isinstance(rel, list):
+        rel = rel[0] if rel else {}
+    if not isinstance(rel, dict):
+        return {}
+    return included_by_id.get(rel.get("id", ""), {})
+
+
+def _normalize_coingecko_pool(item: dict, included_by_id: dict[str, dict]) -> dict | None:
+    attrs = item.get("attributes") or {}
+    base = _coingecko_related(item, included_by_id, "base_token")
+    quote = _coingecko_related(item, included_by_id, "quote_token")
+    dex = _coingecko_related(item, included_by_id, "dex")
+    base_attrs = base.get("attributes") or {}
+    quote_attrs = quote.get("attributes") or {}
+    dex_attrs = dex.get("attributes") or {}
+
+    address = (base_attrs.get("address") or "").lower()
+    if not is_base_contract(address):
+        return None
+
+    pool_address = (attrs.get("address") or "").lower()
+    price_changes = attrs.get("price_change_percentage") or {}
+    volume = attrs.get("volume_usd") or {}
+    txns = attrs.get("transactions") or {}
+    h1_txns = txns.get("h1") or {}
+    h24_txns = txns.get("h24") or {}
+
+    created_at = attrs.get("pool_created_at") or ""
+    pair_created_at = 0
+    if created_at:
+        try:
+            dt = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+            pair_created_at = int(dt.timestamp() * 1000)
+        except ValueError:
+            pair_created_at = 0
+
+    name = base_attrs.get("name") or attrs.get("name") or "Unknown"
+    symbol = base_attrs.get("symbol") or "?"
+    dex_id = dex_attrs.get("identifier") or dex_attrs.get("name") or ""
+
+    market = {
+        "mcap": non_negative_float(attrs.get("market_cap_usd") or attrs.get("fdv_usd")),
+        "volume_24h": non_negative_float(volume.get("h24")),
+        "liquidity": non_negative_float(attrs.get("reserve_in_usd")),
+        "price_usd": attrs.get("base_token_price_usd") or "0",
+        "price_change_1h": to_float(price_changes.get("h1")),
+        "price_change_24h": to_float(price_changes.get("h24")),
+        "pair_url": f"https://www.geckoterminal.com/base/pools/{pool_address or address}",
+        "pair_created_at": pair_created_at,
+        "pair_address": pool_address,
+        "token_name": name,
+        "token_symbol": symbol,
+        "base_token_address": address,
+        "quote_token_address": (quote_attrs.get("address") or "").lower(),
+        "quote_token_symbol": quote_attrs.get("symbol") or "",
+        "dex_id": dex_id,
+        "txns_h1_buys": int(to_float(h1_txns.get("buys"))),
+        "txns_h1_sells": int(to_float(h1_txns.get("sells"))),
+        "txns_h24_buys": int(to_float(h24_txns.get("buys"))),
+        "txns_h24_sells": int(to_float(h24_txns.get("sells"))),
+        "_source": "coingecko",
+    }
+    return {
+        "source": "coingecko",
+        "address": address,
+        "name": name,
+        "symbol": symbol,
+        "x_username": "",
+        "tweet_url": "",
+        "image_uri": base_attrs.get("image_url") or "",
+        "website_url": "",
+        "pair_url": market["pair_url"],
+        "source_method": "new_pools",
+        "dex_id": dex_id,
+        "created_at": created_at,
+        "_dex": market,
+    }
+
+
+async def fetch_coingecko_new_pools(session: aiohttp.ClientSession) -> list[dict]:
+    """Fetch latest Base pools from CoinGecko Onchain with conservative credit usage."""
+    global last_coingecko_poll_at
+
+    if not COINGECKO_DISCOVERY_ENABLED:
+        return []
+    if not COINGECKO_API_KEY:
+        log.warning("CoinGecko discovery enabled but COINGECKO_API_KEY is not set")
+        return []
+    if not await is_provider_available("coingecko"):
+        log.debug("CoinGecko cooldown active, skipping new pools")
+        return []
+
+    now = time.time()
+    if now - last_coingecko_poll_at < COINGECKO_POLL_INTERVAL:
+        return []
+    if not _coingecko_rate_ok():
+        log.debug("CoinGecko local rate limit reached, skipping new pools")
+        return []
+
+    try:
+        url = f"{COINGECKO_API_URL}/onchain/networks/base/new_pools"
+        params = {"include": "base_token,quote_token,dex"}
+        headers = {
+            "Accept": "application/json",
+            "x-cg-demo-api-key": COINGECKO_API_KEY,
+        }
+        coingecko_calls.append(now)
+        last_coingecko_poll_at = now
+
+        async with session.get(url, headers=headers, params=params, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+            await record_provider_response(
+                "coingecko",
+                endpoint="onchain/base/new_pools",
+                status_code=resp.status,
+                cooldown_seconds=COINGECKO_COOLDOWN_SEC,
+            )
+            if resp.status == 429:
+                log.warning("CoinGecko new_pools rate limited, cooling down")
+                return []
+            if resp.status != 200:
+                body = await resp.text()
+                log.warning(f"CoinGecko new_pools returned {resp.status}: {body[:160]}")
+                return []
+            raw = await resp.json()
+
+        included_by_id = _coingecko_included_map(raw.get("included") or [])
+        launches: list[dict] = []
+        seen: set[str] = set()
+        for item in raw.get("data") or []:
+            launch = _normalize_coingecko_pool(item, included_by_id)
+            if not launch or launch["address"] in seen:
+                continue
+            seen.add(launch["address"])
+            launches.append(launch)
+            if len(launches) >= COINGECKO_DISCOVERY_LIMIT:
+                break
+
+        log.info(f"CoinGecko: {len(launches)} Base new pools fetched")
+        return launches
+    except Exception as e:
+        log.error(f"CoinGecko new_pools error: {e}")
+        return []
+
+
 # ─── Virtuals API ─────────────────────────────────────────────────────────────
 
 async def fetch_virtuals(session: aiohttp.ClientSession) -> list[dict]:
@@ -2308,8 +3515,21 @@ def clean_x_handle(value: str) -> str:
 def fmt_token_age(dex: dict | None) -> str:
     if not dex:
         return "n/a"
-    pair_created = dex.get("pair_created_at", 0)
+    pair_created = dex.get("pair_created_at") or dex.get("pairCreatedAt") or dex.get("pool_created_at") or 0
     if not pair_created:
+        return "n/a"
+    if isinstance(pair_created, str):
+        if pair_created.isdigit():
+            pair_created = int(pair_created)
+            if pair_created < 10_000_000_000:
+                pair_created *= 1000
+        else:
+            try:
+                dt = datetime.fromisoformat(pair_created.replace("Z", "+00:00"))
+                pair_created = int(dt.timestamp() * 1000)
+            except ValueError:
+                return "n/a"
+    if not isinstance(pair_created, (int, float)):
         return "n/a"
     age_seconds = max(0, time.time() - (pair_created / 1000))
     if age_seconds < 3600:
@@ -2349,22 +3569,9 @@ def build_ai_summary_placeholder(launch: dict, dex: dict | None, verdict: dict |
     if verdict:
         return verdict.get("human_readable") or ""
 
-    market = "pending market read"
-    if dex:
-        market = (
-            f"MC {fmt_usd(float(dex.get('mcap') or 0))} · "
-            f"Vol {fmt_usd(float(dex.get('volume_24h') or 0))} · "
-            f"Liq {fmt_usd(float(dex.get('liquidity') or 0))}"
-        )
-        age = fmt_token_age(dex)
-        if age != "n/a":
-            market += f" · Age {age}"
-
     return (
-        "🧠 <b>AI brief</b> • Score pending\n\n"
-        f"• <b>Type:</b> pending classification\n"
-        "• <b>Owner:</b> pending Base/X identity check\n"
-        f"• <b>Market:</b> {h(market)}\n"
+        "🧠 <b>AI brief</b> • Score <b>(0/10)</b>\n\n"
+        "• <b>Type of token:</b> pending classification\n"
         "• <b>Product:</b> pending narrative/product read\n"
         "• <b>Risks:</b> pending spoof/liquidity checks"
     )
@@ -2396,10 +3603,379 @@ def build_research_takeaway(dex: dict | None, x_mentions: list[dict], influencer
     return f"{left}. Risk: {right}."
 
 
-SOURCE_EMOJIS = {"bankr": "🏦", "clanker": "⚙️", "virtuals": "🤖", "dexscreener": "📊"}
+def infer_research_token_type(token_name: str, ticker: str, x_mentions: list[dict]) -> str:
+    text = " ".join([token_name, ticker] + [m.get("text", "")[:160] for m in x_mentions[:3]]).lower()
+    if any(term in text for term in ("agent", "ai", "bot", "inference", "autonomous")):
+        return "AI agent / Utility"
+    if any(term in text for term in ("terminal", "scanner", "framework", "protocol", "app", "api", "tool")):
+        return "Utility / Tooling"
+    if any(term in text for term in ("community", "meme", "mascot", "cult")):
+        return "Narrative / Community"
+    return "Memecoin / Experimental"
 
 
-def format_signal_telegram(launch: dict, dex: dict | None, executed: bool = False, job_id: str = "") -> str:
+def format_research_ai_brief(
+    *,
+    token_name: str,
+    ticker: str,
+    dex: dict | None,
+    deployer_info: dict | None,
+    x_mentions: list[dict],
+    influencer_mentions: list[dict],
+    nitter_mentions: list[dict] | None = None,
+    social_evidence: dict | None = None,
+    launch_status: str | None = None,
+) -> str:
+    score = 0.0
+    risks: list[str] = []
+    if dex:
+        passes, reason = passes_market_filters(dex)
+        if passes:
+            score += 3.5
+        else:
+            risks.append(reason)
+    else:
+        risks.append("market data missing")
+    if influencer_mentions:
+        score += 2.0
+    elif x_mentions:
+        score += 1.2
+    else:
+        risks.append("no notable X coverage")
+    if deployer_info and deployer_info.get("x_username"):
+        score += 1.0
+    if launch_status == "signaled":
+        score += 1.0
+    score = min(10.0, score)
+
+    product = "No product differentiation confirmed from current evidence."
+    top_tweet = (influencer_mentions or x_mentions or [{}])[0]
+    if top_tweet.get("text") and float(top_tweet.get("thesis_quality") or 0) >= 4:
+        product = research_clean_text(top_tweet["text"])[:180]
+    elif token_name:
+        product = f"{token_name} has market/social traces, but product proof is not confirmed yet."
+
+    thesis = (social_evidence or {}).get("thesis") or ""
+    value_assessment = (social_evidence or {}).get("value_assessment") or ""
+    social_score = int((social_evidence or {}).get("social_score") or 0)
+    breakdown = (social_evidence or {}).get("score_breakdown") or {}
+    project_value = (social_evidence or {}).get("project_value") or infer_research_token_type(token_name, ticker, x_mentions)
+    evidence_line = format_compact_evidence_refs(social_evidence or {})
+    thesis_line = thesis if thesis else product[:180]
+    value_line = value_assessment or "No clear value case confirmed from the current evidence."
+    split = ""
+    if breakdown:
+        split = (
+            f"\n<i>Split: Narrative {int(breakdown.get('narrative') or 0)}/40 · "
+            f"Creator {int(breakdown.get('creator') or 0)}/30 · "
+            f"Utility/Tech {int(breakdown.get('utility_tech') or 0)}/20 · "
+            f"Shill Risk -{int(breakdown.get('shill_risk') or 0)}/10</i>"
+        )
+    return (
+        f"🧠 <b>AI brief</b> • Score <b>{score:.1f}/10</b>"
+        + (f" · Social <b>{social_score}/100</b>" if social_score else "")
+        + "\n\n"
+        f"• <b>Type:</b> {h(project_value)}\n"
+        f"• <b>Thesis:</b> {h(thesis_line[:220])}\n"
+        f"• <b>Why value:</b> {h(value_line[:220])}\n"
+        f"• <b>Evidence:</b> {evidence_line}\n"
+        f"• <b>Risks:</b> {h('; '.join(risks[:2]) if risks else 'no major deterministic risk detected')}"
+        f"{split}"
+    )
+
+
+def fmt_compact_number(value: int) -> str:
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.0f}K"
+    return str(value)
+
+
+def format_compact_evidence_refs(social_evidence: dict, *, limit: int = 3) -> str:
+    tweets = social_evidence.get("top_tweets") or []
+    if not tweets:
+        return "none"
+    parts = []
+    for item in tweets[:limit]:
+        ref = int(item.get("ref") or 0)
+        username = h(item.get("username") or "unknown")
+        url = item.get("url") or ""
+        views = fmt_compact_number(int(item.get("views") or 0))
+        likes = fmt_compact_number(int(item.get("likes") or 0))
+        retweets = fmt_compact_number(int(item.get("retweets") or 0))
+        label = f"[{ref}] @{username} ❤️ {likes} · 👁 {views} · 🔄 {retweets}"
+        if url:
+            parts.append(f"<a href='{h(url)}'>{label}</a>")
+        else:
+            parts.append(label)
+    return " · ".join(parts)
+
+
+def xsignal_cache_key(address: str) -> str:
+    return (address or "").lower()[:12]
+
+
+def remember_xsignal_evidence(address: str, social_evidence: dict | None) -> None:
+    if not address or not social_evidence:
+        return
+    key = xsignal_cache_key(address)
+    _address_map[key] = address.lower()
+    _xsignal_page_cache[key] = social_evidence
+
+
+def xsignal_visible_tweets(social_evidence: dict | None) -> list[dict]:
+    tweets = (social_evidence or {}).get("top_tweets") or []
+    return [
+        item for item in tweets
+        if item.get("language") == "en" and is_likely_english_text(item.get("excerpt") or "")
+    ]
+
+
+def xsignal_page_count(social_evidence: dict | None) -> int:
+    count = len(xsignal_visible_tweets(social_evidence))
+    if count <= XSIGNAL_INLINE_THRESHOLD:
+        return 1
+    return max(1, (count + XSIGNAL_PAGE_SIZE - 1) // XSIGNAL_PAGE_SIZE)
+
+
+def build_xsignal_pagination_keyboard(address: str, social_evidence: dict | None, page: int = 1) -> dict | None:
+    pages = xsignal_page_count(social_evidence)
+    if pages <= 1 or not address:
+        return None
+    key = xsignal_cache_key(address)
+    _address_map[key] = address.lower()
+    prev_page = max(1, page - 1)
+    next_page = min(pages, page + 1)
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "← Prev", "callback_data": f"xpg:{key}:{prev_page}"},
+                {"text": f"Page {page}/{pages}", "callback_data": f"xpg:{key}:{page}"},
+                {"text": "Next →", "callback_data": f"xpg:{key}:{next_page}"},
+            ]
+        ]
+    }
+
+
+def strip_xsignal_keyboard(keyboard: dict | None) -> dict | None:
+    rows = []
+    for row in (keyboard or {}).get("inline_keyboard") or []:
+        kept = [
+            button for button in row
+            if not str(button.get("callback_data") or "").startswith("xpg:")
+        ]
+        if kept:
+            rows.append(kept)
+    return {"inline_keyboard": rows} if rows else None
+
+
+def merge_inline_keyboards(*keyboards: dict | None) -> dict | None:
+    rows: list[list[dict]] = []
+    for keyboard in keyboards:
+        if keyboard and keyboard.get("inline_keyboard"):
+            rows.extend(keyboard["inline_keyboard"])
+    return {"inline_keyboard": rows} if rows else None
+
+
+def replace_xsignal_block(message_text: str, new_block: str) -> str:
+    marker = "🐦 <b>X Signal</b>"
+    text = str(message_text or "")
+    start = text.find(marker)
+    if start < 0:
+        return (text.rstrip() + "\n\n" + new_block).strip()
+    return (text[:start].rstrip() + "\n\n" + new_block).strip()
+
+
+async def load_xsignal_evidence_for_ca(address: str) -> dict | None:
+    key = xsignal_cache_key(address)
+    if key in _xsignal_page_cache:
+        return _xsignal_page_cache[key]
+
+    async with db_session() as db:
+        launch = await get_launch(db, address)
+        if launch:
+            raw = launch.raw_json or {}
+            social_evidence = ((raw.get("social_confirmation") or {}).get("social_evidence") or {})
+            if social_evidence:
+                remember_xsignal_evidence(address, social_evidence)
+                return social_evidence
+        research = await get_latest_token_research(db, address)
+        processed = (research.processed_data if research else {}) or {}
+
+    social = processed.get("social") or {}
+    tweets = social.get("evidence_tweets") or []
+    if not tweets:
+        return None
+    social_evidence = {
+        "ticker": processed.get("symbol") or social.get("ticker") or "",
+        "qualified_tweets": int(social.get("qualified_tweets") or len(tweets)),
+        "max_age_hours": 24,
+        "thesis": social.get("evidence_thesis") or "",
+        "value_assessment": social.get("value_assessment") or "",
+        "social_score": int(social.get("social_score") or 0),
+        "score_breakdown": social.get("score_breakdown") or {},
+        "top_tweets": tweets,
+    }
+    remember_xsignal_evidence(address, social_evidence)
+    return social_evidence
+
+
+def format_research_social_block(
+    ticker: str,
+    mentions: list[dict],
+    influencer_mentions: list[dict],
+    *,
+    social_evidence: dict | None = None,
+    nitter_mentions: list[dict] | None = None,
+    address: str = "",
+    page: int = 1,
+) -> str:
+    evidence_tweets = (social_evidence or {}).get("top_tweets") or []
+    if evidence_tweets:
+        remember_xsignal_evidence(address, social_evidence)
+        thesis = hide_contract_mentions((social_evidence or {}).get("thesis") or "", address)
+        lines = ["🐦 <b>X signal</b>"]
+        if thesis:
+            lines.append(f"\n<b>Thesis:</b> {h(thesis[:520])}")
+        visible_tweets = xsignal_visible_tweets(social_evidence)
+        total_visible = len(visible_tweets)
+        page_count = xsignal_page_count(social_evidence)
+        page = max(1, min(int(page or 1), page_count))
+        if total_visible > XSIGNAL_INLINE_THRESHOLD:
+            start = (page - 1) * XSIGNAL_PAGE_SIZE
+            page_tweets = visible_tweets[start:start + XSIGNAL_PAGE_SIZE]
+        else:
+            page_tweets = visible_tweets[:XSIGNAL_INLINE_THRESHOLD]
+        for item in page_tweets:
+            ref = int(item.get("ref") or 0)
+            url = item.get("url") or ""
+            author = h(item.get("username", "unknown"))
+            likes = fmt_compact_number(int(item.get("likes") or 0))
+            views = fmt_compact_number(int(item.get("views") or 0))
+            retweets = fmt_compact_number(int(item.get("retweets") or 0))
+            importance = h(item.get("importance") or item.get("reason") or "qualified mention")
+            excerpt = h(strip_non_english_content(hide_contract_mentions(item.get("excerpt") or "", address))[:220])
+            if not excerpt:
+                continue
+            header = f"[{ref}] <a href='{h(url)}'>@{author}</a>" if url else f"[{ref}] @{author}"
+            lines.append(
+                f"\n{header} · 👁 {views} · ❤️ {likes} · 🔄 {retweets}\n"
+                f"{importance}\n"
+                f"“{excerpt}”"
+            )
+        return "\n".join(lines)
+
+    combined: list[dict] = []
+    seen: set[str] = set()
+    for item in influencer_mentions + mentions + (nitter_mentions or []):
+        if item.get("url") in seen:
+            continue
+        combined.append(item)
+        seen.add(item.get("url", ""))
+    if not combined:
+        return (
+            f"🐦 <b>X signal</b>\n"
+            f"• No CA-verified qualified tweets for ${h(ticker)} "
+            f"(min {RESEARCH_MIN_QUALIFIED_TWEETS}, {RESEARCH_MIN_TWEET_VIEWS}+ views, "
+            f"{RESEARCH_MIN_TWEET_LIKES}+ likes)."
+        )
+    lines = ["🐦 <b>X signal</b>"]
+    for item in combined[:4]:
+        tier = int(item.get("tier") or 3)
+        marker = "🟢🟢" if tier == 1 else "🟢" if tier == 2 else "🟡"
+        hp = " ★" if item.get("high_priority") else ""
+        author = h(item.get("username", "unknown"))
+        likes = fmt_compact_number(int(item.get("likes") or 0))
+        views = fmt_compact_number(int(item.get("views") or 0))
+        retweets = fmt_compact_number(int(item.get("retweets") or 0))
+        clean_text = strip_non_english_content(hide_contract_mentions(research_clean_text(item.get("text", "")), address))
+        if not is_likely_english_text(clean_text):
+            continue
+        text = h(clean_text[:300])
+        lines.append(
+            f"• {marker} <a href='{item.get('url')}'>@{author}</a>{hp} · "
+            f"❤️ {likes} · 👁 {views} · 🔄 {retweets}\n"
+            f"  <i>{text}</i>"
+        )
+    return "\n".join(lines) if len(lines) > 1 else (
+        f"🐦 <b>X signal</b>\n"
+        f"• No English qualified tweets for ${h(ticker)} after filtering."
+    )
+
+
+def format_research_card(
+    *,
+    token_name: str,
+    ticker: str,
+    address: str,
+    dex: dict | None,
+    deployer_info: dict | None,
+    x_mentions: list[dict],
+    influencer_mentions: list[dict],
+    nitter_mentions: list[dict] | None = None,
+    social_evidence: dict | None = None,
+    launch_status: str | None = None,
+) -> str:
+    safe_name = h(token_name or ticker or address[:10])
+    safe_ticker = h(str(ticker or "").lstrip("$"))
+    source = "RESEARCH"
+    age = fmt_token_age(dex) if dex else "n/a"
+    mcap = float((dex or {}).get("mcap") or 0)
+    volume = float((dex or {}).get("volume_24h") or 0)
+    liquidity = float((dex or {}).get("liquidity") or 0)
+    change_1h = float((dex or {}).get("price_change_1h") or 0)
+    one_h_emoji = "🟢" if change_1h >= 0 else "🔴"
+    links: list[str] = []
+    if address:
+        links = [
+            f"<a href='https://dexscreener.com/base/{address}'>DexScreener</a>",
+            f"<a href='https://gmgn.ai/base/token/{address}'>GMGN</a>",
+            f"<a href='{build_x_research_url(address, ticker)}'>Tweet</a>",
+            f"<a href='https://app.uniswap.org/swap?chain=base&amp;outputCurrency={address}'>Uniswap</a>",
+        ]
+    status_line = ""
+    if launch_status == "signaled":
+        status_line = "\n📡 Already surfaced by scanner"
+    elif launch_status:
+        status_line = f"\n🗂 Scanner status: <code>{h(launch_status)}</code>"
+
+    body = (
+        f"🔍 <b>Research</b> 🧪 <b>{source}</b>\n\n"
+        f"<b>{safe_name}</b> - ${safe_ticker}\n\n"
+        f"🕐 <b>Launched:</b> {h(age + ' ago' if age != 'n/a' else 'n/a')}\n"
+        f"•💰 <b>Market Cap.:</b> {fmt_usd(mcap)}\n"
+        f"•📈 <b>Volume:</b> {fmt_usd(volume)}\n"
+        f"•💧 <b>Liquidity:</b> {fmt_usd(liquidity)}\n"
+        f"•{one_h_emoji} <b>1h:</b> {change_1h:+.1f}%{status_line}\n\n"
+        + (f"🔗 " + " · ".join(links) + "\n\n" if links else "")
+        + format_research_ai_brief(
+            token_name=token_name,
+            ticker=ticker,
+            dex=dex,
+            deployer_info=deployer_info,
+            x_mentions=x_mentions,
+            influencer_mentions=influencer_mentions,
+            social_evidence=social_evidence,
+            launch_status=launch_status,
+        )
+        + "\n\n"
+        + format_research_social_block(
+            ticker,
+            x_mentions,
+            influencer_mentions,
+            nitter_mentions=nitter_mentions,
+            social_evidence=social_evidence,
+            address=address,
+        )
+    )
+    return body[:3900]
+
+
+SOURCE_EMOJIS = {"bankr": "🤖", "clanker": "⚙️", "virtuals": "🤖", "dexscreener": "📊", "coingecko": "🦎"}
+
+
+def format_signal_telegram(launch: dict, dex: dict | None) -> str:
     source_key = launch["source"]
     source = h(source_key.upper())
     name = h(launch["name"])
@@ -2409,81 +3985,63 @@ def format_signal_telegram(launch: dict, dex: dict | None, executed: bool = Fals
     tweet_url = h(launch.get("tweet_url", ""))
     source_emoji = SOURCE_EMOJIS.get(source_key, "📡")
 
-    market_line = "Market: n/a"
-    momentum_line = ""
+    age = "n/a"
+    mcap = volume = liquidity = 0.0
+    change_1h = 0.0
     if dex:
-        change_1h = dex.get("price_change_1h", 0)
-        change_emoji = "🟢" if change_1h >= 0 else "🔴"
-        liq_val = dex.get('liquidity', 0)
-        liq_note = " (safe source)" if source_key in SAFE_LAUNCHPADS else ""
-        market_line = (
-            f"MCap {fmt_usd(dex['mcap'])} · Vol {fmt_usd(dex['volume_24h'])} · "
-            f"Liq {fmt_usd(liq_val)}{liq_note}"
-        )
-        momentum_line = f"{change_emoji} 1h {change_1h:+.1f}% · Age {fmt_token_age(dex)}"
+        mcap = float(dex.get("mcap") or 0)
+        volume = float(dex.get("volume_24h") or 0)
+        liquidity = float(dex.get("liquidity") or 0)
+        change_1h = float(dex.get("price_change_1h") or 0)
+        age = fmt_token_age(dex)
 
-    identity_bits = [f"{source_emoji} {source}"]
+    launch_title = f"<b>{name}</b> - ${symbol}"
     if x_username:
-        identity_bits.append(f"<a href='https://x.com/{x_username}'>@{x_username}</a>")
+        launch_title += f" · <a href='https://x.com/{x_username}'>@{x_username}</a>"
 
-    extra_lines: list[str] = []
+    source_lines: list[str] = []
     if source_key == "virtuals":
         creator_x = clean_x_handle(launch.get("creator_x", ""))
         if creator_x and creator_x != x_username:
-            extra_lines.append(f"Creator <a href='https://x.com/{creator_x}'>@{creator_x}</a>")
+            source_lines.append(f"Creator <a href='https://x.com/{creator_x}'>@{creator_x}</a>")
         holders = launch.get("holder_count", 0)
         if holders:
-            extra_lines.append(f"Holders {holders:,}")
+            source_lines.append(f"Holders {holders:,}")
 
-    if source_key == "dexscreener":
+    if source_key in {"dexscreener", "coingecko"}:
         dex_id = launch.get("dex_id", "")
-        extra_lines.append(f"Via {h(dex_id.title() if dex_id else 'Unknown DEX')}")
+        source_lines.append(f"Via {h(dex_id.title() if dex_id else 'Unknown DEX')}")
 
-    execution_line = ""
-    if executed:
-        execution_line = f"\n💸 Auto-bought ${BANKR_BUY_AMOUNT} via Bankr" + (f" (job: <code>{job_id}</code>)" if job_id else "")
-    elif AUTO_EXECUTE and not BANKR_EXECUTION_API_KEY:
-        execution_line = "\n⚠️ Auto-execute ON but no API key set"
-
+    dexscreener_url = f"https://dexscreener.com/base/{address}"
+    if dex and dex.get("_source") == "dexscreener" and dex.get("pair_url"):
+        dexscreener_url = h(dex.get("pair_url"))
     links = [
-        f"<a href='https://www.geckoterminal.com/base/tokens/{address}'>Gecko</a>",
+        f"<a href='{dexscreener_url}'>DexScreener</a>",
         f"<a href='https://gmgn.ai/base/token/{address}'>GMGN</a>",
     ]
-    if source_key == "clanker":
-        links.append(f"<a href='https://www.clanker.world/clanker/{address}'>Clanker</a>")
-    elif source_key == "virtuals":
-        vid = h(launch.get("virtuals_id", ""))
-        if vid:
-            links.append(f"<a href='https://app.virtuals.io/virtuals/{vid}'>Virtuals</a>")
-    elif source_key == "dexscreener":
-        pair_url = h(launch.get("pair_url", ""))
-        if pair_url:
-            links.append(f"<a href='{pair_url}'>Chart</a>")
     if tweet_url:
-        links.append(f"<a href='{tweet_url}'>Tweet</a>")
+        links.append(f"📝 <a href='{tweet_url}'>Tweet</a>")
     links.append(f"<a href='https://app.uniswap.org/swap?chain=base&amp;outputCurrency={address}'>Uniswap</a>")
 
-    details_line = " · ".join(identity_bits)
-    if extra_lines:
-        details_line += "\n" + " · ".join(extra_lines[:2])
+    liq_lock = " 🔓" if source_key in SAFE_LAUNCHPADS else ""
+    one_h_emoji = "🟢" if change_1h >= 0 else "🔴"
+    source_note = (" · ".join(source_lines[:2]) + "\n") if source_lines else ""
 
     return (
-        f"📡 <b>${symbol}</b> · {name}\n"
-        f"{details_line}\n\n"
-        f"📊 <b>Snapshot</b>\n"
-        f"├ {market_line}\n"
-        f"└ {momentum_line or 'Momentum n/a'}\n\n"
-        f"🎯 <b>Why surfaced</b>\n"
-        f"└ {h(build_signal_reason(launch, dex))}\n\n"
+        f"🚨 <b>New Launch</b> {source_emoji} <b>{source}</b>\n\n"
+        f"{launch_title}\n"
+        f"{source_note}\n"
+        f"🕐 <b>Launched:</b> {h(age + ' ago' if age != 'n/a' else 'n/a')}\n"
+        f"•💰 <b>Market Cap.:</b> {fmt_usd(mcap)}\n"
+        f"•📈 <b>Volume:</b> {fmt_usd(volume)}\n"
+        f"•💧 <b>Liquidity:</b> {fmt_usd(liquidity)}{liq_lock}\n"
+        f"•{one_h_emoji} <b>1h:</b> {change_1h:+.1f}%\n\n"
+        f"🔗 " + " · ".join(links) + "\n\n"
         f"{build_ai_summary_placeholder(launch, dex)}"
-        f"{execution_line}\n\n"
-        f"🔗 " + " · ".join(links) + "\n"
-        f"<code>{address}</code>\n"
-        f"/research {address}"
     )
 
 
-def format_alert_whatsapp(launch: dict, dex: dict | None, executed: bool = False) -> str:
+def format_alert_whatsapp(launch: dict, dex: dict | None) -> str:
     source = launch["source"].upper()
     name = launch["name"]
     symbol = launch["symbol"]
@@ -2520,9 +4078,6 @@ def format_alert_whatsapp(launch: dict, dex: dict | None, executed: bool = False
             f"├ 💧 Liq: {fmt_usd(dex['liquidity'])}{liq_note}",
             f"└ {change_emoji} 1h: {change_1h:+.1f}%",
         ])
-
-    if executed:
-        lines.extend(["", f"💸 Auto-bought ${BANKR_BUY_AMOUNT} via Bankr"])
 
     lines.extend([
         "", "🔗 Links:",
@@ -2691,6 +4246,209 @@ async def process_delivery_retries(session: aiohttp.ClientSession) -> int:
     return processed
 
 
+def build_watchlist_change_message(item, market: dict, launch) -> str | None:
+    mcap = float(market.get("mcap") or 0)
+    volume = float(market.get("volume_24h") or 0)
+    liquidity = float(market.get("liquidity") or 0)
+    mcap_change = pct_change(item.last_mcap, mcap)
+    volume_change = pct_change(item.last_volume, volume)
+    triggers: list[str] = []
+    if mcap_change is not None and abs(mcap_change) >= WATCHLIST_NOTIFY_MCAP_CHANGE_PCT:
+        triggers.append(f"MC {format_pct(mcap_change)}")
+    if volume_change is not None and abs(volume_change) >= WATCHLIST_NOTIFY_VOLUME_CHANGE_PCT:
+        triggers.append(f"Vol {format_pct(volume_change)}")
+    if not triggers:
+        return None
+    symbol = h((launch.ticker if launch else "") or (market.get("token_symbol") or item.ca[:8]))
+    label = f" · {h(item.label)}" if item.label else ""
+    return (
+        f"⭐ <b>Watchlist update</b> · ${symbol}{label}\n"
+        f"<code>{h(item.ca)}</code>\n\n"
+        f"Move: <b>{h(' · '.join(triggers))}</b>\n"
+        f"MC {fmt_usd(mcap)} · Vol {fmt_usd(volume)} · Liq {fmt_usd(liquidity)}\n"
+        f"/research {h(item.ca)}"
+    )
+
+
+async def process_watchlist_checks(session: aiohttp.ClientSession) -> int:
+    async with db_session() as db:
+        due = await get_due_watchlist_items(
+            db,
+            now=utc_now(),
+            limit=WATCHLIST_CHECK_BATCH,
+            min_interval_seconds=WATCHLIST_CHECK_INTERVAL,
+        )
+
+    notified_count = 0
+    for item in due:
+        market = await fetch_geckoterminal(session, item.ca)
+        async with db_session() as db:
+            launch = await get_launch(db, item.ca)
+            tenant = await get_tenant(db, tenant_id=item.tenant_id)
+        message = build_watchlist_change_message(item, market or {}, launch) if market and tenant else None
+        async with db_session() as db:
+            await mark_watchlist_checked(db, watchlist_id=item.id, market_json=market, notified=bool(message))
+        if not message or not tenant:
+            continue
+        sent = await send_telegram(session, message, chat_id=tenant.external_id)
+        if sent is not None:
+            notified_count += 1
+    return notified_count
+
+
+def parse_hex_int(value) -> int | None:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, str) and value.startswith("0x"):
+            return int(value, 16)
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+async def fetch_latest_base_block(session: aiohttp.ClientSession) -> int | None:
+    if not ALCHEMY_RPC_URL:
+        return None
+    try:
+        async with session.post(
+            ALCHEMY_RPC_URL,
+            json={"jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber", "params": []},
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as resp:
+            data = await resp.json()
+            return parse_hex_int(data.get("result"))
+    except Exception as e:
+        log.debug(f"Base block lookup failed: {e}")
+        return None
+
+
+async def fetch_wallet_asset_transfers(
+    session: aiohttp.ClientSession,
+    *,
+    wallet_address: str,
+    from_block: int,
+    to_block: int,
+) -> list[dict]:
+    if not ALCHEMY_RPC_URL:
+        return []
+    params_base = {
+        "fromBlock": hex(max(0, from_block)),
+        "toBlock": hex(max(from_block, to_block)),
+        "category": ["erc20"],
+        "withMetadata": True,
+        "excludeZeroValue": True,
+        "maxCount": "0x64",
+    }
+    transfers: list[dict] = []
+    for key in ("fromAddress", "toAddress"):
+        params = {**params_base, key: wallet_address}
+        try:
+            async with session.post(
+                ALCHEMY_RPC_URL,
+                json={"jsonrpc": "2.0", "id": 1, "method": "alchemy_getAssetTransfers", "params": [params]},
+                timeout=aiohttp.ClientTimeout(total=12),
+            ) as resp:
+                data = await resp.json()
+                if data.get("error"):
+                    log.warning(f"Alchemy transfer lookup error for {wallet_address[:10]}: {data['error']}")
+                    return []
+                batch = (data.get("result") or {}).get("transfers") or []
+                transfers.extend(batch)
+        except Exception as e:
+            log.warning(f"Wallet transfer lookup failed for {wallet_address[:10]}: {e}")
+            return transfers
+    by_key: dict[tuple[str, str, str], dict] = {}
+    for transfer in transfers:
+        contract = ((transfer.get("rawContract") or {}).get("address") or transfer.get("asset") or "").lower()
+        tx_hash = (transfer.get("hash") or "").lower()
+        direction = "in" if (transfer.get("to") or "").lower() == wallet_address.lower() else "out"
+        by_key[(tx_hash, contract, direction)] = transfer
+    return list(by_key.values())
+
+
+def normalize_wallet_transfer(wallet_address: str, transfer: dict) -> dict | None:
+    raw_contract = transfer.get("rawContract") or {}
+    ca = (raw_contract.get("address") or "").lower()
+    if not is_base_contract(ca):
+        return None
+    tx_hash = (transfer.get("hash") or "").lower()
+    if not tx_hash:
+        return None
+    direction = "in" if (transfer.get("to") or "").lower() == wallet_address.lower() else "out"
+    return {
+        "ca": ca,
+        "direction": direction,
+        "tx_hash": tx_hash,
+        "block_number": parse_hex_int(transfer.get("blockNum")),
+        "amount": to_float(transfer.get("value"), 0.0),
+        "event_json": transfer,
+    }
+
+
+async def process_tracked_wallet_checks(session: aiohttp.ClientSession) -> int:
+    if not WALLET_MONITOR_ENABLED:
+        return 0
+    latest_block = await fetch_latest_base_block(session)
+    if latest_block is None:
+        return 0
+    async with db_session() as db:
+        wallets = await get_due_tracked_wallets(
+            db,
+            now=utc_now(),
+            limit=WALLET_POLL_BATCH,
+            min_interval_seconds=WALLET_POLL_INTERVAL,
+        )
+
+    inserted_count = 0
+    for wallet in wallets:
+        from_block = int(wallet.last_checked_block or max(0, latest_block - WALLET_LOOKBACK_BLOCKS))
+        transfers = await fetch_wallet_asset_transfers(
+            session,
+            wallet_address=wallet.address,
+            from_block=from_block + 1 if wallet.last_checked_block else from_block,
+            to_block=latest_block,
+        )
+        async with db_session() as db:
+            tenant = await get_tenant(db, tenant_id=wallet.tenant_id)
+            max_block = wallet.last_checked_block or from_block
+            alerts: list[str] = []
+            for transfer in transfers:
+                event = normalize_wallet_transfer(wallet.address, transfer)
+                if not event:
+                    continue
+                max_block = max(max_block or 0, int(event.get("block_number") or 0))
+                row, inserted = await upsert_wallet_event(
+                    db,
+                    tracked_wallet_id=wallet.id,
+                    tenant_id=wallet.tenant_id,
+                    wallet_address=wallet.address,
+                    ca=event["ca"],
+                    direction=event["direction"],
+                    tx_hash=event["tx_hash"],
+                    block_number=event.get("block_number"),
+                    amount=event.get("amount"),
+                    event_json=event.get("event_json") or {},
+                )
+                if not inserted:
+                    continue
+                inserted_count += 1
+                status = await get_launch_status(db, event["ca"])
+                if tenant and event["direction"] == "in" and status in {"signaled", "queued_recheck", "manual_research"}:
+                    alerts.append(
+                        f"🐋 <b>Smart wallet inflow</b>\n"
+                        f"{h(wallet.label or wallet.address[:10])} received token we track\n"
+                        f"<code>{event['ca']}</code>\n"
+                        f"Tx: <a href='https://basescan.org/tx/{event['tx_hash']}'>BaseScan</a>\n"
+                        f"/research {event['ca']}"
+                    )
+            await mark_tracked_wallet_checked(db, wallet_id=wallet.id, block_number=max_block or latest_block)
+        if tenant:
+            for alert in alerts[:3]:
+                await send_telegram(session, alert, chat_id=tenant.external_id)
+    return inserted_count
+
+
 async def ensure_launch_for_analysis(session: aiohttp.ClientSession, ca: str) -> tuple[dict, dict | None]:
     ca = ca.lower()
     dex = await fetch_geckoterminal(session, ca)
@@ -2706,12 +4464,61 @@ async def ensure_launch_for_analysis(session: aiohttp.ClientSession, ca: str) ->
     async with db_session() as db:
         existing = await get_launch(db, ca)
     if existing:
-        return existing.raw_json or launch, dex or existing.market_json
+        existing_raw = dict(existing.raw_json or launch)
+        existing_dex = dex or existing.market_json
+        enriched_raw, reason = await enrich_launch_social_confirmation(session, existing_raw, ca)
+        if enriched_raw != existing_raw:
+            async with db_session() as db:
+                await mark_launch_status(
+                    db,
+                    ca=ca,
+                    status=existing.status,
+                    reason=reason,
+                    market_json=existing_dex,
+                    raw_json=enriched_raw,
+                )
+        return enriched_raw, existing_dex
     await persist_launch_seen(launch, status="manual_research")
+    launch, reason = await enrich_launch_social_confirmation(session, launch, ca)
     if dex:
         async with db_session() as db:
-            await mark_launch_status(db, ca=ca, status="manual_research", reason="manual analysis", market_json=dex)
+            await mark_launch_status(
+                db,
+                ca=ca,
+                status="manual_research",
+                reason=reason or "manual analysis",
+                market_json=dex,
+                raw_json=launch,
+            )
     return launch, dex
+
+
+async def enrich_launch_social_confirmation(
+    session: aiohttp.ClientSession,
+    launch: dict,
+    ca: str,
+) -> tuple[dict, str]:
+    """Attach CA-only social evidence for manual verdict commands without blocking the command."""
+    if launch.get("social_confirmation"):
+        return launch, "social confirmation already captured"
+    ticker = str(launch.get("symbol") or "").lstrip("$")
+    if not ticker or not is_base_contract(ca):
+        return launch, "manual analysis"
+    try:
+        social_ok, social_reason, social_evidence = await validate_ca_social_confirmation(
+            session,
+            ticker=ticker,
+            address=ca,
+        )
+    except Exception as e:
+        log.warning(f"Manual social enrichment failed for {ca}: {e}")
+        return launch, "manual social enrichment failed"
+    enriched = dict(launch)
+    enriched["social_confirmation"] = {
+        **(social_evidence or {}),
+        "verified": bool(social_ok and (social_evidence or {}).get("verified")),
+    }
+    return enriched, social_reason
 
 
 def command_market_line(result: dict) -> str:
@@ -2740,16 +4547,17 @@ def format_verdict2_report(result: dict) -> str:
     source_info = research.get("source") or {}
     human = verdict.get("human_readable") or "No verdict generated."
     ca = launch.get("ca", "")
+    score = float(verdict.get("score") or 0) / 10
     lines = [
-        f"🤖 <b>Verdict 2.0</b> · ${h(launch.get('symbol') or '')} · <b>{h(verdict.get('label') or '')}</b>",
+        f"🤖 <b>Verdict 2.0</b> · <b>{h(verdict.get('label') or '')}</b> · {score:.1f}/10",
+        f"${h(launch.get('symbol') or '')} · {h(launch.get('source') or source_info.get('source') or 'unknown')}",
         f"<code>{h(ca)}</code>",
-        f"Source: <b>{h(launch.get('source') or source_info.get('source') or 'unknown')}</b>",
         h(command_market_line(result)),
         "",
         human,
     ]
     if summary:
-        lines.extend(["", f"📝 <b>Summary stub</b>\n{h(summary.get('summary_text', ''))}"])
+        lines.extend(["", f"📝 <b>Summary</b>\n{h(summary.get('summary_text', ''))}"])
     return "\n".join(lines)[:3900]
 
 
@@ -2760,12 +4568,12 @@ def format_spoof_report(result: dict) -> str:
     lines = [
         f"🕵️ <b>Spoof Check</b> · ${h(launch.get('symbol') or '')}",
         f"<code>{h(launch.get('ca') or '')}</code>",
-        f"Verdict: <b>{h(verdict.get('label') or '')}</b> · {float(verdict.get('score') or 0) / 10:.1f}/10",
+        f"<b>{h(verdict.get('label') or '')}</b> · {float(verdict.get('score') or 0) / 10:.1f}/10",
         h(command_market_line(result)),
         "",
     ]
     if not signals:
-        lines.append("No deterministic spoof signals found yet.")
+        lines.append("No deterministic spoof signals found.")
     else:
         for signal in signals[:8]:
             impact = float(signal.get("score_impact") or 0)
@@ -2780,11 +4588,11 @@ def format_summary_report(result: dict) -> str:
     summary = result.get("summary") or {}
     verdict = result.get("verdict") or {}
     return (
-        f"🧠 <b>AI Summary</b> <i>(stub)</i> · ${h(launch.get('symbol') or '')}\n"
+        f"🧠 <b>Summary</b> · ${h(launch.get('symbol') or '')}\n"
         f"<code>{h(launch.get('ca') or '')}</code>\n\n"
         f"{h(command_market_line(result))}\n\n"
         f"{h(summary.get('summary_text') or 'Summary unavailable')}\n\n"
-        f"Verdict: <b>{h(verdict.get('label'))}</b> · {float(verdict.get('score') or 0) / 10:.1f}/10"
+        f"<b>{h(verdict.get('label'))}</b> · {float(verdict.get('score') or 0) / 10:.1f}/10"
     )[:3900]
 
 
@@ -2820,9 +4628,9 @@ async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, s
     addr_truncated = address[:20]
     _address_map[addr_truncated] = address
 
-    tg_text = format_signal_telegram(launch, dex, executed=False, job_id="")
-    wa_text = format_alert_whatsapp(launch, dex, executed=False)
-    keyboard = build_trade_keyboard(address, symbol)
+    tg_text = format_signal_telegram(launch, dex)
+    wa_text = format_alert_whatsapp(launch, dex)
+    keyboard = build_signal_keyboard(address, symbol)
     delivery_payload = {
         "telegram_text": tg_text,
         "reply_markup": keyboard,
@@ -2831,54 +4639,77 @@ async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, s
         "source": source,
     }
 
-    if default_tenant_db_id is not None:
-        async with db_session() as db:
-            if await signal_exists_for_tenant(db, ca=address, tenant_id=default_tenant_db_id):
-                log.info(f"  📡 [{source}] ${symbol} already delivered for default tenant, skipping")
-                await mark_launch_status(db, ca=address, status="signaled", reason="already delivered", market_json=dex)
-                return False
-            _, delivery, delivery_inserted = await prepare_tenant_delivery(
+    async with db_session() as db:
+        signal, delivery_inserted = await prepare_signal_fanout(
+            db,
+            ca=address,
+            source=source,
+            payload_json=delivery_payload,
+            page_size=1000,
+        )
+        if delivery_inserted == 0:
+            log.info(f"  📡 [{source}] ${symbol} already delivered or no active tenants, skipping")
+            await mark_launch_status(
                 db,
                 ca=address,
-                tenant_id=default_tenant_db_id,
-                chat_id=TELEGRAM_CHAT_ID,
-                payload_json=delivery_payload,
+                status="signaled",
+                reason="already delivered or no tenants",
+                market_json=dex,
+                raw_json=launch,
             )
-            if not delivery_inserted:
-                log.info(f"  📡 [{source}] ${symbol} delivery row exists, skipping duplicate")
-                return False
-            delivery_id = delivery.id
-    else:
-        delivery_id = None
+            return False
+        pending_deliveries = await get_pending_deliveries_for_signal(
+            db,
+            signal_id=signal.id,
+            limit=TELEGRAM_SIGNAL_DELIVERY_LIMIT,
+        )
 
     log.info(
-        f"  📡 {prefix}SIGNAL: [{source}] ${symbol} "
+        f"  📡 {prefix}SIGNAL: [{source}] ${symbol} → {len(pending_deliveries)} Telegram deliveries "
         f"MCap {fmt_usd(dex['mcap'])} Vol {fmt_usd(dex['volume_24h'])}"
         + (f" @{launch.get('x_username')}" if launch.get('x_username') else "")
     )
 
-    if delivery_id is not None:
+    successful_messages: list[tuple[str, int]] = []
+    for delivery in pending_deliveries:
         async with db_session() as db:
-            await mark_delivery_sending(db, delivery_id=delivery_id)
+            await mark_delivery_sending(db, delivery_id=delivery.id)
 
-    message_id = await send_telegram(session, tg_text, reply_markup=keyboard)
-    if message_id is None:
-        log.error(f"  ❌ Telegram signal failed: [{source}] ${symbol} {address}")
-        if delivery_id is not None:
-            async with db_session() as db:
+        message_id = await send_telegram(session, tg_text, chat_id=delivery.destination_id, reply_markup=keyboard)
+        async with db_session() as db:
+            if message_id is not None:
+                await mark_delivery_sent(db, delivery_id=delivery.id, message_id=str(message_id))
+                successful_messages.append((delivery.destination_id, message_id))
+                log_event(
+                    "signal_delivery_sent",
+                    correlation_id=cid,
+                    ca=address,
+                    source=source,
+                    chat_id=delivery.destination_id,
+                    message_id=message_id,
+                )
+            else:
                 await mark_delivery_retry(
                     db,
-                    delivery_id=delivery_id,
+                    delivery_id=delivery.id,
                     error="telegram send failed",
                     next_retry_at=utc_now() + timedelta(minutes=1),
                 )
+
+    if not successful_messages:
+        log.error(f"  ❌ Telegram signal failed for all tenants: [{source}] ${symbol} {address}")
         return False
 
-    if delivery_id is not None:
-        async with db_session() as db:
-            await mark_delivery_sent(db, delivery_id=delivery_id, message_id=str(message_id))
-            await mark_launch_status(db, ca=address, status="signaled", reason="telegram delivered", market_json=dex)
-            log_event("signal_sent", correlation_id=cid, ca=address, source=source, message_id=message_id)
+    async with db_session() as db:
+        await mark_launch_status(db, ca=address, status="signaled", reason="telegram delivered", market_json=dex, raw_json=launch)
+        log_event(
+            "signal_sent",
+            correlation_id=cid,
+            ca=address,
+            source=source,
+            delivered=len(successful_messages),
+            queued=len(pending_deliveries),
+        )
 
     if WHAPI_TOKEN and WHATSAPP_GROUP_ID:
         await send_whatsapp(session, wa_text)
@@ -2889,50 +4720,23 @@ async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, s
         pushover_msg += f" · @{launch['x_username']}"
     await send_pushover(session, f"🐋 {source.upper()}: ${symbol}", pushover_msg, url=dex_url)
 
-    alert_count += 1
+    alert_count += len(successful_messages)
 
-    if AUTO_EXECUTE and isinstance(message_id, int):
+    if AUTO_VERDICT_ENABLED:
         asyncio.create_task(
-            attach_execution_result(session, TELEGRAM_CHAT_ID, message_id, tg_text, keyboard, launch, source, symbol)
-        )
-
-    if AUTO_VERDICT_ENABLED and isinstance(message_id, int):
-        asyncio.create_task(
-            attach_signal_verdict(session, TELEGRAM_CHAT_ID, message_id, tg_text, keyboard, launch, dex, source, symbol)
+            attach_signal_verdict_to_messages(session, successful_messages, tg_text, keyboard, launch, dex, source, symbol)
         )
 
     return True
 
 
-async def attach_execution_result(
-    session: aiohttp.ClientSession,
-    chat_id: str,
-    message_id: int,
+async def build_signal_verdict_text(
     base_text: str,
-    keyboard: dict,
-    launch: dict,
-    source: str,
-    symbol: str,
-):
-    address = launch["address"]
-    executed = await execute_bankr_buy(session, address, symbol, source)
-    status = f"💸 <b>Auto-buy submitted</b> via Bankr" if executed else "⚠️ Auto-buy not submitted"
-    ok = await edit_telegram_message(session, chat_id, message_id, f"{base_text}\n\n{status}", reply_markup=keyboard)
-    if ok:
-        log.info(f"  💸 Execution status attached: [{source}] ${symbol} → {'submitted' if executed else 'skipped'}")
-
-
-async def attach_signal_verdict(
-    session: aiohttp.ClientSession,
-    chat_id: str,
-    message_id: int,
-    base_text: str,
-    keyboard: dict,
     launch: dict,
     dex: dict | None,
     source: str,
     symbol: str,
-):
+) -> str | None:
     address = launch.get("address", "")
     try:
         async with db_session() as db:
@@ -2957,7 +4761,7 @@ async def attach_signal_verdict(
             )
     except Exception as e:
         log.warning(f"  ⚠️ Verdict 2.0 skipped: [{source}] ${symbol}: {e}")
-        return
+        return None
 
     verdict = result.get("verdict") or {}
     verdict_block = verdict.get("human_readable") or build_ai_summary_placeholder(
@@ -2977,17 +4781,90 @@ async def attach_signal_verdict(
         if placeholder in base_text
         else f"{base_text}\n\n{verdict_block}"
     )
+    processed = (result.get("research") or {}).get("processed_data") or {}
+    social = processed.get("social") or {}
+    evidence_tweets = social.get("evidence_tweets") or []
+    if evidence_tweets:
+        social_evidence = {
+            "ticker": processed.get("symbol") or symbol,
+            "qualified_tweets": int(social.get("qualified_tweets") or len(evidence_tweets)),
+            "max_age_hours": 24,
+            "thesis": social.get("evidence_thesis") or "",
+            "value_assessment": social.get("value_assessment") or "",
+            "social_score": int(social.get("social_score") or 0),
+            "score_breakdown": social.get("score_breakdown") or {},
+            "top_tweets": evidence_tweets,
+        }
+        xsignal_block = format_research_social_block(
+            symbol,
+            [],
+            [],
+            social_evidence=social_evidence,
+            address=address,
+            page=1,
+        )
+        if "🐦 <b>X Signal</b>" not in new_text:
+            new_text = f"{new_text}\n\n{xsignal_block}"
     if len(new_text) > 3900:
         new_text = new_text[:3800] + "\n\n<i>Verdict 2.0 truncated</i>"
+    log.info(
+        f"  🧠 Verdict 2.0: [{source}] ${symbol} → "
+        f"{verdict.get('label')} ({float(verdict.get('score') or 0) / 10:.1f}/10)"
+    )
+    return new_text
 
-    ok = await edit_telegram_message(session, chat_id, message_id, new_text, reply_markup=keyboard)
+
+async def attach_signal_verdict(
+    session: aiohttp.ClientSession,
+    chat_id: str,
+    message_id: int,
+    base_text: str,
+    keyboard: dict,
+    launch: dict,
+    dex: dict | None,
+    source: str,
+    symbol: str,
+):
+    new_text = await build_signal_verdict_text(base_text, launch, dex, source, symbol)
+    if not new_text:
+        return
+    address = launch.get("address", "")
+    social_evidence = _xsignal_page_cache.get(xsignal_cache_key(address))
+    merged_keyboard = merge_inline_keyboards(
+        keyboard,
+        build_xsignal_pagination_keyboard(address, social_evidence, 1),
+    )
+    ok = await edit_telegram_message(session, chat_id, message_id, new_text, reply_markup=merged_keyboard)
     if ok:
-        log.info(
-            f"  🧠 Verdict 2.0: [{source}] ${symbol} → "
-            f"{verdict.get('label')} ({float(verdict.get('score') or 0) / 10:.1f}/10)"
-        )
+        log.info(f"  🧠 Verdict 2.0 edit attached: [{source}] ${symbol} → {chat_id}/{message_id}")
     else:
         log.warning(f"  ⚠️ Verdict 2.0 edit rejected: [{source}] ${symbol}")
+
+
+async def attach_signal_verdict_to_messages(
+    session: aiohttp.ClientSession,
+    messages: list[tuple[str, int]],
+    base_text: str,
+    keyboard: dict,
+    launch: dict,
+    dex: dict | None,
+    source: str,
+    symbol: str,
+):
+    new_text = await build_signal_verdict_text(base_text, launch, dex, source, symbol)
+    if not new_text:
+        return
+    address = launch.get("address", "")
+    social_evidence = _xsignal_page_cache.get(xsignal_cache_key(address))
+    merged_keyboard = merge_inline_keyboards(
+        keyboard,
+        build_xsignal_pagination_keyboard(address, social_evidence, 1),
+    )
+    edited = 0
+    for chat_id, message_id in messages:
+        if await edit_telegram_message(session, chat_id, message_id, new_text, reply_markup=merged_keyboard):
+            edited += 1
+    log.info(f"  🧠 Verdict 2.0 edited {edited}/{len(messages)} Telegram deliveries for [{source}] ${symbol}")
 
 
 # ─── Seeding ──────────────────────────────────────────────────────────────────
@@ -2997,9 +4874,10 @@ async def seed_existing(session: aiohttp.ClientSession):
     bankr = await fetch_bankr(session)
     clanker = await fetch_clanker(session)
     dexscreener = await fetch_dexscreener_discoveries(session)
+    coingecko = await fetch_coingecko_new_pools(session)
     virtuals = await fetch_virtuals(session)
 
-    all_launches = bankr + clanker + dexscreener + virtuals
+    all_launches = bankr + clanker + dexscreener + coingecko + virtuals
     inserted = 0
 
     for launch in all_launches:
@@ -3010,7 +4888,8 @@ async def seed_existing(session: aiohttp.ClientSession):
 
     log.info(
         f"📋 Seeded {inserted} new DB rows "
-        f"(Bankr: {len(bankr)}, Clanker: {len(clanker)}, DexScreener: {len(dexscreener)}, Virtuals: {len(virtuals)}) "
+        f"(Bankr: {len(bankr)}, Clanker: {len(clanker)}, DexScreener: {len(dexscreener)}, "
+        f"CoinGecko: {len(coingecko)}, Virtuals: {len(virtuals)}) "
         f"— existing rows skipped"
     )
 
@@ -3023,27 +4902,29 @@ async def main():
     if not TELEGRAM_BOT_TOKEN:
         log.error("❌ TELEGRAM_BOT_TOKEN not set!")
     if not TELEGRAM_CHAT_ID:
-        log.error("❌ TELEGRAM_CHAT_ID not set!")
+        log.warning("⚠️ TELEGRAM_CHAT_ID not set — no default group tenant; public /start DMs still work")
     if not SOCIALDATA_API_KEY:
         log.error("❌ SOCIALDATA_API_KEY not set!")
 
     log.info("=" * 60)
-    log.info("  🐋 Whale Alert Bot (Bankr + Clanker + Virtuals + DexScreener)")
+    log.info("  🐋 Whale Alert Bot (Bankr + Clanker + Virtuals + DexScreener + CoinGecko)")
     log.info(f"  Min followers : {MIN_FOLLOWERS:,}")
     log.info(f"  Min MCap      : ${MIN_MCAP:,}")
     log.info(f"  Min Volume 24h: ${MIN_VOLUME_24H:,}")
     log.info(f"  Min Liquidity : ${MIN_LIQUIDITY:,} (DexScreener-sourced only)")
     log.info(f"  Safe sources  : {', '.join(SAFE_LAUNCHPADS)} (liq check SKIPPED)")
     log.info(f"  Poll interval : {POLL_INTERVAL}s")
-    log.info(f"  Telegram      : {'✅' if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID else '❌'}")
+    log.info(f"  Telegram      : {'✅' if TELEGRAM_BOT_TOKEN else '❌'}" + (f" (default {TELEGRAM_CHAT_ID})" if TELEGRAM_CHAT_ID else " (self-serve DMs)"))
     log.info(f"  Authorized DMs: {', '.join(sorted(AUTHORIZED_USER_IDS)) if AUTHORIZED_USER_IDS else 'none'}")
     log.info(f"  WhatsApp      : {'✅' if WHAPI_TOKEN and WHATSAPP_GROUP_ID else '❌'}")
     log.info(f"  SocialData    : {'✅' if SOCIALDATA_API_KEY else '❌'}")
+    log.info(
+        f"  CoinGecko     : "
+        f"{'✅ ON' if COINGECKO_DISCOVERY_ENABLED and COINGECKO_API_KEY else '❌ OFF'} "
+        f"(new_pools every {COINGECKO_POLL_INTERVAL}s, limit {COINGECKO_DISCOVERY_LIMIT})"
+    )
     log.info(f"  Auto-verdict  : {'✅ ON' if AUTO_VERDICT_ENABLED else '❌ OFF'} ({AUTO_VERDICT_TIMEOUT_SEC:.0f}s, max {AUTO_VERDICT_MAX_CONCURRENT})")
     log.info(f"  Pushover      : {'✅' if PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN else '❌ NOT SET'}")
-    log.info(f"  Auto-execute  : {'✅ ON — $' + str(BANKR_BUY_AMOUNT) + '/trade' if AUTO_EXECUTE else '❌ OFF'}")
-    log.info(f"  Inline trading: {'✅ ON' if TRADING_ENABLED else '❌ OFF (set TRADING_ENABLED=true)'}")
-    log.info(f"  Bankr Exec Key: {'✅' if BANKR_EXECUTION_API_KEY else '❌ NOT SET'}")
     log.info("=" * 60)
 
     await init_db(resolve_database_url(), auto_create=settings.database_auto_create)
@@ -3058,6 +4939,16 @@ async def main():
     async with aiohttp.ClientSession() as session:
         await delete_telegram_webhook(session, drop_pending_updates=True)
         await set_bot_commands(session)
+        asyncio.create_task(telegram_command_loop(session))
+        asyncio.create_task(nitter_health_loop(session))
+        log.info(
+            "✅ Telegram command loop started "
+            f"(interval={TELEGRAM_COMMAND_POLL_INTERVAL}s, timeout={TELEGRAM_GET_UPDATES_TIMEOUT}s)"
+        )
+        log.info(
+            "✅ Nitter health loop configured "
+            f"(enabled={NITTER_HEALTH_ENABLED}, interval={NITTER_HEALTH_INTERVAL_SEC}s)"
+        )
 
         # DexScreener health check
         try:
@@ -3072,26 +4963,6 @@ async def main():
                     log.warning(f"⚠️ DexScreener unexpected format: {type(test_data).__name__}")
         except Exception as e:
             log.error(f"❌ DexScreener health check failed: {e}")
-
-        # Bankr execution health check
-        if AUTO_EXECUTE and BANKR_EXECUTION_API_KEY:
-            log.info("🔍 Verifying Bankr execution API key...")
-            try:
-                async with session.post(
-                    BANKR_AGENT_API_URL,
-                    headers={"Content-Type": "application/json", "X-API-Key": BANKR_EXECUTION_API_KEY},
-                    json={"prompt": "what are my token balances on base?"},
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    data = await resp.json()
-                    if resp.status == 202 and data.get("success"):
-                        log.info(f"✅ Bankr execution API OK — jobId: {data.get('jobId', '?')}")
-                    elif resp.status == 403:
-                        log.error("❌ Bankr API key rejected (403) — check bankr.bot/api for Agent API access")
-                    else:
-                        log.warning(f"⚠️ Bankr API check: {resp.status} — {data}")
-            except Exception as e:
-                log.error(f"❌ Bankr execution health check failed: {e}")
 
         # Pushover health check
         if PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN:
@@ -3112,41 +4983,43 @@ async def main():
 
         await seed_existing(session)
 
-        trade_note = "\n💸 Inline trading: ✅ ON — tap buttons on signals to buy/sell" if TRADING_ENABLED else "\n💸 Inline trading: ❌ OFF"
         pushover_note = "\n🔔 Pushover: ✅ Emergency alerts ON" if PUSHOVER_USER_KEY and PUSHOVER_API_TOKEN else "\n🔔 Pushover: ❌ OFF"
         verdict_note = (
             f"\n🧠 Auto-verdict: ✅ ON — deterministic research, AI stub"
             if AUTO_VERDICT_ENABLED else "\n🧠 Auto-verdict: ❌ OFF"
         )
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-            exec_note = f"\n💸 Auto-execute: ON (${BANKR_BUY_AMOUNT}/trade)" if AUTO_EXECUTE else "\n💸 Auto-execute: OFF"
             await send_telegram(
                 session,
                 f"🐋 <b>Whale Alert Bot started</b>\n\n"
-                f"Sources: Bankr + Clanker + Virtuals + DexScreener\n"
-                f"Market data: DexScreener\n"
+                f"Sources: Bankr + Clanker + Virtuals + DexScreener + CoinGecko\n"
+                f"Market data: DexScreener + GeckoTerminal fallback\n"
                 f"Min MCap: ${MIN_MCAP:,} · Vol: ${MIN_VOLUME_24H:,}\n"
                 f"Liq: ${MIN_LIQUIDITY:,} (DexScreener only — 🔓 skipped for Bankr/Clanker/Virtuals)\n"
                 f"Polling every {POLL_INTERVAL}s"
-                f"{exec_note}"
-                f"{trade_note}"
                 f"{pushover_note}"
                 f"{verdict_note}\n\n"
-                f"Commands: /help · /research · /status · /wallets · /track",
+                f"Commands: /start · /help · /research · /status",
             )
 
         while True:
             try:
-                await handle_telegram_commands(session)
                 retried_deliveries = await process_delivery_retries(session)
                 if retried_deliveries:
                     log.info(f"📨 Retried {retried_deliveries} Telegram deliveries")
+                watchlist_notifications = await process_watchlist_checks(session)
+                if watchlist_notifications:
+                    log.info(f"⭐ Sent {watchlist_notifications} watchlist update(s)")
+                wallet_events = await process_tracked_wallet_checks(session)
+                if wallet_events:
+                    log.info(f"🐋 Stored {wallet_events} tracked wallet event(s)")
 
                 bankr_launches = await fetch_bankr(session)
                 clanker_launches = await fetch_clanker(session)
                 dexscreener_launches = await fetch_dexscreener_discoveries(session)
+                coingecko_launches = await fetch_coingecko_new_pools(session)
                 virtuals_launches = await fetch_virtuals(session)
-                all_launches = bankr_launches + clanker_launches + dexscreener_launches + virtuals_launches
+                all_launches = bankr_launches + clanker_launches + dexscreener_launches + coingecko_launches + virtuals_launches
 
                 new_count = 0
                 signal_count = 0
@@ -3166,13 +5039,14 @@ async def main():
                     cid = correlation_id(source, address)
                     log_event("launch_seen", correlation_id=cid, ca=address, source=source, symbol=symbol)
 
-                    if source == "dexscreener" and launch.get("_dex"):
+                    if source in {"dexscreener", "coingecko"} and launch.get("_dex"):
                         dex = launch["_dex"]
                     else:
                         dex = await fetch_geckoterminal(session, address)
-                    if source == "dexscreener" and dex:
+                    if source in {"dexscreener", "coingecko"} and dex:
                         launch["name"] = dex.get("token_name") or launch.get("name") or "Unknown"
                         launch["symbol"] = dex.get("token_symbol") or launch.get("symbol") or "?"
+                        launch["dex_id"] = dex.get("dex_id") or launch.get("dex_id", "")
                         symbol = launch["symbol"]
 
                     passes, reason = passes_market_filters(dex, source=source)
@@ -3196,6 +5070,33 @@ async def main():
 
                     if launch["source"] == "virtuals":
                         launch["x_username"] = launch.get("creator_x", "") or launch.get("x_username", "")
+
+                    social_ok, social_reason, social_evidence = await validate_ca_social_confirmation(
+                        session,
+                        ticker=symbol,
+                        address=address,
+                    )
+                    if not social_ok:
+                        async with db_session() as db:
+                            await mark_launch_status(
+                                db,
+                                ca=address,
+                                status="filtered",
+                                reason=social_reason,
+                                market_json=dex,
+                            )
+                        log.info(f"  🧹 [{source}] ${symbol} — {social_reason}, skip signal")
+                        continue
+                    launch["social_confirmation"] = social_evidence
+                    async with db_session() as db:
+                        await mark_launch_status(
+                            db,
+                            ca=address,
+                            status="new",
+                            reason=social_reason,
+                            market_json=dex,
+                            raw_json=launch,
+                        )
 
                     if await send_signal(session, launch, dex, source, symbol, is_recheck=False):
                         signal_count += 1
@@ -3243,6 +5144,34 @@ async def main():
 
                     if launch["source"] == "virtuals":
                         launch["x_username"] = launch.get("creator_x", "") or launch.get("x_username", "")
+
+                    social_ok, social_reason, social_evidence = await validate_ca_social_confirmation(
+                        session,
+                        ticker=symbol,
+                        address=addr,
+                    )
+                    if not social_ok:
+                        async with db_session() as db:
+                            await mark_launch_status(
+                                db,
+                                ca=addr,
+                                status="filtered",
+                                reason=social_reason,
+                                market_json=dex,
+                            )
+                        log.info(f"  🧹 [{source}] ${symbol} recheck — {social_reason}, skip signal")
+                        expired_names.append(f"${symbol}[{source}/social]")
+                        continue
+                    launch["social_confirmation"] = social_evidence
+                    async with db_session() as db:
+                        await mark_launch_status(
+                            db,
+                            ca=addr,
+                            status="new",
+                            reason=social_reason,
+                            market_json=dex,
+                            raw_json=launch,
+                        )
 
                     if await send_signal(session, launch, dex, source, symbol, is_recheck=True):
                         signal_count += 1

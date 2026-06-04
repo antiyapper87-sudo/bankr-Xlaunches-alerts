@@ -98,7 +98,11 @@ class TenantSettings(Base):
 
     tenant_id: Mapped[int] = mapped_column(ForeignKey("tenants.id"), primary_key=True)
     min_score: Mapped[float] = mapped_column(Float, nullable=False, default=6.0)
-    enabled_sources: Mapped[dict[str, Any]] = mapped_column(JSONCompat, nullable=False, default=lambda: {"sources": ["bankr", "clanker", "virtuals"]})
+    enabled_sources: Mapped[dict[str, Any]] = mapped_column(
+        JSONCompat,
+        nullable=False,
+        default=lambda: {"sources": ["bankr", "clanker", "virtuals", "dexscreener", "coingecko"]},
+    )
     delivery_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="all")
     max_signals_per_day: Mapped[int | None] = mapped_column(Integer)
     quiet_hours: Mapped[dict[str, Any] | None] = mapped_column(JSONCompat)
@@ -218,6 +222,39 @@ class ApiBudgetEvent(Base):
     )
 
 
+class NitterHealthLog(Base):
+    __tablename__ = "nitter_health_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    base_url: Mapped[str | None] = mapped_column(String(256))
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    detail: Mapped[str | None] = mapped_column(Text)
+    response_ms: Mapped[int | None] = mapped_column(Integer)
+    item_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, index=True)
+
+    __table_args__ = (
+        Index("ix_nitter_health_status_created", "status", "created_at"),
+    )
+
+
+class SocialDataUsageLog(Base):
+    __tablename__ = "socialdata_usage_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    endpoint: Mapped[str] = mapped_column(String(128), nullable=False)
+    query_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    mode: Mapped[str | None] = mapped_column(String(32))
+    result_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    triggered_by_alpha: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    alpha_reason: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, index=True)
+
+    __table_args__ = (
+        Index("ix_socialdata_usage_created", "created_at"),
+    )
+
+
 class AuditEvent(Base):
     __tablename__ = "audit_events"
 
@@ -237,7 +274,17 @@ class BotState(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
 
 
-from models import AISummary, HistoricalLaunch, SpoofSignal, TokenResearch, VerdictV2  # noqa: E402
+from models import (  # noqa: E402
+    AISummary,
+    HistoricalLaunch,
+    SpoofSignal,
+    TokenResearch,
+    TrackedWallet,
+    UserFeedback,
+    UserWatchlist,
+    VerdictV2,
+    WalletEvent,
+)
 
 
 engine: AsyncEngine | None = None
@@ -312,6 +359,28 @@ async def upsert_tenant(
     await db.flush()
     db.add(TenantSettings(tenant_id=tenant.id))
     return tenant
+
+
+async def get_tenant_settings(db: AsyncSession, *, tenant_id: int) -> TenantSettings:
+    settings = await db.get(TenantSettings, tenant_id)
+    if settings:
+        return settings
+    settings = TenantSettings(tenant_id=tenant_id)
+    db.add(settings)
+    await db.flush()
+    return settings
+
+
+async def get_tenant(db: AsyncSession, *, tenant_id: int) -> Tenant | None:
+    return await db.get(Tenant, tenant_id)
+
+
+async def update_tenant_min_score(db: AsyncSession, *, tenant_id: int, min_score: float) -> TenantSettings:
+    settings = await get_tenant_settings(db, tenant_id=tenant_id)
+    settings.min_score = max(0.0, min(10.0, float(min_score)))
+    settings.updated_at = utc_now()
+    await db.flush()
+    return settings
 
 
 async def upsert_launch(
@@ -408,6 +477,26 @@ async def get_ticker_history(db: AsyncSession, *, ticker: str, since: datetime |
     return list(await db.scalars(stmt))
 
 
+async def get_deployer_history(
+    db: AsyncSession,
+    *,
+    deployer: str,
+    since: datetime | None = None,
+    exclude_ca: str | None = None,
+    limit: int = 50,
+) -> list[HistoricalLaunch]:
+    deployer = (deployer or "").strip()
+    if not deployer:
+        return []
+    stmt = select(HistoricalLaunch).where(func.lower(HistoricalLaunch.deployer) == deployer.lower())
+    if since is not None:
+        stmt = stmt.where(HistoricalLaunch.first_seen_at >= since)
+    if exclude_ca:
+        stmt = stmt.where(HistoricalLaunch.ca != normalize_ca(exclude_ca))
+    stmt = stmt.order_by(HistoricalLaunch.first_seen_at.desc()).limit(limit)
+    return list(await db.scalars(stmt))
+
+
 async def get_recent_launches_by_ticker(db: AsyncSession, *, ticker: str, since: datetime | None = None, limit: int = 25) -> list[Launch]:
     ticker = (ticker or "").lstrip("$").upper()
     stmt = select(Launch).where(func.upper(Launch.ticker) == ticker)
@@ -448,12 +537,15 @@ async def mark_launch_status(
     status: str,
     reason: str = "",
     market_json: dict[str, Any] | None = None,
+    raw_json: dict[str, Any] | None = None,
 ) -> None:
     launch = await db.get(Launch, normalize_ca(ca))
     if not launch:
         return
     launch.status = status
     launch.status_reason = reason or None
+    if raw_json is not None:
+        launch.raw_json = raw_json
     if market_json is not None:
         launch.market_json = market_json
         try:
@@ -644,6 +736,319 @@ async def get_due_delivery_retries(db: AsyncSession, *, now: datetime, limit: in
     )
     if db.bind and db.bind.dialect.name == "postgresql":
         stmt = stmt.with_for_update(skip_locked=True)
+    return list(await db.scalars(stmt))
+
+
+async def get_pending_deliveries_for_signal(db: AsyncSession, *, signal_id: int, limit: int = 1000) -> list[SignalDelivery]:
+    stmt = (
+        select(SignalDelivery)
+        .where(SignalDelivery.signal_id == signal_id, SignalDelivery.status == "pending")
+        .order_by(SignalDelivery.id.asc())
+        .limit(limit)
+    )
+    if db.bind and db.bind.dialect.name == "postgresql":
+        stmt = stmt.with_for_update(skip_locked=True)
+    return list(await db.scalars(stmt))
+
+
+async def upsert_watchlist_item(
+    db: AsyncSession,
+    *,
+    tenant_id: int,
+    ca: str,
+    label: str = "",
+    market_json: dict[str, Any] | None = None,
+) -> tuple[UserWatchlist, bool]:
+    ca = normalize_ca(ca)
+    stmt = select(UserWatchlist).where(UserWatchlist.tenant_id == tenant_id, UserWatchlist.ca == ca)
+    row = await db.scalar(stmt)
+    market_json = market_json or None
+    mcap = float((market_json or {}).get("mcap") or 0) if market_json else None
+    volume = float((market_json or {}).get("volume_24h") or 0) if market_json else None
+    liquidity = float((market_json or {}).get("liquidity") or 0) if market_json else None
+    price = str((market_json or {}).get("price_usd") or "") or None
+    if row:
+        row.status = "active"
+        if label:
+            row.label = label[:128]
+        if market_json:
+            row.last_market_json = market_json
+            row.last_mcap = mcap
+            row.last_volume = volume
+            row.last_liquidity = liquidity
+            row.last_price_usd = price
+            row.last_checked_at = utc_now()
+        row.updated_at = utc_now()
+        await db.flush()
+        return row, False
+    row = UserWatchlist(
+        tenant_id=tenant_id,
+        ca=ca,
+        label=label[:128] or None,
+        status="active",
+        last_market_json=market_json,
+        last_mcap=mcap,
+        last_volume=volume,
+        last_liquidity=liquidity,
+        last_price_usd=price,
+        last_checked_at=utc_now() if market_json else None,
+    )
+    db.add(row)
+    await db.flush()
+    return row, True
+
+
+async def deactivate_watchlist_item(db: AsyncSession, *, tenant_id: int, ca: str) -> bool:
+    row = await db.scalar(
+        select(UserWatchlist).where(UserWatchlist.tenant_id == tenant_id, UserWatchlist.ca == normalize_ca(ca))
+    )
+    if not row or row.status != "active":
+        return False
+    row.status = "inactive"
+    row.updated_at = utc_now()
+    await db.flush()
+    return True
+
+
+async def list_watchlist_items(db: AsyncSession, *, tenant_id: int, limit: int = 50) -> list[UserWatchlist]:
+    stmt = (
+        select(UserWatchlist)
+        .where(UserWatchlist.tenant_id == tenant_id, UserWatchlist.status == "active")
+        .order_by(UserWatchlist.created_at.desc())
+        .limit(limit)
+    )
+    return list(await db.scalars(stmt))
+
+
+async def get_due_watchlist_items(db: AsyncSession, *, now: datetime, limit: int, min_interval_seconds: int) -> list[UserWatchlist]:
+    cutoff = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now
+    cutoff = cutoff.timestamp() - min_interval_seconds
+    cutoff_dt = datetime.fromtimestamp(cutoff, timezone.utc)
+    stmt = (
+        select(UserWatchlist)
+        .where(
+            UserWatchlist.status == "active",
+            (UserWatchlist.last_checked_at.is_(None) | (UserWatchlist.last_checked_at <= cutoff_dt)),
+        )
+        .order_by(UserWatchlist.last_checked_at.asc().nullsfirst(), UserWatchlist.id.asc())
+        .limit(limit)
+    )
+    if db.bind and db.bind.dialect.name == "postgresql":
+        stmt = stmt.with_for_update(skip_locked=True)
+    return list(await db.scalars(stmt))
+
+
+async def mark_watchlist_checked(
+    db: AsyncSession,
+    *,
+    watchlist_id: int,
+    market_json: dict[str, Any] | None,
+    notified: bool = False,
+) -> UserWatchlist | None:
+    row = await db.get(UserWatchlist, watchlist_id)
+    if not row:
+        return None
+    row.last_checked_at = utc_now()
+    if market_json:
+        row.last_market_json = market_json
+        row.last_mcap = float(market_json.get("mcap") or 0)
+        row.last_volume = float(market_json.get("volume_24h") or 0)
+        row.last_liquidity = float(market_json.get("liquidity") or 0)
+        row.last_price_usd = str(market_json.get("price_usd") or "") or None
+    if notified:
+        row.last_notified_at = utc_now()
+    row.updated_at = utc_now()
+    await db.flush()
+    return row
+
+
+async def upsert_user_feedback(
+    db: AsyncSession,
+    *,
+    tenant_id: int,
+    ca: str,
+    action: str,
+    source: str = "telegram",
+    payload_json: dict[str, Any] | None = None,
+    note: str = "",
+) -> tuple[UserFeedback, bool]:
+    ca = normalize_ca(ca)
+    stmt = select(UserFeedback).where(UserFeedback.tenant_id == tenant_id, UserFeedback.ca == ca)
+    row = await db.scalar(stmt)
+    if row:
+        row.action = action[:32]
+        row.source = source[:32]
+        row.payload_json = payload_json or {}
+        row.note = note[:2000] if note else None
+        row.updated_at = utc_now()
+        await db.flush()
+        return row, False
+    row = UserFeedback(
+        tenant_id=tenant_id,
+        ca=ca,
+        action=action[:32],
+        source=source[:32],
+        payload_json=payload_json or {},
+        note=note[:2000] if note else None,
+    )
+    db.add(row)
+    await db.flush()
+    return row, True
+
+
+async def upsert_tracked_wallet(
+    db: AsyncSession,
+    *,
+    tenant_id: int,
+    address: str,
+    label: str = "",
+    chain: str = "base",
+) -> tuple[TrackedWallet, bool]:
+    address = normalize_ca(address)
+    chain = (chain or "base").lower()
+    stmt = select(TrackedWallet).where(
+        TrackedWallet.tenant_id == tenant_id,
+        TrackedWallet.address == address,
+        TrackedWallet.chain == chain,
+    )
+    row = await db.scalar(stmt)
+    if row:
+        row.status = "active"
+        row.label = label[:128] or row.label
+        row.updated_at = utc_now()
+        await db.flush()
+        return row, False
+    row = TrackedWallet(
+        tenant_id=tenant_id,
+        address=address,
+        label=label[:128] or None,
+        chain=chain,
+        status="active",
+    )
+    db.add(row)
+    await db.flush()
+    return row, True
+
+
+async def deactivate_tracked_wallet(db: AsyncSession, *, tenant_id: int, address: str, chain: str = "base") -> bool:
+    row = await db.scalar(
+        select(TrackedWallet).where(
+            TrackedWallet.tenant_id == tenant_id,
+            TrackedWallet.address == normalize_ca(address),
+            TrackedWallet.chain == (chain or "base").lower(),
+        )
+    )
+    if not row or row.status != "active":
+        return False
+    row.status = "inactive"
+    row.updated_at = utc_now()
+    await db.flush()
+    return True
+
+
+async def list_tracked_wallets(db: AsyncSession, *, tenant_id: int | None = None, limit: int = 100) -> list[TrackedWallet]:
+    stmt = select(TrackedWallet).where(TrackedWallet.status == "active")
+    if tenant_id is not None:
+        stmt = stmt.where(TrackedWallet.tenant_id == tenant_id)
+    stmt = stmt.order_by(TrackedWallet.created_at.desc()).limit(limit)
+    return list(await db.scalars(stmt))
+
+
+async def get_due_tracked_wallets(db: AsyncSession, *, now: datetime, limit: int, min_interval_seconds: int) -> list[TrackedWallet]:
+    cutoff_dt = ensure_aware(now) if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    cutoff_dt = datetime.fromtimestamp(cutoff_dt.timestamp() - min_interval_seconds, timezone.utc)
+    stmt = (
+        select(TrackedWallet)
+        .where(
+            TrackedWallet.status == "active",
+            TrackedWallet.chain == "base",
+            (TrackedWallet.last_checked_at.is_(None) | (TrackedWallet.last_checked_at <= cutoff_dt)),
+        )
+        .order_by(TrackedWallet.last_checked_at.asc().nullsfirst(), TrackedWallet.id.asc())
+        .limit(limit)
+    )
+    if db.bind and db.bind.dialect.name == "postgresql":
+        stmt = stmt.with_for_update(skip_locked=True)
+    return list(await db.scalars(stmt))
+
+
+async def mark_tracked_wallet_checked(
+    db: AsyncSession,
+    *,
+    wallet_id: int,
+    block_number: int | None = None,
+) -> TrackedWallet | None:
+    row = await db.get(TrackedWallet, wallet_id)
+    if not row:
+        return None
+    if block_number is not None:
+        row.last_checked_block = max(int(block_number), int(row.last_checked_block or 0))
+    row.last_checked_at = utc_now()
+    row.updated_at = utc_now()
+    await db.flush()
+    return row
+
+
+async def upsert_wallet_event(
+    db: AsyncSession,
+    *,
+    tracked_wallet_id: int,
+    tenant_id: int,
+    wallet_address: str,
+    ca: str,
+    direction: str,
+    tx_hash: str,
+    block_number: int | None = None,
+    amount: float | None = None,
+    amount_usd: float | None = None,
+    event_type: str = "erc20_transfer",
+    event_json: dict[str, Any] | None = None,
+    status: str = "new",
+) -> tuple[WalletEvent, bool]:
+    wallet_address = normalize_ca(wallet_address)
+    ca = normalize_ca(ca)
+    direction = direction[:16]
+    stmt = select(WalletEvent).where(
+        WalletEvent.tx_hash == tx_hash,
+        WalletEvent.wallet_address == wallet_address,
+        WalletEvent.ca == ca,
+        WalletEvent.direction == direction,
+    )
+    row = await db.scalar(stmt)
+    if row:
+        return row, False
+    row = WalletEvent(
+        tracked_wallet_id=tracked_wallet_id,
+        tenant_id=tenant_id,
+        wallet_address=wallet_address,
+        ca=ca,
+        direction=direction,
+        event_type=event_type[:32],
+        amount=amount,
+        amount_usd=amount_usd,
+        tx_hash=tx_hash[:128],
+        block_number=block_number,
+        event_json=event_json or {},
+        status=status[:32],
+    )
+    db.add(row)
+    await db.flush()
+    return row, True
+
+
+async def list_recent_wallet_events_for_ca(
+    db: AsyncSession,
+    *,
+    ca: str,
+    since: datetime,
+    limit: int = 20,
+) -> list[WalletEvent]:
+    stmt = (
+        select(WalletEvent)
+        .where(WalletEvent.ca == normalize_ca(ca), WalletEvent.created_at >= since)
+        .order_by(WalletEvent.created_at.desc())
+        .limit(limit)
+    )
     return list(await db.scalars(stmt))
 
 
@@ -934,6 +1339,65 @@ async def record_api_budget_event(
     status_code: int | None = None,
 ) -> None:
     db.add(ApiBudgetEvent(provider=provider, endpoint=endpoint or None, cost_units=cost_units, status_code=status_code))
+
+
+async def record_nitter_health_log(
+    db: AsyncSession,
+    *,
+    base_url: str = "",
+    status: str,
+    detail: str = "",
+    response_ms: int | None = None,
+    item_count: int = 0,
+) -> None:
+    db.add(
+        NitterHealthLog(
+            base_url=base_url or None,
+            status=status,
+            detail=detail[:2000] if detail else None,
+            response_ms=response_ms,
+            item_count=int(item_count or 0),
+        )
+    )
+
+
+async def record_socialdata_usage_log(
+    db: AsyncSession,
+    *,
+    endpoint: str,
+    query_hash: str = "",
+    mode: str = "",
+    result_count: int = 0,
+    triggered_by_alpha: bool = False,
+    alpha_reason: str = "",
+) -> None:
+    db.add(
+        SocialDataUsageLog(
+            endpoint=endpoint,
+            query_hash=query_hash or None,
+            mode=mode or None,
+            result_count=int(result_count or 0),
+            triggered_by_alpha=bool(triggered_by_alpha),
+            alpha_reason=alpha_reason[:128] if alpha_reason else None,
+        )
+    )
+
+
+async def get_api_budget_usage(
+    db: AsyncSession,
+    *,
+    provider: str,
+    since: datetime,
+    endpoint: str | None = None,
+) -> int:
+    query = select(func.coalesce(func.sum(ApiBudgetEvent.cost_units), 0)).where(
+        ApiBudgetEvent.provider == provider,
+        ApiBudgetEvent.created_at >= since,
+    )
+    if endpoint:
+        query = query.where(ApiBudgetEvent.endpoint == endpoint)
+    value = await db.scalar(query)
+    return int(value or 0)
 
 
 async def audit_event(

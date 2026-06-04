@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,9 +9,12 @@ from database import (
     Launch,
     complete_token_research,
     fail_token_research,
+    get_deployer_history,
     get_launch,
+    list_recent_wallet_events_for_ca,
     start_token_research,
     upsert_historical_launch,
+    utc_now,
 )
 
 
@@ -124,6 +127,82 @@ def build_source_snapshot(launch: Launch) -> dict[str, Any]:
     }
 
 
+def summarize_social_confirmation(launch: Launch) -> dict[str, Any]:
+    raw = launch.raw_json or {}
+    evidence = raw.get("social_confirmation") or {}
+    social_evidence = evidence.get("social_evidence") or {}
+    top_authors = evidence.get("top_authors") or []
+    top_tweets = social_evidence.get("top_tweets") or []
+    return {
+        "ca_verified": bool(evidence.get("verified")),
+        "qualified_tweets": int(evidence.get("qualified_tweets") or 0),
+        "min_required": int(evidence.get("min_required") or 0),
+        "total_followers": int(evidence.get("total_followers") or 0),
+        "total_likes": int(evidence.get("total_likes") or 0),
+        "total_retweets": int(evidence.get("total_retweets") or 0),
+        "max_score": int(evidence.get("max_score") or 0),
+        "avg_thesis_quality": float(evidence.get("avg_thesis_quality") or 0),
+        "top_authors": top_authors[:5],
+        "evidence_thesis": social_evidence.get("thesis") or "",
+        "value_assessment": social_evidence.get("value_assessment") or "",
+        "social_score": int(social_evidence.get("social_score") or 0),
+        "score_breakdown": social_evidence.get("score_breakdown") or {},
+        "project_value": social_evidence.get("project_value") or "",
+        "project_value_score": int(social_evidence.get("project_value_score") or 0),
+        "evidence_count": int(social_evidence.get("evidence_count") or len(top_tweets)),
+        "evidence_tweets": top_tweets[:24],
+        "hermes_agent": social_evidence.get("agent") or {},
+    }
+
+
+def deployer_key_from_source(source_info: dict[str, Any]) -> str:
+    return (
+        source_info.get("x_username")
+        or source_info.get("deployer_wallet")
+        or ""
+    ).strip()
+
+
+def summarize_deployer_history(rows: list[Any]) -> dict[str, Any]:
+    dead_statuses = {"expired", "skipped", "failed"}
+    previous_count = len(rows)
+    dead_count = sum(1 for row in rows if (row.final_status or "").lower() in dead_statuses)
+    signaled_count = sum(1 for row in rows if (row.final_status or "").lower() == "signaled")
+    max_mcap = max((float(row.max_mcap or 0) for row in rows), default=0.0)
+    recent = [
+        {
+            "ca": row.ca,
+            "ticker": row.ticker,
+            "status": row.final_status,
+            "max_mcap": float(row.max_mcap or 0),
+        }
+        for row in rows[:5]
+    ]
+    return {
+        "previous_launches": previous_count,
+        "dead_launches": dead_count,
+        "signaled_launches": signaled_count,
+        "dead_ratio": round(dead_count / previous_count, 2) if previous_count else 0.0,
+        "best_previous_mcap": max_mcap,
+        "recent": recent,
+    }
+
+
+def summarize_wallet_events(rows: list[Any]) -> dict[str, Any]:
+    inflow = [row for row in rows if (row.direction or "").lower() == "in"]
+    outflow = [row for row in rows if (row.direction or "").lower() == "out"]
+    inflow_wallets = sorted({row.wallet_address for row in inflow})
+    outflow_wallets = sorted({row.wallet_address for row in outflow})
+    return {
+        "inflow_events": len(inflow),
+        "outflow_events": len(outflow),
+        "inflow_wallets": len(inflow_wallets),
+        "outflow_wallets": len(outflow_wallets),
+        "recent_inflow_wallets": inflow_wallets[:5],
+        "recent_outflow_wallets": outflow_wallets[:5],
+    }
+
+
 def build_research_flags(launch: Launch, market: dict[str, Any], source_info: dict[str, Any]) -> list[str]:
     flags: list[str] = []
     source = (launch.source or "").lower()
@@ -163,10 +242,35 @@ async def run_research_pipeline(
     )
     try:
         dex = dex or launch.market_json or {}
-        await upsert_historical_launch(db, launch=launch)
         market = build_market_snapshot(dex)
         source_info = build_source_snapshot(launch)
+        deployer_key = deployer_key_from_source(source_info)
+        await upsert_historical_launch(db, launch=launch, deployer=deployer_key or None)
+        deployer_history_rows = await get_deployer_history(
+            db,
+            deployer=deployer_key,
+            since=utc_now() - timedelta(days=365),
+            exclude_ca=launch.ca,
+            limit=50,
+        ) if deployer_key else []
+        deployer_history = summarize_deployer_history(deployer_history_rows)
+        wallet_event_rows = await list_recent_wallet_events_for_ca(
+            db,
+            ca=launch.ca,
+            since=utc_now() - timedelta(minutes=60),
+            limit=50,
+        )
+        smart_money = summarize_wallet_events(wallet_event_rows)
+        social_confirmation = summarize_social_confirmation(launch)
         flags = build_research_flags(launch, market, source_info)
+        if social_confirmation["ca_verified"]:
+            flags.append("ca_verified_social")
+        if social_confirmation["qualified_tweets"] >= 5:
+            flags.append("qualified_social_confirmation")
+        if smart_money["inflow_wallets"] >= 1:
+            flags.append("tracked_wallet_inflow")
+        if smart_money["inflow_wallets"] >= 3:
+            flags.append("smart_wallet_convergence")
         processed = {
             "schema": "token-research-v2.1",
             "symbol": (launch.ticker or "").lstrip("$"),
@@ -180,6 +284,11 @@ async def run_research_pipeline(
                 "x_username": source_info.get("x_username"),
                 "tweet_url": source_info.get("tweet_url"),
                 "website_url": source_info.get("website_url"),
+                **social_confirmation,
+            },
+            "deployer": {
+                "key": deployer_key,
+                **deployer_history,
             },
             "onchain": {
                 "provider": "stub",
@@ -187,6 +296,7 @@ async def run_research_pipeline(
                 "bundle": {},
                 "holder_distribution": "pending",
             },
+            "smart_money": smart_money,
             "flags": flags,
             "brief_inputs": {
                 "market_line": (

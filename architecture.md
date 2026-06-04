@@ -49,7 +49,6 @@ main.py                       Main bot runtime, polling, commands, formatting, i
 database.py                   Async SQLAlchemy schema, engine/session, repository helpers
 settings.py                   Typed environment settings and DB URL resolution
 research_pipeline.py          Deterministic auto-verdict scoring and formatting
-trader.py                     Optional on-chain buy/sell helpers, disabled by default
 worker.py                     RQ-compatible enrichment worker skeleton
 maintenance.py                Retention cleanup job entrypoint
 services/                     Import-safe service boundaries for delivery, tenants, queueing, logs
@@ -69,7 +68,7 @@ Runtime-generated local files:
 
 ```text
 blocklist.json                Blocked X accounts, local or /data on hosted deployments
-data/tracked_wallets.json     User-tracked wallets, local or /data on hosted deployments
+data/tracked_wallets.json     Legacy tracked-wallet import file; runtime tracking is DB-backed
 bot.log                       Local screen-session log file
 ```
 
@@ -82,6 +81,7 @@ Owns the running bot process:
 - Reads environment configuration.
 - Starts Telegram long polling.
 - Clears pending Telegram updates on startup with `deleteWebhook(drop_pending_updates=True)`.
+- Registers any private `/start` user as an active Telegram tenant.
 - Polls launch sources.
 - Enriches tokens with DexScreener/GeckoTerminal market data.
 - Applies market/source filters.
@@ -122,6 +122,8 @@ Tenant, User, TenantMember, TenantSettings
 Launch, Verdict, VerdictCache
 Signal, SignalDelivery
 ProviderCooldown, ApiBudgetEvent, AuditEvent, BotState
+UserWatchlist, UserFeedback
+TrackedWallet, WalletEvent
 ```
 
 Critical uniqueness:
@@ -137,12 +139,12 @@ signal_deliveries(signal_id, tenant_id, channel)
 
 Import-safe modules under `services/` keep future workers from importing `main.py`:
 
-- `services.delivery`: single-tenant delivery preparation and 1000-tenant fanout row creation.
-- `services.tenants`: Telegram tenant bootstrap.
+- `services.delivery`: signal-level delivery fanout and delivery ledger creation.
+- `services.tenants`: Telegram tenant bootstrap with self-serve DM defaults.
 - `services.queueing`: Redis/RQ queue helpers with deterministic job ids.
 - `services.observability`: JSON event logging and correlation ids.
 - `services.research_pipeline`: Phase 2 token research persistence and deterministic feature extraction.
-- `services.spoof_detector`: Phase 2 spoof/ticker-reuse/fake-volume, thin-liquidity, paid-attention and flow-imbalance heuristics.
+- `services.spoof_detector`: Phase 2 spoof/same-ticker collision, fake-volume, thin-liquidity, paid-attention and flow-imbalance heuristics.
 - `services.verdict_v2`: Phase 2 structured 0-100 verdict scoring and compact Telegram AI brief output.
 - `services.ai_summary`: AI-summary cache with a deterministic stub provider.
 - `services.token_intelligence`: Phase 2 aggregator for research, spoof signals, verdict and summary.
@@ -158,10 +160,30 @@ historical_launches  ticker/deployer history for spoof and reuse checks
 spoof_signals        persisted deterministic spoof/risk signals
 verdict_v2           versioned structured verdicts with 0-100 score
 ai_summaries         cached human summaries; provider is currently stub
+user_watchlists      per-tenant watched Base contracts and last market snapshot
+user_feedback        per-tenant Worth watching / Skip feedback for future ranking
+tracked_wallets      per-tenant Base wallets watched for smart-money confirmation
+wallet_events        idempotent ERC-20 transfer/event ledger for tracked wallets
 ```
+
+Phase 4 wallet tracking is feature-flagged with `WALLET_MONITOR_ENABLED=false` by
+default. `/track`, `/untrack` and `/wallets` are DB-backed now. When enabled with a Base
+Alchemy RPC URL, the bot polls ERC-20 transfers for tracked wallets and stores matching
+events in `wallet_events`. Recent tracked-wallet inflow/outflow is copied into
+`token_research.processed_data.smart_money` and can boost/risk-adjust Verdict 2.0 output.
+
+Same-ticker collision is intentionally narrow: it only flags other Base contracts with the
+same normalized ticker when they are fresh under `MAX_TOKEN_AGE` and independently pass
+the active market filters. The Telegram AI brief shows this as one short risk line, while
+`/spoof_check` can inspect the stored evidence.
 
 Telegram commands:
 
+- `/start`
+- `/help`
+- `/status`
+- `/research $TICKER`
+- `/research 0xCONTRACT`
 - `/verdict2 0xCONTRACT`
 - `/spoof_check 0xCONTRACT`
 - `/summary 0xCONTRACT`
@@ -187,20 +209,9 @@ The legacy module still:
 - Scores market data, deployer identity, notable X mentions, and watched influencer mentions.
 - Uses a semaphore controlled by `AUTO_VERDICT_MAX_CONCURRENT`.
 - Caches verdicts by token address for 15 minutes.
-- Formats a concise `AI brief (deterministic)` block.
+- Formats the compact `AI brief` placeholder used before Verdict 2.0 enrichment.
 
 This module does not call an LLM yet. It provides the slot and shape for a future AI summary.
-
-### `trader.py`
-
-Contains optional Uniswap V3 SwapRouter buy/sell helpers on Base.
-
-Current safety posture:
-
-- `ALLOW_UNSAFE_TRADING=false` by default.
-- `buy_token()` and `sell_token()` return an error unless `ALLOW_UNSAFE_TRADING=true`.
-- The existing unsafe path still uses `amountOutMinimum=0`; it must not be enabled until
-  quote/minOut protection, nonce serialization, and async-safe execution are implemented.
 
 ## External Services
 
@@ -211,6 +222,7 @@ Current safety posture:
 | Bankr | `https://api.bankr.bot/token-launches` | Primary Base launchpad source |
 | Clanker | `https://www.clanker.world/api/tokens` | Base launchpad source |
 | DexScreener | `https://api.dexscreener.com/token-profiles/latest/v1`, `token-boosts/latest/v1`, `community-takeovers/latest/v1` | Base DEX discovery source |
+| CoinGecko Onchain | `https://api.coingecko.com/api/v3/onchain/networks/base/new_pools` | Base new-pools DEX discovery source |
 | Virtuals | `https://api2.virtuals.io/api/virtuals` | Virtuals agent launches |
 
 Bankr currently exposes the 50 most recent launches; `offset` is not treated as a
@@ -219,8 +231,13 @@ reliable pagination contract. Clanker uses offset pagination with `limit=10`,
 `chainId=8453` for Base.
 DexScreener discovery is filtered to `chainId=base`, deduped by token CA, then enriched
 with `https://api.dexscreener.com/tokens/v1/base/{tokenAddresses}` in batches of up to 30.
-Unlike Bankr/Clanker/Virtuals, DexScreener is not a safe launchpad source, so liquidity
-filtering stays enabled.
+CoinGecko discovery is polled conservatively through Demo API auth with
+`x-cg-demo-api-key`; local defaults cap it to one Base `new_pools` call every 720 seconds
+(5 calls/hour, about 3.6k calls/month). It is a gap-filler source: if Bankr, Clanker or
+DexScreener already inserted the CA, the DB dedupe skips the CoinGecko duplicate; otherwise
+the Base pool is added to the normal filter/recheck pipeline.
+Unlike Bankr/Clanker/Virtuals, DexScreener and CoinGecko are not safe launchpad sources,
+so liquidity filtering stays enabled.
 
 ### Market Data
 
@@ -272,34 +289,30 @@ Signal buttons include:
 | WhatsApp via Whapi | Optional |
 | Pushover | Optional emergency-style alert |
 
-### Optional Execution
-
-| Integration | Status |
-| --- | --- |
-| Bankr Agent API | Optional `AUTO_EXECUTE`, currently off locally |
-| On-chain Uniswap V3 execution | Present in `trader.py`, fail-closed |
-| Banana Gun | External Telegram deep link button only |
-
 ## Telegram UX
 
 Current signal structure:
 
 ```text
-📡 $SYMBOL · Token Name
-Source · @deployer
+🚨 New Launch SOURCE
 
-📊 Snapshot
-├ MCap ... · Vol ... · Liq ...
-└ 1h ... · Age ...
+Token Name - $SYMBOL
 
-🎯 Why surfaced
-└ concise deterministic reason
+🕐 Launched: age
+•💰 Market Cap.: ...
+•📈 Volume: ...
+•💧 Liquidity: ...
+•🟢 1h: ...
+
+🔗 DexScreener · GMGN · Tweet · Uniswap
 
 🧠 AI brief (placeholder)
-├ source/age/data status
-└ next check
+• Type of token
+• Owner
+• Product
+• Focus
+• Risks
 
-🔗 Gecko · GMGN · Source/Tweet · Uniswap
 CA
 /research CA
 ```
@@ -307,18 +320,20 @@ CA
 After deterministic verdict enrichment, the placeholder is replaced with:
 
 ```text
-🧠 AI brief (deterministic) · LABEL score/10
-├ Why: strongest reasons
-├ Risk: strongest risks
-└ X: strongest social signal
+🧠 AI brief · Score score/10 · LABEL
+• Type
+• Owner
+• Product
+• Focus
+• Risks
+
+Split: Market 0/30 · Deployer 0/25 · Social 0/30 · Risk 0/10 · Narrative 0/5
 ```
 
 Keyboard order is research-first:
 
 1. X Research
-2. Gecko / GMGN
-3. Copy CA / Ticker X
-4. Banana Gun
+2. Worth watching / Skip
 
 ## Filtering Model
 
@@ -349,36 +364,36 @@ recheck workers are split out.
 
 General:
 
-- `/start`
+- `/start` — registers the private chat as an active DM tenant and shows the English introduction.
 - `/help`
 - `/status`
-- `/test`
 
 Research:
 
 - `/research $TICKER`
 - `/research 0xCONTRACT`
 - `/r $TICKER`
+- `/verdict2 0xCONTRACT`
+- `/spoof_check 0xCONTRACT`
+- `/summary 0xCONTRACT`
 
-Wallet tracking:
+Retention:
 
+- `/watch 0xCONTRACT [label]`
+- `/unwatch 0xCONTRACT`
+- `/watchlist`
+- `/settings`
+- `/settings min_score 7.5`
+
+Admin-only:
+
+- `/test`
 - `/track 0xADDRESS [label]`
 - `/untrack 0xADDRESS`
 - `/wallets`
-
-Moderation:
-
 - `/block @username`
 - `/unblock @username`
 - `/blocklist`
-
-Trading/admin-gated:
-
-- `/wallet`
-- `/buy 0xADDRESS 20`
-- `/sell 0xADDRESS 50`
-
-Trading commands require `TRADING_ENABLED=true` and an authorized `TRADER_USER_IDS` match.
 
 ## Environment Variables
 
@@ -386,16 +401,19 @@ Required for core bot:
 
 ```text
 TELEGRAM_BOT_TOKEN
-TELEGRAM_CHAT_ID
 SOCIALDATA_API_KEY
+```
+
+Optional default destination:
+
+```text
+TELEGRAM_CHAT_ID          Default group/chat tenant; public DM subscriptions work without it
 ```
 
 Access control:
 
 ```text
-AUTHORIZED_USER_IDS       Comma-separated Telegram user IDs allowed to DM commands
-TRADER_USER_IDS           Comma-separated Telegram user IDs allowed to use trading commands
-TRADER_USER_ID            Legacy single-user fallback
+AUTHORIZED_USER_IDS       Comma-separated Telegram user IDs allowed to admin commands
 ```
 
 Filters:
@@ -423,6 +441,14 @@ Market data runtime:
 
 ```text
 GECKO_COOLDOWN_SEC        default 60
+WATCHLIST_CHECK_INTERVAL  default 900
+WATCHLIST_CHECK_BATCH     default 100
+WATCHLIST_NOTIFY_MCAP_CHANGE_PCT default 50
+WATCHLIST_NOTIFY_VOLUME_CHANGE_PCT default 100
+WALLET_MONITOR_ENABLED default false
+WALLET_POLL_INTERVAL    default 60
+WALLET_POLL_BATCH       default 50
+WALLET_LOOKBACK_BLOCKS  default 1200
 ```
 
 Optional notifications:
@@ -434,22 +460,10 @@ PUSHOVER_USER_KEY
 PUSHOVER_API_TOKEN
 ```
 
-Optional Bankr API execution:
+Wallet monitoring:
 
 ```text
-AUTO_EXECUTE              default false
-BANKR_EXECUTION_API_KEY
-BANKR_BUY_AMOUNT          default 100
-```
-
-Optional on-chain trading:
-
-```text
-TRADING_ENABLED           default false
-ALCHEMY_RPC_URL
-PRIVATE_KEY
-ALLOW_UNSAFE_TRADING      default false, should remain false for now
-SLIPPAGE_BPS              default 1000, currently not enough protection by itself
+ALCHEMY_RPC_URL           Required only when WALLET_MONITOR_ENABLED=true
 ```
 
 ## Startup Flow
@@ -498,12 +512,9 @@ flowchart TD
 
 ## Security And Safety Notes
 
-- Telegram trading is fail-closed unless `TRADER_USER_IDS` is configured.
 - Stale Telegram updates are dropped on startup.
-- Trade commands/callbacks have freshness checks.
 - Telegram message formatting escapes external/user-derived values where signal output is built.
-- On-chain trading remains disabled by default because the current unsafe path does not yet
-  implement reliable quote/minOut protection.
+- Trading/execution code is intentionally not part of the bot runtime.
 - `.env.local` and secrets should not be committed.
 
 ## Known Gaps / Next Work
@@ -511,6 +522,5 @@ flowchart TD
 - Connect a real AI model behind the existing `AI brief` slot.
 - Add a SocialData request budget/cache beyond the current follower cache.
 - Split `main.py` into clearer modules once behavior stabilizes.
-- Implement safe on-chain trading before enabling `ALLOW_UNSAFE_TRADING`.
 - Add tests for signal formatting, verdict formatting, and filter behavior.
 - Decide whether text links should be reduced further now that inline buttons carry most actions.

@@ -60,6 +60,7 @@ async def analyze_token_intelligence(
             "verdict_id": verdict.get("id"),
             "score": verdict.get("score"),
             "label": verdict.get("label"),
+            "social_score": (((research.get("processed_data") or {}).get("social") or {}).get("social_score")),
             "spoof_signals": len(spoof),
         },
     )

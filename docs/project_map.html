@@ -1,0 +1,849 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Карта проекта bankr-Xlaunches-alerts</title>
+  <style>
+    :root {
+      --bg: #0f1720;
+      --nav: #101b27;
+      --panel: #162230;
+      --panel2: #1d2d3d;
+      --panel3: #22364a;
+      --text: #eef5fb;
+      --muted: #9fb0bf;
+      --line: #304457;
+      --accent: #67d3ff;
+      --green: #64d887;
+      --yellow: #ffd36b;
+      --red: #ff7b7b;
+      --code: #0a1018;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.55;
+    }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 285px minmax(0, 1fr);
+      min-height: 100vh;
+    }
+
+    nav {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      overflow: auto;
+      padding: 24px 18px;
+      background: var(--nav);
+      border-right: 1px solid var(--line);
+    }
+
+    nav h1 {
+      margin: 0 0 6px;
+      font-size: 18px;
+      line-height: 1.2;
+    }
+
+    nav .subtitle {
+      margin: 0 0 18px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    nav a {
+      display: block;
+      padding: 7px 8px;
+      border-radius: 6px;
+      color: #d9e8f4;
+      font-size: 14px;
+    }
+
+    nav a:hover {
+      background: var(--panel2);
+      text-decoration: none;
+    }
+
+    main {
+      max-width: 1280px;
+      padding: 34px 40px 80px;
+    }
+
+    header {
+      margin-bottom: 26px;
+      padding-bottom: 24px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    h2 {
+      margin: 0 0 8px;
+      font-size: 34px;
+      line-height: 1.1;
+      letter-spacing: 0;
+    }
+
+    h3 {
+      margin: 0 0 14px;
+      font-size: 24px;
+      letter-spacing: 0;
+    }
+
+    h4 {
+      margin: 20px 0 10px;
+      font-size: 17px;
+      letter-spacing: 0;
+    }
+
+    p { margin: 8px 0 12px; }
+    ul { margin: 8px 0 14px; padding-left: 22px; }
+    li { margin: 5px 0; }
+
+    header p,
+    .muted {
+      color: var(--muted);
+    }
+
+    section {
+      margin: 30px 0;
+      padding: 24px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .grid3 {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .grid4 {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .card,
+    .kpi,
+    .flow-card {
+      padding: 15px;
+      background: var(--panel2);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+
+    .card h4,
+    .flow-card h4 {
+      margin-top: 0;
+    }
+
+    .kpi .value {
+      display: block;
+      margin: 0 0 4px;
+      font-size: 28px;
+      line-height: 1;
+      font-weight: 750;
+      color: #ffffff;
+    }
+
+    .kpi .label {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .tag {
+      display: inline-block;
+      margin: 2px 4px 2px 0;
+      padding: 2px 7px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: #dcecf8;
+      background: #101927;
+      font-size: 12px;
+    }
+
+    .good { color: var(--green); }
+    .warn { color: var(--yellow); }
+    .bad { color: var(--red); }
+
+    code,
+    pre {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    }
+
+    code {
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: var(--code);
+      color: #dff7ff;
+    }
+
+    pre {
+      overflow: auto;
+      padding: 14px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: var(--code);
+      color: #eaf6ff;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 12px 0;
+      font-size: 14px;
+    }
+
+    th,
+    td {
+      vertical-align: top;
+      padding: 9px 10px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    th {
+      text-align: left;
+      color: #ffffff;
+      background: #13202d;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 12px;
+      align-items: stretch;
+      margin: 16px 0;
+    }
+
+    .flow-node {
+      position: relative;
+      min-height: 118px;
+      padding: 14px;
+      background: var(--panel3);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }
+
+    .flow-node:not(:last-child)::after {
+      content: "→";
+      position: absolute;
+      right: -16px;
+      top: 42%;
+      color: var(--accent);
+      font-size: 22px;
+      font-weight: 700;
+      z-index: 2;
+    }
+
+    .flow-node strong {
+      display: block;
+      margin-bottom: 6px;
+      color: #ffffff;
+    }
+
+    .flow-node span {
+      display: block;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .swimlane {
+      display: grid;
+      grid-template-columns: 180px minmax(0, 1fr);
+      gap: 12px;
+      margin: 12px 0;
+      align-items: stretch;
+    }
+
+    .lane-title {
+      padding: 14px;
+      background: #13202d;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      font-weight: 700;
+    }
+
+    .lane-steps {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .mini-step {
+      padding: 12px;
+      background: var(--panel2);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      font-size: 13px;
+    }
+
+    .mini-step strong {
+      display: block;
+      margin-bottom: 4px;
+      color: #ffffff;
+      font-size: 14px;
+    }
+
+    .source-map {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 10px;
+      margin: 14px 0;
+    }
+
+    .source-box {
+      padding: 12px;
+      min-height: 92px;
+      background: var(--panel2);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      text-align: center;
+    }
+
+    .source-box strong {
+      display: block;
+      margin-bottom: 5px;
+    }
+
+    .source-box span {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 12px 0 0;
+    }
+
+    .legend span {
+      padding: 4px 8px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #101927;
+      color: #dcecf8;
+      font-size: 12px;
+    }
+
+    @media (max-width: 1100px) {
+      .flow,
+      .source-map {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .flow-node:not(:last-child)::after { display: none; }
+      .lane-steps { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .grid4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    @media (max-width: 920px) {
+      .layout { display: block; }
+      nav {
+        position: relative;
+        height: auto;
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+      main { padding: 24px 18px 60px; }
+      .grid,
+      .grid3,
+      .grid4,
+      .flow,
+      .source-map,
+      .lane-steps,
+      .swimlane {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <nav>
+      <h1>Карта проекта</h1>
+      <p class="subtitle">bankr-Xlaunches-alerts<br>внутренний dashboard</p>
+      <a href="#summary">Сводка</a>
+      <a href="#rules">Правила бота и агента</a>
+      <a href="#visual-flow">Визуальный flow</a>
+      <a href="#sources">Источники токенов</a>
+      <a href="#filters">Фильтры и verdict</a>
+      <a href="#social">X / SocialData / Nitter</a>
+      <a href="#telegram">Telegram UX</a>
+      <a href="#database">База данных</a>
+      <a href="#files">Карта файлов</a>
+      <a href="#services">Сервисы</a>
+      <a href="#commands">Команды</a>
+      <a href="#config">Конфиг</a>
+      <a href="#deployment">Деплой и VM</a>
+      <a href="#tests">Тесты и проверки</a>
+      <a href="#debug">Debug cheatsheet</a>
+    </nav>
+
+    <main>
+      <header>
+        <h2>bankr-Xlaunches-alerts</h2>
+        <p>
+          Telegram-бот для мониторинга ранних запусков токенов на Base. Он собирает новые
+          пары из Bankr, Clanker, Virtuals, DexScreener и CoinGecko, применяет жесткие
+          фильтры, сохраняет состояние в БД, обогащает токены market/social/spoof research
+          и отправляет компактные сигналы пользователям в Telegram.
+        </p>
+      </header>
+
+      <section id="summary">
+        <h3>Сводка</h3>
+        <div class="grid4">
+          <div class="kpi"><span class="value">5</span><span class="label">источников новых запусков</span></div>
+          <div class="kpi"><span class="value">21</span><span class="label">основная таблица / ledger</span></div>
+          <div class="kpi"><span class="value">4</span><span class="label">Alembic-миграции</span></div>
+          <div class="kpi"><span class="value">14</span><span class="label">регрессионных тестов в текущем suite</span></div>
+        </div>
+
+        <div class="grid3" style="margin-top:14px;">
+          <div class="card">
+            <h4>Главная задача</h4>
+            <p>Поймать свежий Base launch раньше шума, но не отправлять слабые или неподтвержденные токены как сильные сигналы.</p>
+            <span class="tag">Base</span>
+            <span class="tag">Telegram</span>
+            <span class="tag">Early launch scanner</span>
+          </div>
+          <div class="card">
+            <h4>Текущий стек</h4>
+            <p>Python async, SQLAlchemy async, Alembic, Redis/RQ, Telegram polling, SocialData, приватный Nitter, DexScreener, GeckoTerminal, CoinGecko.</p>
+          </div>
+          <div class="card">
+            <h4>Production shape</h4>
+            <p>VM + systemd: bot, worker, private Nitter, Nitter Redis, firewall. Postgres/Redis для прод-состояния и очередей.</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="rules">
+        <h3>Коротко: правила бота и агента</h3>
+        <p>Hermes source of truth лежит в корне проекта: <code>identity.md</code>, <code>agents.md</code>, <code>memory.md</code>.</p>
+        <div class="grid">
+          <div class="card">
+            <h4>Бот</h4>
+            <ul>
+              <li>Детерминированный Base launch scanner.</li>
+              <li>Источники: Bankr, Clanker, Virtuals, DexScreener, CoinGecko.</li>
+              <li>Один contract address = одна запись launch.</li>
+              <li>Слабые токены уходят в recheck / expire, а не форсятся в сигнал.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>Первичные фильтры</h4>
+            <ul>
+              <li>Market cap от 50K.</li>
+              <li>24h volume от 30K.</li>
+              <li>Liquidity от 30K для DEX-sourced токенов.</li>
+              <li>Bankr / Clanker / Virtuals пропускают liquidity check как launchpad/bonding sources.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>X / Social</h4>
+            <ul>
+              <li>SocialData — основной квалифицированный источник.</li>
+              <li>Минимум 5 qualified tweets.</li>
+              <li>Твит режется при <code>okai.hk/alpha</code>, views &lt; 50 или likes &lt; 5.</li>
+              <li>Для scoring CA валидируется отдельно; ticker-only твиты не подтверждают контракт.</li>
+              <li>Кнопка X Research может открывать ручной поиск <code>CA OR $TICKER</code>.</li>
+              <li>Nitter — fallback discovery, не scoring source.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>Агент</h4>
+            <ul>
+              <li>Консервативный Base launch analyst.</li>
+              <li>Работает только поверх уже отфильтрованного evidence.</li>
+              <li>Не переопределяет hard filters промптом.</li>
+              <li>Не хайпит и не выдумывает факты; выводит WAIT / WATCH / AVOID-style кратко.</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section id="visual-flow">
+        <h3>Визуальный flow</h3>
+        <h4>Основной pipeline сигнала</h4>
+        <div class="flow">
+          <div class="flow-node"><strong>1. Источники</strong><span>Bankr, Clanker, Virtuals, DexScreener, CoinGecko.</span></div>
+          <div class="flow-node"><strong>2. Нормализация</strong><span>CA, ticker, source, launch time, raw payload.</span></div>
+          <div class="flow-node"><strong>3. Market filters</strong><span>MCap, volume, liquidity, freshness, source-specific rules.</span></div>
+          <div class="flow-node"><strong>4. Research / Risk</strong><span>Verdict 2.0, spoof detector, same-ticker, social evidence.</span></div>
+          <div class="flow-node"><strong>5. Telegram</strong><span>Fanout, delivery ledger, retries, buttons, /research.</span></div>
+        </div>
+
+        <h4>Swimlane: что происходит после нового токена</h4>
+        <div class="swimlane">
+          <div class="lane-title">Scanner</div>
+          <div class="lane-steps">
+            <div class="mini-step"><strong>Fetch</strong>Забирает свежие launch/pool payloads.</div>
+            <div class="mini-step"><strong>Dedup</strong>Проверяет CA в <code>launches</code>.</div>
+            <div class="mini-step"><strong>Persist</strong>Сохраняет raw_json, source, статус.</div>
+            <div class="mini-step"><strong>Recheck</strong>Слабые/пустые данные ставит в очередь.</div>
+          </div>
+        </div>
+        <div class="swimlane">
+          <div class="lane-title">Research</div>
+          <div class="lane-steps">
+            <div class="mini-step"><strong>Market</strong>DexScreener / GeckoTerminal snapshot.</div>
+            <div class="mini-step"><strong>Social</strong>SocialData search с cache/budget.</div>
+            <div class="mini-step"><strong>Spoof</strong>Same-ticker и volume/liquidity risks.</div>
+            <div class="mini-step"><strong>Verdict</strong>Score, label, readable reasoning.</div>
+          </div>
+        </div>
+        <div class="swimlane">
+          <div class="lane-title">Delivery</div>
+          <div class="lane-steps">
+            <div class="mini-step"><strong>Signal</strong>Одна запись <code>signals</code> на CA.</div>
+            <div class="mini-step"><strong>Fanout</strong>Delivery rows по tenants.</div>
+            <div class="mini-step"><strong>Telegram</strong>Compact card + inline buttons.</div>
+            <div class="mini-step"><strong>Retry</strong>Ошибки отправки не теряются.</div>
+          </div>
+        </div>
+
+        <h4>Social/X flow</h4>
+        <div class="flow">
+          <div class="flow-node"><strong>Query</strong><span>CA OR $TICKER, Top / Latest / influencers.</span></div>
+          <div class="flow-node"><strong>Cache</strong><span>15m hit TTL, 5m empty TTL, stale до 24h.</span></div>
+          <div class="flow-node"><strong>SocialData</strong><span>Cursor pagination, budget cap, engagement metrics.</span></div>
+          <div class="flow-node"><strong>Hard filters</strong><span>OKAI spam, views, likes, duplicate, relevance.</span></div>
+          <div class="flow-node"><strong>Evidence</strong><span>Только qualified tweets попадают в research card.</span></div>
+        </div>
+      </section>
+
+      <section id="sources">
+        <h3>Источники токенов</h3>
+        <div class="source-map">
+          <div class="source-box"><strong>Bankr</strong><span>launchpad / safe source</span></div>
+          <div class="source-box"><strong>Clanker</strong><span>Base token launches</span></div>
+          <div class="source-box"><strong>Virtuals</strong><span>AI agent launches</span></div>
+          <div class="source-box"><strong>DexScreener</strong><span>profiles / boosts / CTO</span></div>
+          <div class="source-box"><strong>CoinGecko</strong><span>Base new pools</span></div>
+          <div class="source-box"><strong>GeckoTerminal</strong><span>market fallback</span></div>
+        </div>
+
+        <table>
+          <thead><tr><th>Источник</th><th>Функция</th><th>Зачем нужен</th><th>Особенность</th></tr></thead>
+          <tbody>
+            <tr><td>Bankr</td><td><code>fetch_bankr()</code></td><td>Новые Bankr launches.</td><td>Liquidity check пропускается.</td></tr>
+            <tr><td>Clanker</td><td><code>fetch_clanker()</code></td><td>Clanker-токены на Base.</td><td>Liquidity check пропускается.</td></tr>
+            <tr><td>Virtuals</td><td><code>fetch_virtuals()</code></td><td>AI agent launches.</td><td>Поллит несколько статусов.</td></tr>
+            <tr><td>DexScreener</td><td><code>fetch_dexscreener_discoveries()</code></td><td>Base discovery вне launchpad.</td><td>Полные market filters.</td></tr>
+            <tr><td>CoinGecko</td><td><code>fetch_coingecko_new_pools()</code></td><td>Base Onchain new pools.</td><td>Консервативный polling: 720s.</td></tr>
+            <tr><td>GeckoTerminal</td><td><code>fetch_geckoterminal()</code></td><td>Fallback по market data.</td><td>Rate guard + cooldown.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="filters">
+        <h3>Фильтры, Verdict 2.0 и риски</h3>
+        <div class="grid">
+          <div class="card">
+            <h4>Market filters</h4>
+            <ul>
+              <li><code>MIN_MCAP</code>: 50K.</li>
+              <li><code>MIN_VOLUME_24H</code>: 30K.</li>
+              <li><code>MIN_LIQUIDITY</code>: 30K для DEX-sourced.</li>
+              <li>Freshness/age учитывается для новых пар.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>Verdict 2.0</h4>
+            <ul>
+              <li><code>services/verdict_v2.py</code>.</li>
+              <li>Market, deployer, social, spoof, narrative scoring.</li>
+              <li>AI пока stub; детерминированный evidence главный.</li>
+              <li>Сохраняется в <code>verdict_v2</code>.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>Spoof detector</h4>
+            <ul>
+              <li><code>services/spoof_detector.py</code>.</li>
+              <li>Fresh same-ticker pairs, прошедшие фильтры.</li>
+              <li>Prior same-ticker launches, прошедшие фильтры.</li>
+              <li>Volume/liquidity imbalance.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>Research pipeline</h4>
+            <ul>
+              <li><code>services/research_pipeline.py</code>.</li>
+              <li>Source, market, deployer, wallet, flags snapshot.</li>
+              <li>Статусы pending / in_progress / completed / failed.</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section id="social">
+        <h3>X / SocialData / Nitter</h3>
+        <p>
+          SocialData — единственный источник, который может дать qualified social evidence,
+          потому что для наших правил нужны views/likes. Nitter помогает найти твиты, но
+          без SocialData-verification не повышает score.
+        </p>
+        <table>
+          <thead><tr><th>Правило</th><th>Дефолт</th><th>Зачем</th></tr></thead>
+          <tbody>
+            <tr><td>Минимум qualified tweets</td><td><code>5</code></td><td>Не считать одиночный пост social confirmation.</td></tr>
+            <tr><td>CA verification</td><td><code>CA-only</code></td><td>Ticker-only твиты не могут подтверждать конкретный смарт-контракт.</td></tr>
+            <tr><td>X Research button</td><td><code>CA OR $TICKER</code></td><td>Ручная широкая ссылка для человека; не scoring proof.</td></tr>
+            <tr><td>Views gate</td><td><code>50+</code></td><td>Отрезать low-engagement шум.</td></tr>
+            <tr><td>Likes gate</td><td><code>5+</code></td><td>Отрезать пустые посты.</td></tr>
+            <tr><td>Hard spam URL</td><td><code>okai.hk/alpha</code></td><td>Резать copytrading spam до scoring.</td></tr>
+            <tr><td>Search pages</td><td><code>4</code></td><td>Cursor pagination без uncontrolled spend.</td></tr>
+            <tr><td>Cache TTL</td><td><code>900s</code></td><td>Одинаковые запросы не жгут API.</td></tr>
+            <tr><td>Empty TTL</td><td><code>300s</code></td><td>Мусорные тикеры не дергаются повторно.</td></tr>
+            <tr><td>Stale TTL</td><td><code>86400s</code></td><td>Fallback при cooldown / budget cap.</td></tr>
+            <tr><td>Budget cap</td><td><code>30/min</code>, <code>240/hour</code></td><td>Защита ключа SocialData.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="telegram">
+        <h3>Telegram UX</h3>
+        <div class="grid">
+          <div class="card">
+            <h4>Сигнальная карточка</h4>
+            <ul>
+              <li>Источник, token name, ticker.</li>
+              <li>Age, market cap, volume, liquidity, 1h change.</li>
+              <li>Why surfaced / AI brief stub / score.</li>
+              <li>Risks: same-ticker, unresolved deployer, spoof signals.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>Inline buttons</h4>
+            <ul>
+              <li>X Research.</li>
+              <li>Worth watching / Skip.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>Delivery model</h4>
+            <ul>
+              <li>Пользователь подписывается через <code>/start</code> в DM.</li>
+              <li>Один signal fanout на tenants.</li>
+              <li>Delivery retry ledger сохраняется в БД.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>Research UX</h4>
+            <ul>
+              <li><code>/research &lt;ticker|ca&gt;</code>.</li>
+              <li>Тот же компактный стиль, что в сигналах.</li>
+              <li>Social block показывает только qualified tweets.</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section id="database">
+        <h3>База данных</h3>
+        <table>
+          <thead><tr><th>Таблица</th><th>Назначение</th></tr></thead>
+          <tbody>
+            <tr><td><code>tenants</code>, <code>users</code>, <code>tenant_members</code>, <code>tenant_settings</code></td><td>Подписчики, группы, DM, настройки доставки.</td></tr>
+            <tr><td><code>launches</code></td><td>Главный CA ledger: source, raw_json, market_json, status, recheck state.</td></tr>
+            <tr><td><code>signals</code>, <code>signal_deliveries</code></td><td>Сигнал и доставка по tenants, retry ledger.</td></tr>
+            <tr><td><code>verdicts</code>, <code>verdict_cache</code>, <code>verdict_v2</code></td><td>Verdict scoring и кеш.</td></tr>
+            <tr><td><code>token_research</code>, <code>historical_launches</code></td><td>Research pipeline, source/market/deployer history.</td></tr>
+            <tr><td><code>spoof_signals</code></td><td>Same-ticker, spoof, fake-volume risk evidence.</td></tr>
+            <tr><td><code>ai_summaries</code></td><td>Кеш AI summary stub / будущий AI output.</td></tr>
+            <tr><td><code>user_watchlists</code>, <code>user_feedback</code></td><td>Retention layer: watchlist, worth watching, skip.</td></tr>
+            <tr><td><code>tracked_wallets</code>, <code>wallet_events</code></td><td>Wallet tracking config и event ledger.</td></tr>
+            <tr><td><code>provider_cooldowns</code>, <code>api_budget_events</code>, <code>bot_state</code>, <code>audit_events</code></td><td>Resilience, API budget, persistent cache, audit trail.</td></tr>
+          </tbody>
+        </table>
+
+        <h4>Миграции</h4>
+        <ul>
+          <li><code>0001_initial_service_schema.py</code>: core schema.</li>
+          <li><code>0002_phase2_intelligent_verdict.py</code>: Verdict 2.0 / research / spoof / AI summary.</li>
+          <li><code>0003_phase3_user_retention.py</code>: watchlists / feedback.</li>
+          <li><code>0004_phase4_wallet_tracking.py</code>: tracked wallets / wallet events.</li>
+        </ul>
+      </section>
+
+      <section id="files">
+        <h3>Карта файлов</h3>
+        <table>
+          <thead><tr><th>Путь</th><th>Роль</th></tr></thead>
+          <tbody>
+            <tr><td><code>main.py</code></td><td>Основной runtime: Telegram, polling, sources, filters, SocialData, formatting.</td></tr>
+            <tr><td><code>database.py</code></td><td>Core SQLAlchemy models и repository helpers.</td></tr>
+            <tr><td><code>settings.py</code></td><td>Pydantic settings и database URL resolver.</td></tr>
+            <tr><td><code>research_pipeline.py</code></td><td>Legacy/current auto-verdict wrapper для signal attachments.</td></tr>
+            <tr><td><code>services/</code></td><td>Verdict, spoof, delivery, queueing, research, tenants, summaries.</td></tr>
+            <tr><td><code>models/</code></td><td>Phase 2-4 models: research, spoof, verdict, retention, wallet.</td></tr>
+            <tr><td><code>migrations/</code></td><td>Alembic schema evolution для SQLite/Postgres.</td></tr>
+            <tr><td><code>tests/</code></td><td>Persistence, fanout, SocialData, spoof, watchlist, wallet tests.</td></tr>
+            <tr><td><code>docs/</code></td><td>Runbooks, roadmap, architecture, project map.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="services">
+        <h3>Сервисы</h3>
+        <div class="grid">
+          <div class="card"><h4><code>services/delivery.py</code></h4><p>Idempotent signal fanout и tenant deliveries.</p></div>
+          <div class="card"><h4><code>services/tenants.py</code></h4><p>Создание Telegram tenants для group/DM.</p></div>
+          <div class="card"><h4><code>services/research_pipeline.py</code></h4><p>Persistent research snapshots.</p></div>
+          <div class="card"><h4><code>services/verdict_v2.py</code></h4><p>Category scoring и human-readable verdict.</p></div>
+          <div class="card"><h4><code>services/spoof_detector.py</code></h4><p>Same-ticker / spoof / volume-liquidity signals.</p></div>
+          <div class="card"><h4><code>services/ai_summary.py</code></h4><p>AI summary stub + cache boundary.</p></div>
+          <div class="card"><h4><code>services/token_intelligence.py</code></h4><p>Aggregator: research + spoof + verdict + summary.</p></div>
+          <div class="card"><h4><code>services/queueing.py</code></h4><p>Redis/RQ launch enrichment queue.</p></div>
+        </div>
+      </section>
+
+      <section id="commands">
+        <h3>Команды</h3>
+        <table>
+          <thead><tr><th>Команда</th><th>Доступ</th><th>Что делает</th></tr></thead>
+          <tbody>
+            <tr><td><code>/start</code></td><td>Public</td><td>Подписывает DM и показывает introduction.</td></tr>
+            <tr><td><code>/help</code></td><td>Public</td><td>Меню команд.</td></tr>
+            <tr><td><code>/status</code></td><td>Public</td><td>Runtime status, DB counters, cooldowns.</td></tr>
+            <tr><td><code>/research &lt;ticker|ca&gt;</code>, <code>/r</code></td><td>Public</td><td>Market + X + brief research card.</td></tr>
+            <tr><td><code>/verdict2 &lt;ca&gt;</code></td><td>Public</td><td>Запуск Verdict 2.0.</td></tr>
+            <tr><td><code>/spoof_check &lt;ca&gt;</code></td><td>Public</td><td>Spoof detector.</td></tr>
+            <tr><td><code>/summary &lt;ca&gt;</code></td><td>Public</td><td>AI summary stub.</td></tr>
+            <tr><td><code>/watch</code>, <code>/unwatch</code>, <code>/watchlist</code></td><td>Public</td><td>Watchlist слой.</td></tr>
+            <tr><td><code>/settings</code></td><td>Public</td><td>Personal min score.</td></tr>
+            <tr><td><code>/track</code>, <code>/untrack</code>, <code>/wallets</code></td><td>Admin</td><td>Wallet tracking.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="config">
+        <h3>Конфиг</h3>
+        <div class="grid">
+          <div class="card">
+            <h4>Core</h4>
+            <ul>
+              <li><code>TELEGRAM_BOT_TOKEN</code></li>
+              <li><code>SOCIALDATA_API_KEY</code></li>
+              <li><code>DATABASE_URL</code></li>
+              <li><code>REDIS_URL</code></li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>Providers</h4>
+            <ul>
+              <li><code>COINGECKO_API_KEY</code></li>
+              <li><code>NITTER_BASE_URL</code></li>
+              <li><code>WHAPI_TOKEN</code></li>
+              <li><code>PUSHOVER_TOKEN</code></li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>Safety</h4>
+            <ul>
+              <li>Trading/execution runtime removed.</li>
+              <li><code>LLM_SCORING_ENABLED=false</code></li>
+              <li><code>DATABASE_AUTO_CREATE=false</code> в prod.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>Budgets</h4>
+            <ul>
+              <li><code>SOCIALDATA_SEARCH_MAX_CALLS_PER_MIN</code></li>
+              <li><code>SOCIALDATA_SEARCH_MAX_CALLS_PER_HOUR</code></li>
+              <li><code>COINGECKO_POLL_INTERVAL</code></li>
+              <li><code>COINGECKO_RATE_LIMIT_PER_MIN</code></li>
+            </ul>
+          </div>
+        </div>
+        <p class="warn">
+          Не коммитить <code>.env.local</code>, <code>.env.production</code>, X cookies,
+          Nitter <code>sessions.jsonl</code>, Telegram token, SocialData key, CoinGecko key.
+        </p>
+      </section>
+
+      <section id="deployment">
+        <h3>Деплой и VM</h3>
+        <table>
+          <thead><tr><th>Компонент</th><th>Путь / service</th><th>Описание</th></tr></thead>
+          <tbody>
+            <tr><td>Код</td><td><code>/opt/bankr-Xlaunches-alerts</code></td><td>Production code на VM.</td></tr>
+            <tr><td>Env</td><td><code>.env.production</code></td><td>Секреты и production config.</td></tr>
+            <tr><td>Bot</td><td><code>bankr-bot.service</code></td><td>Запускает <code>main.py</code>.</td></tr>
+            <tr><td>Worker</td><td><code>bankr-worker.service</code></td><td>RQ worker.</td></tr>
+            <tr><td>Nitter</td><td><code>nitter-private.service</code></td><td>Private local X fallback.</td></tr>
+            <tr><td>Nitter Redis</td><td><code>nitter-redis.service</code></td><td>Redis container для Nitter.</td></tr>
+            <tr><td>Firewall</td><td><code>nitter-private-firewall.service</code></td><td>Закрывает Nitter ports наружу.</td></tr>
+          </tbody>
+        </table>
+        <pre><code>systemctl status bankr-bot.service bankr-worker.service
+journalctl -u bankr-bot.service --since "10 minutes ago" --no-pager
+python infra_check.py</code></pre>
+      </section>
+
+      <section id="tests">
+        <h3>Тесты и проверки</h3>
+        <pre><code>PYTHONPATH=. .venv/bin/python -m pytest -q tests/test_phase1_persistence.py</code></pre>
+        <ul>
+          <li>Launch dedupe / recheck persistence.</li>
+          <li>Fanout на 1000 tenants.</li>
+          <li>Watchlist / feedback / wallet persistence.</li>
+          <li>SocialData hard spam / engagement gate / cursor pagination / cache.</li>
+          <li>Same-ticker spoof detector и GeckoTerminal parser.</li>
+        </ul>
+      </section>
+
+      <section id="debug">
+        <h3>Debug cheatsheet</h3>
+        <table>
+          <thead><tr><th>Вопрос</th><th>Где смотреть</th></tr></thead>
+          <tbody>
+            <tr><td>Почему токен не попал в сигнал?</td><td><code>launches.status_reason</code>, market filters, recheck logs.</td></tr>
+            <tr><td>Почему X block пустой?</td><td>SocialData cache, min 5 tweets, views/likes gate, spam URL, dedupe.</td></tr>
+            <tr><td>Почему API расход высокий?</td><td><code>api_budget_events</code>, SocialData TTL, max pages, command spam.</td></tr>
+            <tr><td>Почему Telegram не отправил?</td><td><code>signal_deliveries</code>, retry ledger, Telegram logs.</td></tr>
+            <tr><td>Почему same-ticker не найден?</td><td><code>services/spoof_detector.py</code>, local history, GeckoTerminal parser.</td></tr>
+            <tr><td>Почему CoinGecko молчит?</td><td><code>COINGECKO_DISCOVERY_ENABLED</code>, key, poll interval, cooldown.</td></tr>
+            <tr><td>Почему Nitter не работает?</td><td><code>docs/nitter_private_runbook.md</code>, services, local curl, session validity.</td></tr>
+          </tbody>
+        </table>
+        <pre><code>select ca, ticker, source, status, status_reason, first_seen_at
+from launches
+order by first_seen_at desc
+limit 20;
+
+select provider, endpoint, count(*) calls, sum(cost_units) units
+from api_budget_events
+where created_at > now() - interval '1 hour'
+group by provider, endpoint
+order by units desc;
+
+select key, updated_at
+from bot_state
+where key like 'socialdata:search:%'
+order by updated_at desc
+limit 20;</code></pre>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

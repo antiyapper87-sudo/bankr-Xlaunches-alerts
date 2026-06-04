@@ -65,11 +65,9 @@ idempotency per tenant.
 
 | Finding | Current state | Decision |
 | --- | --- | --- |
-| Trading was fail-open | fixed: `TRADING_ENABLED=true` requires `TRADER_USER_IDS` | Leave as-is |
-| Unsafe on-chain trading | fixed: `ALLOW_UNSAFE_TRADING=false` blocks buy/sell | Leave disabled |
+| Trading runtime in bot | removed from command/callback/signal surface | Keep bot research-only |
 | Stale Telegram updates after restart | fixed: `deleteWebhook(drop_pending_updates=True)` on startup | Leave as-is |
 | Telegram send return type ambiguity | fixed: `send_telegram()` returns `int | None` | Leave as-is |
-| Auto-execute blocking signal send | fixed: auto-execute attaches result in background | Keep `AUTO_EXECUTE=false` |
 | Signal UI too noisy | first UX pass done | Iterate later |
 
 ## Fact Check: Proposed Framework

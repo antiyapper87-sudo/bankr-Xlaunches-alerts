@@ -37,7 +37,7 @@ Still intentionally out of Phase 1:
 - LLM scoring beyond the existing AI-summary placeholder.
 - Dynamic thresholds as active production filters.
 - Billing, Discord, Solana and advanced wallet tracking.
-- Unsafe on-chain trading.
+- Trading/execution; this bot stays research and monitoring only.
 
 ## Key Architecture Decision
 
@@ -78,7 +78,7 @@ Still rejected for Phase 1:
 
 - dynamic thresholds as active filters
 - LLM scoring
-- on-chain trading
+- trading/execution
 - subscriptions/Stripe
 - Discord
 - Solana
@@ -895,8 +895,6 @@ Feature flags:
 
 ```text
 AUTO_VERDICT_ENABLED=true
-TRADING_ENABLED=false
-ALLOW_UNSAFE_TRADING=false
 DYNAMIC_THRESHOLDS_ENABLED=false
 LLM_SCORING_ENABLED=false
 ```

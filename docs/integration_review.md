@@ -61,8 +61,8 @@ Current useful hooks:
 - `send_telegram()` and `edit_telegram_message()`
   - already return `message_id` and can edit existing messages
 
-- `build_trade_keyboard()`
-  - already has Banana Gun, X Research URL, Copy CA, Ticker X
+- `build_signal_keyboard()`
+  - already has X Research URL, Worth watching, Skip
 
 - `research_token()`
   - already does market data, deployer identity, notable X mentions, watched influencer mentions
@@ -363,7 +363,7 @@ Tasks:
 
 - Move `/track`, `/untrack`, `/wallets` state to SQLite.
 - Poll tracked wallets on Base.
-- Detect buys/sells.
+- Detect wallet inflow/outflow events.
 - Cross-reference recent signal addresses.
 - Add verdict boost/risk from wallet actions.
 
@@ -406,7 +406,7 @@ await send_alert_all(session, tg_text, wa_text, token_address=address, symbol=sy
 ### To this pattern:
 
 ```python
-keyboard = build_trade_keyboard(address, symbol)
+keyboard = build_signal_keyboard(address, symbol)
 message_id = await send_telegram(session, tg_text, reply_markup=keyboard)
 if WHAPI_TOKEN and WHATSAPP_GROUP_ID:
     await send_whatsapp(session, wa_text)
@@ -417,7 +417,7 @@ if AUTO_VERDICT_ENABLED and isinstance(message_id, int):
 
 Use `chat_id` explicitly. Do not hardcode `TELEGRAM_CHAT_ID` inside `attach_verdict()`.
 
-### `build_trade_keyboard()` can add Nitter safely:
+### `build_signal_keyboard()` can add Nitter safely:
 
 ```python
 NITTER_BASE = os.getenv("NITTER_BASE", "https://nitter.net").rstrip("/")
@@ -478,4 +478,3 @@ This gives us a production-friendly base. After that, add SQLite persistence and
   - Telegram edit succeeds
   - Telegram edit fails
   - verdict block fits below message limit
-
