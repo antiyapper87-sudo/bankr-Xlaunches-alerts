@@ -377,8 +377,15 @@ def test_signal_keyboard_is_research_only(monkeypatch):
         for button in row
     ]
 
-    assert labels == ["🔎 X Research", "⭐ Worth watching", "⏭ Skip"]
+    assert labels == ["🔎 X Research", "⭐ Worth watching", "📤 Share ticker"]
     assert all("Buy" not in label and "Banana" not in label for label in labels)
+    share_url = next(
+        button["url"]
+        for row in keyboard["inline_keyboard"]
+        for button in row
+        if button["text"] == "📤 Share ticker"
+    )
+    assert "%24FMT" in share_url
 
 
 def test_signal_keyboard_includes_fomo_when_enabled(monkeypatch):
@@ -396,7 +403,7 @@ def test_signal_keyboard_includes_fomo_when_enabled(monkeypatch):
     ]
 
     assert "👀 Fomo" in labels
-    assert "👥 Fomo holders" in labels
+    assert "🧬 Deep Research" in labels
     fomo_url = next(
         button["url"]
         for row in keyboard["inline_keyboard"]

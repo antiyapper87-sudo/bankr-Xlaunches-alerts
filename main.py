@@ -606,6 +606,12 @@ def build_x_research_url(token_address: str, symbol: str) -> str:
     return f"https://x.com/search?q={quote(query, safe='$')}&src=typed_query"
 
 
+def build_share_ticker_url(symbol: str) -> str:
+    clean_symbol = (symbol or "").strip().lstrip("$").upper()
+    text = f"${clean_symbol}" if clean_symbol else "Base token"
+    return f"https://t.me/share/url?text={quote(text)}"
+
+
 def build_signal_keyboard(token_address: str, symbol: str) -> dict:
     x_research_url = build_x_research_url(token_address, symbol)
     rows = [[{"text": "🔎 X Research", "url": x_research_url}]]
@@ -613,11 +619,11 @@ def build_signal_keyboard(token_address: str, symbol: str) -> dict:
         ca = token_address.lower()
         rows.append([
             {"text": "👀 Fomo", "url": build_fomo_url(ca, FOMO_DEFAULT_CHAIN_ID)},
-            {"text": "👥 Fomo holders", "callback_data": f"fomo_h:{FOMO_DEFAULT_CHAIN_ID}:{ca}"},
+            {"text": "🧬 Deep Research", "callback_data": f"deep_research:{ca}"},
         ])
     rows.append([
         {"text": "⭐ Worth watching", "callback_data": f"watch:{token_address.lower()}"},
-        {"text": "⏭ Skip", "callback_data": f"fb:skip:{token_address.lower()}"},
+        {"text": "📤 Share ticker", "url": build_share_ticker_url(symbol)},
     ])
     return {"inline_keyboard": rows}
 
@@ -856,6 +862,21 @@ async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: 
                 "✅ <b>Removed from watchlist</b>" if removed else "⭐ <b>Not in watchlist</b>",
                 chat_id=chat_id,
             )
+        return
+
+    if len(parts) == 2 and parts[0] == "deep_research":
+        ca = parts[1].strip().lower()
+        if not is_base_contract(ca):
+            await answer_callback_query(session, callback_id, "Invalid token address", show_alert=True)
+            return
+        await answer_callback_query(session, callback_id, "Deep Research is coming soon")
+        await send_telegram(
+            session,
+            "🧬 <b>Deep Research</b>\n\n"
+            "This action is reserved for the next research layer. "
+            "For now use <code>/research 0x...</code> or add it to watchlist.",
+            chat_id=chat_id,
+        )
         return
 
     if len(parts) == 3 and parts[0] == "fomo_h":
@@ -4075,15 +4096,95 @@ def build_signal_reason(launch: dict, dex: dict | None) -> str:
     return "; ".join(reasons[:3]) if reasons else "Passed scan filters"
 
 
+def dex_social_label(dex: dict | None, social_type: str) -> str:
+    for item in (dex or {}).get("socials") or []:
+        if (item.get("type") or "").lower() == social_type:
+            url = item.get("url") or ""
+            if social_type == "twitter" and "x.com/" in url:
+                return "@" + url.rstrip("/").split("/")[-1]
+            return url
+    return ""
+
+
+def dex_website_domain(dex: dict | None) -> str:
+    websites = (dex or {}).get("websites") or []
+    if not websites:
+        return ""
+    url = websites[0].get("url") if isinstance(websites[0], dict) else str(websites[0])
+    domain = str(url or "").replace("https://", "").replace("http://", "").split("/", 1)[0]
+    return domain.replace("www.", "")
+
+
+def infer_initial_token_type(launch: dict, dex: dict | None) -> str:
+    text = " ".join([
+        str(launch.get("name") or ""),
+        str(launch.get("symbol") or ""),
+        str((dex or {}).get("token_name") or ""),
+        dex_website_domain(dex),
+    ]).lower()
+    if any(term in text for term in ("privacy", "private", "veil", "cash", "shield")):
+        return "Privacy / Base protocol"
+    if any(term in text for term in ("agent", "ai", "bot", "automation")):
+        return "AI / Agent"
+    if any(term in text for term in ("app", "protocol", "terminal", "tool", "finance")):
+        return "Utility / Protocol"
+    return "Unclear / Experimental"
+
+
+def build_initial_product_line(launch: dict, dex: dict | None) -> str:
+    name = (dex or {}).get("token_name") or launch.get("name") or launch.get("symbol") or "Token"
+    website = dex_website_domain(dex)
+    x_handle = dex_social_label(dex, "twitter")
+    token_type = infer_initial_token_type(launch, dex)
+    if token_type.startswith("Privacy"):
+        base = f"{name} appears positioned as a privacy-oriented Base protocol"
+    else:
+        base = f"{name} has live Base market data"
+    sources = []
+    if website:
+        sources.append(f"site {website}")
+    if x_handle:
+        sources.append(f"X {x_handle}")
+    if sources:
+        return f"{base}; metadata links: {', '.join(sources[:2])}."
+    return f"{base}; product proof still needs verified research."
+
+
 def build_ai_summary_placeholder(launch: dict, dex: dict | None, verdict: dict | None = None) -> str:
     if verdict:
         return verdict.get("human_readable") or ""
 
+    token_type = infer_initial_token_type(launch, dex)
+    product = build_initial_product_line(launch, dex)
+    focus = "market data unavailable"
+    risks = ["deep research not connected yet"]
+    score = 0.0
+    if dex:
+        mcap = float(dex.get("mcap") or 0)
+        volume = float(dex.get("volume_24h") or 0)
+        liquidity = float(dex.get("liquidity") or 0)
+        focus = f"MC {fmt_usd(mcap)} · Vol {fmt_usd(volume)} · Liq {fmt_usd(liquidity)}"
+        if mcap >= MIN_MCAP:
+            score += 2.0
+        if volume >= MIN_VOLUME_24H:
+            score += 2.0
+        if liquidity >= MIN_LIQUIDITY:
+            score += 1.5
+        if dex_website_domain(dex):
+            score += 0.8
+        if dex_social_label(dex, "twitter"):
+            score += 0.7
+        if mcap and liquidity and mcap / max(liquidity, 1) > 10:
+            risks.append("MC is high relative to liquidity")
+        else:
+            risks.append("social and spoof checks still pending")
+    score = min(score, 7.0)
     return (
-        "🧠 <b>AI brief</b> • Score <b>(0/10)</b>\n\n"
-        "• <b>Type of token:</b> pending classification\n"
-        "• <b>Product:</b> pending narrative/product read\n"
-        "• <b>Risks:</b> pending spoof/liquidity checks"
+        f"🧠 <b>AI brief</b> • Initial <b>{score:.1f}/10</b> · <b>WAIT</b>\n\n"
+        f"• <b>Type:</b> {h(token_type)}\n"
+        f"• <b>Product:</b> {h(product[:220])}\n"
+        f"• <b>Focus:</b> {h(focus)}\n"
+        f"• <b>Risks:</b> {h('; '.join(risks[:2]))}"
     )
 
 
