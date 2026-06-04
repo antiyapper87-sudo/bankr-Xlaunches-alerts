@@ -31,6 +31,24 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 
+
+def load_local_env(path: str = ".env.local") -> None:
+    env_path = Path(path)
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_local_env()
+
 from database import (
     close_db,
     db_session,
@@ -85,6 +103,13 @@ from research_pipeline import (
     format_verdict_block,
 )
 from services.delivery import prepare_signal_fanout
+from services.fomo import (
+    FOMO_DEFAULT_CHAIN_ID,
+    FOMO_ENABLED,
+    build_fomo_url,
+    fetch_fomo_top_holders,
+    format_fomo_holders_card,
+)
 from services.observability import correlation_id, log_event
 from services.social_evidence import (
     build_social_evidence,
@@ -580,17 +605,18 @@ def build_x_research_url(token_address: str, symbol: str) -> str:
 
 def build_signal_keyboard(token_address: str, symbol: str) -> dict:
     x_research_url = build_x_research_url(token_address, symbol)
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "🔎 X Research", "url": x_research_url},
-            ],
-            [
-                {"text": "⭐ Worth watching", "callback_data": f"watch:{token_address.lower()}"},
-                {"text": "⏭ Skip", "callback_data": f"fb:skip:{token_address.lower()}"},
-            ],
-        ]
-    }
+    rows = [[{"text": "🔎 X Research", "url": x_research_url}]]
+    if FOMO_ENABLED:
+        ca = token_address.lower()
+        rows.append([
+            {"text": "👀 Fomo", "url": build_fomo_url(ca, FOMO_DEFAULT_CHAIN_ID)},
+            {"text": "👥 Fomo holders", "callback_data": f"fomo_h:{FOMO_DEFAULT_CHAIN_ID}:{ca}"},
+        ])
+    rows.append([
+        {"text": "⭐ Worth watching", "callback_data": f"watch:{token_address.lower()}"},
+        {"text": "⏭ Skip", "callback_data": f"fb:skip:{token_address.lower()}"},
+    ])
+    return {"inline_keyboard": rows}
 
 
 def build_admin_keyboard() -> dict:
@@ -760,6 +786,33 @@ async def handle_trade_callback(session: aiohttp.ClientSession, callback_query: 
             )
             return
         await answer_callback_query(session, callback_id, "Unknown admin action", show_alert=True)
+        return
+
+    if len(parts) == 3 and parts[0] == "fomo_h":
+        if not FOMO_ENABLED:
+            await answer_callback_query(session, callback_id, "Fomo is disabled", show_alert=True)
+            return
+        try:
+            chain_id = int(parts[1])
+        except ValueError:
+            await answer_callback_query(session, callback_id, "Invalid Fomo chain", show_alert=True)
+            return
+        ca = _address_map.get(parts[2].strip().lower(), parts[2].strip().lower())
+        if not is_base_contract(ca):
+            await answer_callback_query(session, callback_id, "Invalid token address", show_alert=True)
+            return
+        await answer_callback_query(session, callback_id, "Loading Fomo holders...")
+        try:
+            result = await fetch_fomo_top_holders(session, address=ca, chain_id=chain_id)
+            await send_telegram(session, format_fomo_holders_card(result), chat_id=chat_id)
+        except Exception as exc:
+            log.warning(f"Fomo holders failed for {ca}: {exc}")
+            await send_telegram(
+                session,
+                "👥 <b>Fomo holders unavailable</b>\n\n"
+                "Session expired or Fomo blocked the request. Refresh Fomo cookies/token.",
+                chat_id=chat_id,
+            )
         return
 
     if len(parts) == 3 and parts[0] == "xpg":

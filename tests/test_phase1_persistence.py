@@ -364,10 +364,12 @@ def test_signal_format_stays_under_telegram_limit():
     assert "/research" not in text
 
 
-def test_signal_keyboard_is_research_only():
-    from main import build_signal_keyboard
+def test_signal_keyboard_is_research_only(monkeypatch):
+    import main
 
-    keyboard = build_signal_keyboard(ca(6), "FMT")
+    monkeypatch.setattr(main, "FOMO_ENABLED", False)
+
+    keyboard = main.build_signal_keyboard(ca(6), "FMT")
     labels = [
         button["text"]
         for row in keyboard["inline_keyboard"]
@@ -376,6 +378,31 @@ def test_signal_keyboard_is_research_only():
 
     assert labels == ["🔎 X Research", "⭐ Worth watching", "⏭ Skip"]
     assert all("Buy" not in label and "Banana" not in label for label in labels)
+
+
+def test_signal_keyboard_includes_fomo_when_enabled(monkeypatch):
+    import main
+
+    monkeypatch.setattr(main, "FOMO_ENABLED", True)
+    monkeypatch.setattr(main, "FOMO_DEFAULT_CHAIN_ID", 8453)
+
+    token_ca = ca(7)
+    keyboard = main.build_signal_keyboard(token_ca, "FMT")
+    labels = [
+        button["text"]
+        for row in keyboard["inline_keyboard"]
+        for button in row
+    ]
+
+    assert "👀 Fomo" in labels
+    assert "👥 Fomo holders" in labels
+    fomo_url = next(
+        button["url"]
+        for row in keyboard["inline_keyboard"]
+        for button in row
+        if button["text"] == "👀 Fomo"
+    )
+    assert fomo_url == f"https://fomo.family/coin?address={token_ca}&chainId=8453"
 
 
 def socialdata_tweet(

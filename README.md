@@ -9,7 +9,7 @@ X research links, watched-influencer signals and an optional deterministic auto-
 1. Polls launch sources and rechecks new tokens while market data is still indexing.
 2. Enriches launches with DexScreener/GeckoTerminal market data.
 3. Filters by market cap, volume, liquidity and source-specific safety rules.
-4. Fans out Telegram alerts to active DM/group tenants with X Research, Ticker X, Copy CA and chart/trading links.
+4. Fans out Telegram alerts to active DM/group tenants with X Research, Fomo, watchlist and feedback actions.
 5. Optionally attaches deterministic research verdicts in the background.
 6. Builds Phase 2 Verdict 2.0 research, spoof checks and AI-summary stubs for Base CAs.
 7. Supports Phase 3 retention features: user watchlists, per-user min score and signal feedback.
@@ -65,6 +65,10 @@ X research links, watched-influencer signals and an optional deterministic auto-
 | `SAME_TICKER_EXTERNAL_ENABLED` | ❌ | `true` | Checks GeckoTerminal for older same-ticker Base markets during Verdict 2.0 |
 | `SAME_TICKER_PRIOR_LOOKBACK_HOURS` | ❌ | `48` | Lookback for prior same-ticker markets that passed scanner filters |
 | `SAME_TICKER_EXTERNAL_TIMEOUT_SEC` | ❌ | `8` | Timeout for same-ticker GeckoTerminal fallback |
+| `FOMO_ENABLED` | ❌ | `false` | Adds Fomo deeplink and holders action to signal cards |
+| `FOMO_API_BASE` | ❌ | `https://prod-api.fomo.family` | Fomo API base URL |
+| `FOMO_COOKIES_FILE` | Required if Fomo enabled | `.secrets/fomo_cookies.json` | Ignored cookie export containing `privy-token` |
+| `FOMO_DEFAULT_CHAIN_ID` | ❌ | `8453` | Fomo chain ID for Base |
 | `TELEGRAM_SIGNAL_DELIVERY_LIMIT` | ❌ | `2000` | Max pending Telegram deliveries sent synchronously per signal |
 | `WATCHLIST_CHECK_INTERVAL` | ❌ | `900` | Seconds between per-token watchlist market checks |
 | `WATCHLIST_CHECK_BATCH` | ❌ | `100` | Max due watchlist rows checked per bot loop |
