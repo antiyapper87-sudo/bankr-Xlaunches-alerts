@@ -326,8 +326,8 @@ def product_line(
         )
     if not source_backed:
         return (
-            f"{display} has weak signals around {group.lower()}, but source attribution is not strong yet. "
-            f"{mechanics_sentence(group, keywords)}"
+            f"{display} has only possible {group.lower()} context from name/ticker/metadata or non-primary tweets. "
+            f"No contract-confirmed product proof is available yet."
         )
     if group == "AI / Agent":
         if any(term in keywords for term in ("inference", "marketplace", "intelligence", "decentralized intelligence")):
@@ -401,14 +401,23 @@ def extract_project_narrative(
     flags: list[str] | None = None,
 ) -> ProjectNarrative:
     tweets = tweets or list((social_evidence or {}).get("top_tweets") or [])
+    primary_tweets = list((social_evidence or {}).get("primary_tweets") or [])
+    if not primary_tweets:
+        primary_tweets = [tweet for tweet in tweets if tweet.get("ai_verdict_eligible")]
+    if not primary_tweets and ca:
+        needle = ca.lower()
+        primary_tweets = [
+            tweet for tweet in tweets
+            if needle in str(tweet.get("text") or tweet.get("excerpt") or "").lower()
+        ]
     desc, sources = source_description(launch, dex)
     metadata_text, metadata_sources = metadata_terms(launch, dex)
-    text_pool = " ".join([desc, metadata_text, name, ticker] + [tweet_text(tweet) for tweet in tweets[:12]])
-    group, keywords, unique_authors = best_narrative_group(text_pool, tweets)
-    ca_mentions = ca_confirmed_tweets(tweets, ca)
+    text_pool = " ".join([desc, metadata_text, name, ticker] + [tweet_text(tweet) for tweet in primary_tweets[:12]])
+    group, keywords, unique_authors = best_narrative_group(text_pool, primary_tweets)
+    ca_mentions = ca_confirmed_tweets(primary_tweets, ca)
     qualified_count = qualified_tweets(social_evidence, tweets)
     collision = has_same_ticker_collision(social_evidence, flags)
-    ticker_only = bool(tweets and ca_mentions == 0 and not desc)
+    ticker_only = bool(tweets and ca_mentions == 0 and not desc and not primary_tweets)
     has_description = bool(desc)
     confidence = confidence_for(
         has_description=has_description,
@@ -428,7 +437,7 @@ def extract_project_narrative(
         why = "Ticker-only evidence can belong to another token, so the current CA needs contract-specific proof."
         lore_context = why
     else:
-        source_backed = has_description or bool(metadata_text.strip()) or unique_authors >= 2 or ca_mentions > 0
+        source_backed = has_description or unique_authors >= 2 or ca_mentions > 0 or len(primary_tweets) >= 2
         tweet_sentences = high_signal_tweet_sentences(tweets, keywords)
         product = product_line(
             group,
@@ -447,6 +456,7 @@ def extract_project_narrative(
             ticker_only=ticker_only,
         )
         if ticker_only:
+            product = f"{name or ticker} has ticker-context only; CA attribution and product proof are not confirmed."
             why = "X evidence is ticker-only and not CA-confirmed; treat this narrative as weak until contract-specific proof appears."
 
     return ProjectNarrative(

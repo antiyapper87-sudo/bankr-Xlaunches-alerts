@@ -1991,6 +1991,31 @@ def non_negative_float(value, default: float = 0.0) -> float:
     return max(0.0, to_float(value, default))
 
 
+COMMON_BASE_ASSET_ADDRESSES = {
+    "0x4200000000000000000000000000000000000006",  # WETH
+    "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",  # USDC
+    "0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca",  # USDbC
+    "0x50c5725949a6f0c72e6c4a641f24049a917db0cb",  # DAI
+    "0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22",  # cbETH
+    "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf",  # cbBTC
+    "0x940181a94a35a4569e4529a3cdfb74e38fd98631",  # AERO
+    "0x0b3e328455c4059eeb9e3f84b5543f74e24e7e1b",  # VIRTUAL
+}
+COMMON_BASE_ASSET_SYMBOLS = {"WETH", "ETH", "USDC", "USDBC", "DAI", "CBETH", "CBBTC", "AERO", "VIRTUAL"}
+
+
+def is_common_base_asset(address: str = "", symbol: str = "") -> bool:
+    return str(address or "").lower() in COMMON_BASE_ASSET_ADDRESSES or str(symbol or "").upper() in COMMON_BASE_ASSET_SYMBOLS
+
+
+def same_market_pool(a: dict | None, b: dict | None) -> bool:
+    if not a or not b:
+        return False
+    pa = str(a.get("pair_address") or "").lower()
+    pb = str(b.get("pair_address") or "").lower()
+    return bool(pa and pb and pa == pb)
+
+
 async def _fetch_dexscreener(session: aiohttp.ClientSession, token_address: str) -> dict | None:
     """Fetch market data from DexScreener (primary source)."""
     if not await is_provider_available("dexscreener"):
@@ -2135,6 +2160,7 @@ async def _fetch_geckoterminal_api(session: aiohttp.ClientSession, token_address
             "price_change_24h": float(price_changes.get("h24") or 0),
             "pair_url": f"https://www.geckoterminal.com/base/pools/{best.get('address', token_address)}",
             "pair_created_at": 0,  # GeckoTerminal returns ISO date, convert if needed
+            "pair_address": (best.get("address") or "").lower(),
             "token_name": token_name,
             "token_symbol": token_symbol,
             "dex_id": best.get("dex_id", ""),
@@ -2196,17 +2222,17 @@ async def fetch_geckoterminal(session: aiohttp.ClientSession, token_address: str
             if result is None:
                 # DexScreener had nothing — use GeckoTerminal entirely
                 result = gecko_result
-            else:
-                # DexScreener had partial data — merge: prefer non-zero values
-                if gecko_result.get("liquidity", 0) > result.get("liquidity", 0):
-                    result["liquidity"] = gecko_result["liquidity"]
-                if gecko_result.get("mcap", 0) > result.get("mcap", 0):
-                    result["mcap"] = gecko_result["mcap"]
-                if gecko_result.get("volume_24h", 0) > result.get("volume_24h", 0):
-                    result["volume_24h"] = gecko_result["volume_24h"]
+            elif same_market_pool(result, gecko_result):
+                for key in ("liquidity", "mcap", "volume_24h"):
+                    if gecko_result.get(key, 0) > result.get(key, 0):
+                        result[key] = gecko_result[key]
                 if not result.get("pair_created_at") and gecko_result.get("pair_created_at"):
                     result["pair_created_at"] = gecko_result["pair_created_at"]
-                result["_source"] = "dexscreener+geckoterminal"
+                result["_source"] = "dexscreener+geckoterminal_same_pool"
+            else:
+                result["secondary_market_json"] = gecko_result
+                result["selection_warning"] = "geckoterminal_fallback_pair_mismatch_not_merged"
+                result["selection_reason"] = "dexscreener_primary_pair"
 
     # Cache the result
     gecko_cache[token_address] = (time.time(), result)
@@ -4018,6 +4044,20 @@ def _coingecko_related(item: dict, included_by_id: dict[str, dict], relation: st
     return included_by_id.get(rel.get("id", ""), {})
 
 
+def choose_coingecko_pool_token_side(base_attrs: dict, quote_attrs: dict) -> tuple[str, dict] | None:
+    candidates: list[tuple[str, dict, bool]] = []
+    for side, attrs in (("base", base_attrs), ("quote", quote_attrs)):
+        address = (attrs.get("address") or "").lower()
+        symbol = (attrs.get("symbol") or "").upper()
+        if not is_base_contract(address):
+            continue
+        candidates.append((side, attrs, is_common_base_asset(address, symbol)))
+    non_common = [(side, attrs) for side, attrs, is_common in candidates if not is_common]
+    if len(non_common) == 1:
+        return non_common[0]
+    return None
+
+
 def _normalize_coingecko_pool(item: dict, included_by_id: dict[str, dict]) -> dict | None:
     attrs = item.get("attributes") or {}
     base = _coingecko_related(item, included_by_id, "base_token")
@@ -4027,7 +4067,11 @@ def _normalize_coingecko_pool(item: dict, included_by_id: dict[str, dict]) -> di
     quote_attrs = quote.get("attributes") or {}
     dex_attrs = dex.get("attributes") or {}
 
-    address = (base_attrs.get("address") or "").lower()
+    selected = choose_coingecko_pool_token_side(base_attrs, quote_attrs)
+    if not selected:
+        return None
+    selected_side, token_attrs = selected
+    address = (token_attrs.get("address") or "").lower()
     if not is_base_contract(address):
         return None
 
@@ -4047,15 +4091,20 @@ def _normalize_coingecko_pool(item: dict, included_by_id: dict[str, dict]) -> di
         except ValueError:
             pair_created_at = 0
 
-    name = base_attrs.get("name") or attrs.get("name") or "Unknown"
-    symbol = base_attrs.get("symbol") or "?"
+    name = token_attrs.get("name") or attrs.get("name") or "Unknown"
+    symbol = token_attrs.get("symbol") or "?"
     dex_id = dex_attrs.get("identifier") or dex_attrs.get("name") or ""
+    selected_price_key = "base_token_price_usd" if selected_side == "base" else "quote_token_price_usd"
+    if selected_side == "base":
+        selected_mcap = attrs.get("market_cap_usd") or attrs.get("fdv_usd") or 0
+    else:
+        selected_mcap = attrs.get("quote_token_market_cap_usd") or attrs.get("quote_token_fdv_usd") or 0
 
     market = {
-        "mcap": non_negative_float(attrs.get("market_cap_usd") or attrs.get("fdv_usd")),
+        "mcap": non_negative_float(selected_mcap),
         "volume_24h": non_negative_float(volume.get("h24")),
         "liquidity": non_negative_float(attrs.get("reserve_in_usd")),
-        "price_usd": attrs.get("base_token_price_usd") or "0",
+        "price_usd": attrs.get(selected_price_key) or "0",
         "price_change_1h": to_float(price_changes.get("h1")),
         "price_change_24h": to_float(price_changes.get("h24")),
         "pair_url": f"https://www.geckoterminal.com/base/pools/{pool_address or address}",
@@ -4063,7 +4112,11 @@ def _normalize_coingecko_pool(item: dict, included_by_id: dict[str, dict]) -> di
         "pair_address": pool_address,
         "token_name": name,
         "token_symbol": symbol,
-        "base_token_address": address,
+        "selected_token_side": selected_side,
+        "selected_token_address": address,
+        "selected_token_symbol": symbol,
+        "base_token_address": (base_attrs.get("address") or "").lower(),
+        "base_token_symbol": base_attrs.get("symbol") or "",
         "quote_token_address": (quote_attrs.get("address") or "").lower(),
         "quote_token_symbol": quote_attrs.get("symbol") or "",
         "dex_id": dex_id,
@@ -5050,6 +5103,32 @@ def seconds_since(dt: datetime | None) -> float:
     return max(0, (utc_now() - dt).total_seconds())
 
 
+SEED_SUPPRESS_MIN_AGE_SECONDS = int(os.getenv("SEED_SUPPRESS_MIN_AGE_SECONDS", "1800"))
+
+
+def launch_age_seconds(launch: dict) -> float | None:
+    dt = parse_launch_datetime(launch)
+    if dt:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, (utc_now() - dt).total_seconds())
+    pair_created = (launch.get("_dex") or {}).get("pair_created_at") or 0
+    try:
+        value = float(pair_created or 0)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    if value > 10_000_000_000:
+        value = value / 1000
+    return max(0.0, time.time() - value)
+
+
+def should_seed_suppress_launch(launch: dict) -> bool:
+    age = launch_age_seconds(launch)
+    return age is not None and age >= SEED_SUPPRESS_MIN_AGE_SECONDS
+
+
 async def is_provider_available(provider: str) -> bool:
     async with db_session() as db:
         return await provider_available(db, provider)
@@ -5787,8 +5866,12 @@ async def seed_existing(session: aiohttp.ClientSession):
 
     all_launches = bankr + clanker + dexscreener + coingecko + virtuals
     inserted = 0
+    fresh_skipped = 0
 
     for launch in all_launches:
+        if not should_seed_suppress_launch(launch):
+            fresh_skipped += 1
+            continue
         was_inserted, addr = await persist_launch_seen(launch, status="seeded")
         inserted += int(was_inserted)
         if was_inserted:
@@ -5796,6 +5879,7 @@ async def seed_existing(session: aiohttp.ClientSession):
 
     log.info(
         f"📋 Seeded {inserted} new DB rows "
+        f"(fresh/unknown left eligible: {fresh_skipped}) "
         f"(Bankr: {len(bankr)}, Clanker: {len(clanker)}, DexScreener: {len(dexscreener)}, "
         f"CoinGecko: {len(coingecko)}, Virtuals: {len(virtuals)}) "
         f"— existing rows skipped"

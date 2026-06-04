@@ -612,6 +612,95 @@ def test_watch_ambiguous_message_lists_ca_candidates():
     assert "/watch 0x..." in message
 
 
+def test_coingecko_new_pool_selects_quote_side_launch_token_not_weth():
+    import main
+
+    token_ca = ca(90)
+    item = {
+        "attributes": {
+            "address": "0xpool",
+            "pool_created_at": utc_now().isoformat(),
+            "volume_usd": {"h24": "90000"},
+            "reserve_in_usd": "70000",
+            "quote_token_price_usd": "0.01",
+        },
+        "relationships": {
+            "base_token": {"data": {"id": "base_weth"}},
+            "quote_token": {"data": {"id": "base_new"}},
+            "dex": {"data": {"id": "base_uniswap_v4"}},
+        },
+    }
+    included = {
+        "base_weth": {"attributes": {"address": "0x4200000000000000000000000000000000000006", "symbol": "WETH", "name": "Wrapped Ether"}},
+        "base_new": {"attributes": {"address": token_ca, "symbol": "NEW", "name": "New Token"}},
+        "base_uniswap_v4": {"attributes": {"identifier": "uniswap_v4"}},
+    }
+
+    launch = main._normalize_coingecko_pool(item, included)
+
+    assert launch is not None
+    assert launch["address"] == token_ca
+    assert launch["symbol"] == "NEW"
+    assert launch["_dex"]["selected_token_side"] == "quote"
+    assert launch["_dex"]["base_token_symbol"] == "WETH"
+
+
+def test_coingecko_new_pool_rejects_common_assets_only():
+    import main
+
+    item = {
+        "attributes": {"address": "0xpool", "pool_created_at": utc_now().isoformat()},
+        "relationships": {
+            "base_token": {"data": {"id": "base_weth"}},
+            "quote_token": {"data": {"id": "base_usdc"}},
+        },
+    }
+    included = {
+        "base_weth": {"attributes": {"address": "0x4200000000000000000000000000000000000006", "symbol": "WETH"}},
+        "base_usdc": {"attributes": {"address": "0x833589fcd6edb6e08f4c7c32d4f71b54bdA02913", "symbol": "USDC"}},
+    }
+
+    assert main._normalize_coingecko_pool(item, included) is None
+
+
+@pytest.mark.asyncio
+async def test_gecko_fallback_does_not_merge_different_pair_metrics(monkeypatch):
+    import main
+
+    dex = {"pair_address": ca(91), "mcap": 100_000, "volume_24h": 0, "liquidity": 0, "_source": "dexscreener"}
+    gecko = {"pair_address": ca(92), "mcap": 5_000_000, "volume_24h": 1_000_000, "liquidity": 900_000, "_source": "geckoterminal"}
+
+    async def fake_dex(*_args, **_kwargs):
+        return dict(dex)
+
+    async def fake_gecko(*_args, **_kwargs):
+        return dict(gecko)
+
+    main.gecko_cache.clear()
+    monkeypatch.setattr(main, "_fetch_dexscreener", fake_dex)
+    monkeypatch.setattr(main, "_fetch_geckoterminal_api", fake_gecko)
+
+    result = await main.fetch_geckoterminal(None, ca(93))
+
+    assert result["mcap"] == 100_000
+    assert result["liquidity"] == 0
+    assert result["volume_24h"] == 0
+    assert result["secondary_market_json"]["liquidity"] == 900_000
+    assert result["selection_warning"] == "geckoterminal_fallback_pair_mismatch_not_merged"
+
+
+def test_seed_existing_does_not_suppress_fresh_or_unknown_launch():
+    import main
+
+    fresh = {"created_at": utc_now().isoformat()}
+    old = {"created_at": (utc_now() - timedelta(hours=2)).isoformat()}
+    unknown = {"symbol": "UNKNOWN"}
+
+    assert main.should_seed_suppress_launch(fresh) is False
+    assert main.should_seed_suppress_launch(unknown) is False
+    assert main.should_seed_suppress_launch(old) is True
+
+
 def socialdata_tweet(
     *,
     tweet_id: int,
@@ -1306,6 +1395,10 @@ def test_hybrid_social_evidence_keeps_ticker_context_without_verdict_credit():
     assert len(evidence["top_tweets"]) == 2
     assert evidence["qualified"] is False
     assert evidence["qualified_tweets"] == 1
+    assert evidence["social_score"] < 80
+    assert evidence["project_value"] == "Narrative / Community"
+    assert len(evidence["primary_tweets"]) == 1
+    assert len(evidence["ticker_context_tweets"]) == 1
     assert evidence["trust_summary"]["ca_confirmed"] == 1
     assert evidence["trust_summary"]["ticker_strong"] == 1
     assert evidence["top_tweets"][0]["evidence_type"] == "ca_confirmed"
@@ -1341,6 +1434,37 @@ def test_x_signal_hybrid_summary_shows_ca_and_ticker_context():
     assert "Ticker context:" not in block
     assert "Takeaway:" not in block
     assert "Thesis:" in block
+
+
+def test_ticker_only_context_does_not_raise_social_score_or_project_value():
+    from services.social_evidence import build_social_evidence
+
+    token_ca = ca(93)
+    evidence = build_social_evidence(
+        [
+            {
+                "username": "strongticker",
+                "url": "https://x.com/strongticker/status/1",
+                "text": "$ONLY is an AI inference marketplace with real utility and huge traction.",
+                "views": 20_000,
+                "likes": 250,
+                "retweets": 40,
+                "followers": 80_000,
+                "created_at": utc_now(),
+            }
+        ],
+        ticker="ONLY",
+        address=token_ca,
+        min_count=1,
+        include_context=True,
+    )
+
+    assert evidence["qualified"] is False
+    assert evidence["qualified_tweets"] == 0
+    assert evidence["score_eligible_tweets"] == 0
+    assert evidence["social_score"] == 0
+    assert evidence["project_value"] == "Unclear / Experimental"
+    assert evidence["ticker_context_tweets"]
 
 
 @pytest.mark.asyncio
@@ -1773,10 +1897,10 @@ def test_project_narrative_does_not_infer_product_from_ticker_only():
 
     assert narrative.confidence == "LOW"
     assert "No verified project description found" not in narrative.product
-    assert "weak signals" in narrative.product
+    assert "contract-confirmed product proof" in narrative.product
 
 
-def test_project_narrative_infers_surplus_ai_inference_from_metadata():
+def test_project_narrative_treats_surplus_ticker_context_as_unconfirmed():
     narrative = extract_project_narrative(
         ca=ca(77),
         ticker="SURPLUS",
@@ -1802,5 +1926,5 @@ def test_project_narrative_infers_surplus_ai_inference_from_metadata():
     )
 
     assert "No verified project description found" not in narrative.product
-    assert "AI inference" in narrative.product
-    assert "intelligence" in narrative.product.lower()
+    assert "ticker-context only" in narrative.product.lower()
+    assert narrative.confidence == "LOW"

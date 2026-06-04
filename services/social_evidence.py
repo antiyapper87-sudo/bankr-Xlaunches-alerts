@@ -374,47 +374,67 @@ def build_social_evidence(
         reverse=True,
     )
     top = ranked[:max_tweets]
-    project_value, project_value_score, totals = infer_project_value(top)
-    thesis = build_thesis(project_value, top, totals)
-    value_assessment = build_value_assessment(project_value, top, totals)
-    score_breakdown = build_social_score_breakdown(project_value, top, project_value_score)
-    social_score = social_score_from_breakdown(score_breakdown)
-    evidence = []
-    for idx, item in enumerate(top, 1):
-        excerpt = compact_excerpt(item.get("text", ""), address=address)
-        evidence.append(
-            {
-                "ref": idx,
-                "url": item.get("url", ""),
-                "username": item.get("username", ""),
-                "followers": _num(item.get("followers")),
-                "views": _num(item.get("views")),
-                "likes": _num(item.get("likes")),
-                "retweets": _num(item.get("retweets")),
-                "score": _num(item.get("hermes_score")),
-                "tweet_tier_score": _num(item.get("tweet_tier_score")),
-                "tweet_tier": item.get("tweet_tier", "C"),
-                "reason": item.get("hermes_reason", ""),
-                "importance": evidence_importance(item),
-                "excerpt": excerpt,
-                "language": "en" if is_likely_english_text(excerpt) else "other",
-                "source_match": item.get("source_match") or "",
-                "source_matches": item.get("source_matches") or [],
-                "source_provider": item.get("source_provider") or item.get("source") or "",
-                "ca_confirmed": bool(item.get("ca_confirmed")),
-                "ticker_confirmed": bool(item.get("ticker_confirmed")),
-                "evidence_type": item.get("evidence_type") or "unmatched",
-                "confidence_score": _num(item.get("confidence_score")),
-                "ai_verdict_eligible": bool(item.get("ai_verdict_eligible")),
-            }
-        )
-    primary_evidence = [
-        item for item in top
+    primary_ranked = [
+        item for item in ranked
         if item.get("ai_verdict_eligible")
         and _num(item.get("views")) >= 50
         and _num(item.get("likes")) >= 5
     ]
-    qualified_count = len(primary_evidence)
+    ticker_context_ranked = [
+        item for item in ranked
+        if item.get("evidence_type") in {"ticker_strong", "ticker_only"}
+    ]
+    primary_top = primary_ranked[:max_tweets]
+    if primary_top:
+        project_value, project_value_score, totals = infer_project_value(primary_top)
+        thesis = build_thesis(project_value, primary_top, totals)
+        value_assessment = build_value_assessment(project_value, primary_top, totals)
+        score_breakdown = build_social_score_breakdown(project_value, primary_top, project_value_score)
+    else:
+        project_value = "Unclear / Experimental"
+        project_value_score = 0
+        totals = {"utility": 0, "tech": 0, "market": 0, "meme": 0}
+        thesis = build_thesis(project_value, [], totals)
+        value_assessment = build_value_assessment(project_value, [], totals)
+        score_breakdown = {"narrative": 0, "creator": 0, "utility_tech": 0, "shill_risk": 0}
+    social_score = social_score_from_breakdown(score_breakdown)
+
+    def evidence_from(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        evidence = []
+        for idx, item in enumerate(items, 1):
+            excerpt = compact_excerpt(item.get("text", ""), address=address)
+            evidence.append(
+                {
+                    "ref": idx,
+                    "url": item.get("url", ""),
+                    "username": item.get("username", ""),
+                    "followers": _num(item.get("followers")),
+                    "views": _num(item.get("views")),
+                    "likes": _num(item.get("likes")),
+                    "retweets": _num(item.get("retweets")),
+                    "score": _num(item.get("hermes_score")),
+                    "tweet_tier_score": _num(item.get("tweet_tier_score")),
+                    "tweet_tier": item.get("tweet_tier", "C"),
+                    "reason": item.get("hermes_reason", ""),
+                    "importance": evidence_importance(item),
+                    "excerpt": excerpt,
+                    "language": "en" if is_likely_english_text(excerpt) else "other",
+                    "source_match": item.get("source_match") or "",
+                    "source_matches": item.get("source_matches") or [],
+                    "source_provider": item.get("source_provider") or item.get("source") or "",
+                    "ca_confirmed": bool(item.get("ca_confirmed")),
+                    "ticker_confirmed": bool(item.get("ticker_confirmed")),
+                    "evidence_type": item.get("evidence_type") or "unmatched",
+                    "confidence_score": _num(item.get("confidence_score")),
+                    "ai_verdict_eligible": bool(item.get("ai_verdict_eligible")),
+                }
+            )
+        return evidence
+
+    evidence = evidence_from(top)
+    primary_evidence = evidence_from(primary_top)
+    ticker_context_evidence = evidence_from(ticker_context_ranked[:max_tweets])
+    qualified_count = len(primary_top)
     ticker_context_count = sum(
         1 for item in top
         if item.get("evidence_type") in {"ticker_strong", "ticker_only"}
@@ -446,6 +466,9 @@ def build_social_evidence(
         "signal_terms": totals,
         "thesis": thesis,
         "top_tweets": evidence,
+        "primary_tweets": primary_evidence,
+        "ticker_context_tweets": ticker_context_evidence,
+        "score_eligible_tweets": len(primary_top),
         "source_provenance": {
             "ca_confirmed": sum(1 for item in evidence if item.get("ca_confirmed")),
             "ticker_confirmed": sum(1 for item in evidence if item.get("ticker_confirmed")),
