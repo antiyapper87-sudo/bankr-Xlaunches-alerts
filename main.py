@@ -111,6 +111,10 @@ from services.fomo import (
     format_fomo_holders_card,
 )
 from services.observability import correlation_id, log_event
+from services.project_narrative import (
+    extract_project_narrative,
+    narrative_token_type,
+)
 from services.social_evidence import (
     build_social_evidence,
     hide_contract_mentions,
@@ -3360,15 +3364,38 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
                 alpha_reason=smart_fetch.alpha_reason,
             )
     launch_status = None
+    launch_for_narrative = {
+        "source": "manual",
+        "address": address,
+        "name": token_name or (dex or {}).get("token_name") or ticker,
+        "symbol": ticker,
+    }
     if address:
         async with db_session() as db:
             launch_status = await get_launch_status(db, address)
+            existing_launch = await get_launch(db, address)
+            if existing_launch and existing_launch.raw_json:
+                launch_for_narrative = {
+                    **existing_launch.raw_json,
+                    "address": address,
+                    "name": token_name or existing_launch.name or (dex or {}).get("token_name") or ticker,
+                    "symbol": ticker or existing_launch.ticker or (dex or {}).get("token_symbol") or "",
+                    "source": existing_launch.source or "manual",
+                }
     if not dex and not x_mentions and not influencer_mentions and not nitter_mentions:
         return (
             f"🔍 <b>No data found for ${ticker}</b>\n\n"
             f"No Base market data or CA-verified X mentions found after spam/engagement filters.\n"
             f"Try: /research 0x..."
         )
+    project_narrative = extract_project_narrative(
+        ca=address,
+        ticker=ticker,
+        name=token_name or (dex or {}).get("token_name") or ticker,
+        launch=launch_for_narrative,
+        dex=dex,
+        social_evidence=social_evidence,
+    )
 
     return format_research_card(
         token_name=token_name or (dex or {}).get("token_name") or ticker,
@@ -3380,6 +3407,7 @@ async def research_token(session: aiohttp.ClientSession, query: str) -> str:
         influencer_mentions=influencer_mentions,
         nitter_mentions=nitter_mentions,
         social_evidence=social_evidence,
+        project_narrative=project_narrative.to_dict(),
         launch_status=launch_status,
     )
 
@@ -4154,8 +4182,17 @@ def build_ai_summary_placeholder(launch: dict, dex: dict | None, verdict: dict |
     if verdict:
         return verdict.get("human_readable") or ""
 
-    token_type = infer_initial_token_type(launch, dex)
-    product = build_initial_product_line(launch, dex)
+    social_confirmation = launch.get("social_confirmation") or {}
+    social_evidence = social_confirmation.get("social_evidence") or social_confirmation
+    narrative = extract_project_narrative(
+        ca=launch.get("address") or "",
+        ticker=launch.get("symbol") or "",
+        name=(dex or {}).get("token_name") or launch.get("name") or "",
+        launch=launch,
+        dex=dex,
+        social_evidence=social_evidence if isinstance(social_evidence, dict) else {},
+    )
+    token_type = narrative_token_type(narrative, infer_initial_token_type(launch, dex))
     focus = "market data unavailable"
     risks = ["deep research not connected yet"]
     score = 0.0
@@ -4174,17 +4211,25 @@ def build_ai_summary_placeholder(launch: dict, dex: dict | None, verdict: dict |
             score += 0.8
         if dex_social_label(dex, "twitter"):
             score += 0.7
+        if narrative.confidence == "HIGH":
+            score += 1.0
+        elif narrative.confidence == "MEDIUM":
+            score += 0.6
         if mcap and liquidity and mcap / max(liquidity, 1) > 10:
             risks.append("MC is high relative to liquidity")
+        elif narrative.is_ticker_only_evidence:
+            risks.append("narrative is ticker-only, not CA-confirmed")
         else:
             risks.append("social and spoof checks still pending")
     score = min(score, 7.0)
     return (
         f"🧠 <b>AI brief</b> • Initial <b>{score:.1f}/10</b> · <b>WAIT</b>\n\n"
         f"• <b>Type:</b> {h(token_type)}\n"
-        f"• <b>Product:</b> {h(product[:220])}\n"
+        f"• <b>Product:</b> {h(narrative.product[:220])}\n"
+        f"• <b>Why value:</b> {h(narrative.why_it_matters[:220])}\n"
         f"• <b>Focus:</b> {h(focus)}\n"
-        f"• <b>Risks:</b> {h('; '.join(risks[:2]))}"
+        f"• <b>Risks:</b> {h('; '.join(risks[:2]))}\n"
+        f"• <b>Confidence:</b> {h(narrative.confidence)}"
     )
 
 
@@ -4235,6 +4280,7 @@ def format_research_ai_brief(
     influencer_mentions: list[dict],
     nitter_mentions: list[dict] | None = None,
     social_evidence: dict | None = None,
+    project_narrative: dict | None = None,
     launch_status: str | None = None,
 ) -> str:
     score = 0.0
@@ -4259,21 +4305,25 @@ def format_research_ai_brief(
         score += 1.0
     score = min(10.0, score)
 
-    product = "No product differentiation confirmed from current evidence."
+    product = (project_narrative or {}).get("product") or "No product differentiation confirmed from current evidence."
     top_tweet = (influencer_mentions or x_mentions or [{}])[0]
-    if top_tweet.get("text") and float(top_tweet.get("thesis_quality") or 0) >= 4:
+    if not (project_narrative or {}).get("product") and top_tweet.get("text") and float(top_tweet.get("thesis_quality") or 0) >= 4:
         product = research_clean_text(top_tweet["text"])[:180]
-    elif token_name:
+    elif not (project_narrative or {}).get("product") and token_name:
         product = f"{token_name} has market/social traces, but product proof is not confirmed yet."
 
     thesis = (social_evidence or {}).get("thesis") or ""
     value_assessment = (social_evidence or {}).get("value_assessment") or ""
     social_score = int((social_evidence or {}).get("social_score") or 0)
     breakdown = (social_evidence or {}).get("score_breakdown") or {}
-    project_value = (social_evidence or {}).get("project_value") or infer_research_token_type(token_name, ticker, x_mentions)
+    project_value = (
+        narrative_token_type(project_narrative, "")
+        if project_narrative else ""
+    ) or (social_evidence or {}).get("project_value") or infer_research_token_type(token_name, ticker, x_mentions)
     evidence_line = format_compact_evidence_refs(social_evidence or {})
     thesis_line = thesis if thesis else product[:180]
-    value_line = value_assessment or "No clear value case confirmed from the current evidence."
+    value_line = (project_narrative or {}).get("why_it_matters") or value_assessment or "No clear value case confirmed from the current evidence."
+    confidence = (project_narrative or {}).get("confidence") or "LOW"
     split = ""
     if breakdown:
         split = (
@@ -4287,10 +4337,12 @@ def format_research_ai_brief(
         + (f" · Social <b>{social_score}/100</b>" if social_score else "")
         + "\n\n"
         f"• <b>Type:</b> {h(project_value)}\n"
+        f"• <b>Product:</b> {h(product[:220])}\n"
         f"• <b>Thesis:</b> {h(thesis_line[:220])}\n"
         f"• <b>Why value:</b> {h(value_line[:220])}\n"
         f"• <b>Evidence:</b> {evidence_line}\n"
         f"• <b>Risks:</b> {h('; '.join(risks[:2]) if risks else 'no major deterministic risk detected')}"
+        f"\n• <b>Confidence:</b> {h(confidence)}"
         f"{split}"
     )
 
@@ -4526,6 +4578,7 @@ def format_research_card(
     influencer_mentions: list[dict],
     nitter_mentions: list[dict] | None = None,
     social_evidence: dict | None = None,
+    project_narrative: dict | None = None,
     launch_status: str | None = None,
 ) -> str:
     safe_name = h(token_name or ticker or address[:10])
@@ -4568,6 +4621,7 @@ def format_research_card(
             x_mentions=x_mentions,
             influencer_mentions=influencer_mentions,
             social_evidence=social_evidence,
+            project_narrative=project_narrative,
             launch_status=launch_status,
         )
         + "\n\n"

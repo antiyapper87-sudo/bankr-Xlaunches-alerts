@@ -17,10 +17,16 @@ def build_stub_summary(verdict: dict[str, Any], *, language: str) -> str:
     token_type = research.get("token_type") or "Unknown"
     market = research.get("market") or {}
     social = research.get("social") or {}
+    project_narrative = research.get("project_narrative") or {}
     reasons = verdict.get("reasons") or []
     risks = verdict.get("risks") or []
-    thesis = social.get("evidence_thesis") or "Evidence is limited and the value case is not fully proven."
-    value = social.get("value_assessment") or (reasons[0] if reasons else "No strong social value case is confirmed yet")
+    product = project_narrative.get("product") or research.get("product_note") or "Project description is not confirmed."
+    thesis = social.get("evidence_thesis") or product
+    value = (
+        project_narrative.get("why_it_matters")
+        or social.get("value_assessment")
+        or (reasons[0] if reasons else "No strong social value case is confirmed yet")
+    )
     risk = risks[0] if risks else "no major deterministic risk was detected"
     market_line = (
         f"MC ${float(market.get('mcap') or 0):,.0f}, "
@@ -30,13 +36,13 @@ def build_stub_summary(verdict: dict[str, Any], *, language: str) -> str:
     if language == "ru":
         return (
             f"${symbol}: {label}, {score / 10:.1f}/10. "
-            f"Тип: {token_type}. Рынок: {market_line}. "
+            f"Тип: {token_type}. Проект: {product}. Рынок: {market_line}. "
             f"Тезис: {thesis} Оценка ценности: {value}. Главный риск: {risk}. "
             "Это deterministic AI-brief stub без внешней модели."
         )
     return (
         f"${symbol}: {label}, {score / 10:.1f}/10. "
-        f"Type: {token_type}. Market: {market_line}. "
+        f"Type: {token_type}. Project: {product}. Market: {market_line}. "
         f"Thesis: {thesis} Value read: {value}. Main risk: {risk}. "
         "This is a deterministic AI-brief stub without an external model."
     )

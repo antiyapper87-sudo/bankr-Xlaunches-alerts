@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -292,6 +293,7 @@ def score_deployer(research: dict[str, Any]) -> tuple[float, list[str], list[str
 def score_narrative(research: dict[str, Any]) -> tuple[float, list[str], list[str]]:
     token_type = research.get("token_type") or ""
     product_note = research.get("product_note") or ""
+    project_narrative = research.get("project_narrative") or {}
     social = research.get("social") or {}
     project_value = social.get("project_value") or ""
     project_value_score = int(social.get("project_value_score") or 0)
@@ -299,6 +301,7 @@ def score_narrative(research: dict[str, Any]) -> tuple[float, list[str], list[st
     reasons: list[str] = []
     risks: list[str] = []
     score = 1.0
+    narrative_confidence = str(project_narrative.get("confidence") or "").upper()
 
     weak_product = not product_note or any(
         phrase in product_note.lower()
@@ -322,6 +325,20 @@ def score_narrative(research: dict[str, Any]) -> tuple[float, list[str], list[st
     if token_type and token_type != "Memecoin / Experimental":
         score += 2
         reasons.append(f"clearer narrative: {token_type}")
+    if narrative_confidence == "HIGH":
+        score += 3
+        reasons.append("project narrative is confirmed by multiple sources")
+    elif narrative_confidence == "MEDIUM":
+        score += 2
+        reasons.append("project narrative has usable confirmation")
+    elif project_narrative:
+        risks.append("project narrative confidence is low")
+    if project_narrative.get("is_ticker_only_evidence"):
+        score -= 3
+        risks.append("project narrative is ticker-only, not contract-confirmed")
+    if project_narrative.get("same_ticker_collision"):
+        score -= 4
+        risks.append("ticker collision weakens narrative attribution")
     if product_note and not weak_product:
         score += 3
         reasons.append("product/narrative metadata is present")
@@ -357,6 +374,10 @@ def fmt_compact_int(value: int) -> str:
     return str(value)
 
 
+def esc(value: Any) -> str:
+    return html.escape(str(value or ""))
+
+
 def format_evidence_refs(research: dict[str, Any], *, limit: int = 3) -> str:
     social = research.get("social") or {}
     tweets = social.get("evidence_tweets") or []
@@ -379,7 +400,8 @@ def format_evidence_refs(research: dict[str, Any], *, limit: int = 3) -> str:
 
 
 def build_product_line(research: dict[str, Any], reasons: list[str]) -> str:
-    product_note = research.get("product_note") or "Product differentiation is not proven yet."
+    project_narrative = research.get("project_narrative") or {}
+    product_note = project_narrative.get("product") or research.get("product_note") or "Product differentiation is not proven yet."
     product_note = " ".join(str(product_note).split())
     if len(product_note) > 145:
         product_note = product_note[:142] + "..."
@@ -400,18 +422,22 @@ def build_human_readable(
 ) -> str:
     token_type = research.get("token_type") or "Unknown"
     social = research.get("social") or {}
+    project_narrative = research.get("project_narrative") or {}
     thesis = social.get("evidence_thesis") or ""
     value_assessment = social.get("value_assessment") or ""
     social_score = int(social.get("social_score") or 0)
     breakdown = social.get("score_breakdown") or {}
     project_value = social.get("project_value") or token_type
     product_line = build_product_line(research, reasons)
+    why_value = project_narrative.get("why_it_matters") or value_assessment or product_line
+    if len(why_value) > 220:
+        why_value = why_value[:217] + "..."
     thesis_line = thesis or product_line
     if len(thesis_line) > 220:
         thesis_line = thesis_line[:217] + "..."
     evidence_line = format_evidence_refs(research)
     risk_text = top_items(risks, 2) or "no major deterministic risk detected"
-    value_line = value_assessment or product_line
+    value_line = value_assessment or why_value
     if len(value_line) > 220:
         value_line = value_line[:217] + "..."
     split = ""
@@ -424,12 +450,13 @@ def build_human_readable(
         )
     return (
         f"🧠 <b>AI brief</b> • Score <b>{score / 10:.1f}/10</b> · <b>{label}</b>\n\n"
-        f"• <b>Type:</b> {project_value}\n"
-        f"• <b>Thesis:</b> {thesis_line}\n"
-        f"• <b>Why value:</b> {value_line}\n"
+        f"• <b>Type:</b> {esc(project_value)}\n"
+        f"• <b>Product:</b> {esc(product_line)}\n"
+        f"• <b>Thesis:</b> {esc(thesis_line)}\n"
+        f"• <b>Why value:</b> {esc(why_value)}\n"
         f"• <b>Evidence:</b> {evidence_line}\n"
-        f"• <b>Risks:</b> {risk_text}\n"
-        f"• <b>Confidence:</b> {confidence}"
+        f"• <b>Risks:</b> {esc(risk_text)}\n"
+        f"• <b>Confidence:</b> {esc(confidence)}"
         + (f"\n• <b>Social Score:</b> {social_score}/100" if social_score else "")
         + split
     )

@@ -38,6 +38,7 @@ from database import (
     utc_now,
 )
 from services.delivery import prepare_signal_fanout, prepare_tenant_delivery
+from services.project_narrative import extract_project_narrative
 from services.research_pipeline import run_research_pipeline
 from services import spoof_detector
 from services.spoof_detector import detect_spoof_signals
@@ -1510,3 +1511,39 @@ def test_geckoterminal_same_ticker_parser_keeps_only_exact_base_symbol_candidate
         min_age_seconds=spoof_detector.MAX_TOKEN_AGE,
         max_age_seconds=spoof_detector.SAME_TICKER_PRIOR_LOOKBACK.total_seconds(),
     )
+
+
+def test_project_narrative_uses_qualified_x_evidence_without_screener_description():
+    token_ca = ca(50)
+    tweets = [
+        {
+            "username": f"analyst{i}",
+            "text": f"{token_ca} $VEIL is building private shielded swaps for Base users and MEV-resistant trading.",
+            "views": 2000,
+            "likes": 25,
+        }
+        for i in range(3)
+    ]
+    narrative = extract_project_narrative(
+        ca=token_ca,
+        ticker="VEIL",
+        name="Veil",
+        social_evidence={"qualified_tweets": 3, "top_tweets": tweets},
+    )
+
+    assert narrative.confidence == "MEDIUM"
+    assert "privacy" in narrative.product.lower() or "shielded" in narrative.product.lower()
+    assert narrative.ca_confirmed_mentions == 3
+    assert narrative.is_ticker_only_evidence is False
+
+
+def test_project_narrative_does_not_infer_product_from_ticker_only():
+    narrative = extract_project_narrative(
+        ca=ca(51),
+        ticker="VEIL",
+        name="Veil",
+        social_evidence={"qualified_tweets": 0, "top_tweets": []},
+    )
+
+    assert narrative.confidence == "LOW"
+    assert narrative.product == "No verified project description found from screeners or qualified X evidence."

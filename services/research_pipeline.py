@@ -16,6 +16,7 @@ from database import (
     upsert_historical_launch,
     utc_now,
 )
+from services.project_narrative import extract_project_narrative, narrative_token_type
 
 
 def fmt_usd_short(value: float) -> str:
@@ -271,14 +272,29 @@ async def run_research_pipeline(
             flags.append("tracked_wallet_inflow")
         if smart_money["inflow_wallets"] >= 3:
             flags.append("smart_wallet_convergence")
+        project_narrative = extract_project_narrative(
+            ca=launch.ca,
+            ticker=launch.ticker or "",
+            name=launch.name or "",
+            launch={**(launch.raw_json or {}), "source": launch.source},
+            dex=dex,
+            social_evidence={
+                "qualified_tweets": social_confirmation.get("qualified_tweets"),
+                "thesis": social_confirmation.get("evidence_thesis"),
+                "value_assessment": social_confirmation.get("value_assessment"),
+                "top_tweets": social_confirmation.get("evidence_tweets") or [],
+            },
+            flags=flags,
+        )
         processed = {
             "schema": "token-research-v2.1",
             "symbol": (launch.ticker or "").lstrip("$"),
             "name": launch.name or "",
             "source": source_info,
-            "token_type": classify_token_type(launch, dex),
+            "project_narrative": project_narrative.to_dict(),
+            "token_type": narrative_token_type(project_narrative, classify_token_type(launch, dex)),
             "owner_note": infer_owner_note(launch),
-            "product_note": infer_product_note(launch, dex),
+            "product_note": project_narrative.product or infer_product_note(launch, dex),
             "market": market,
             "social": {
                 "x_username": source_info.get("x_username"),
