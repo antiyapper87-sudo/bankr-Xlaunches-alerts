@@ -87,7 +87,7 @@ async def _run_block_reader(ca: str) -> dict:
                 result = await scan_base_token_blocks(
                     db,
                     session,
-                    rpc_url=os.getenv("ALCHEMY_RPC_URL", ""),
+                    rpc_url=settings.alchemy_rpc_url or os.getenv("ALCHEMY_RPC_URL", ""),
                     token_id=ca.lower(),
                     dex=market or (launch_row.market_json if launch_row else None),
                     launch=launch,
@@ -128,7 +128,7 @@ async def _enrich_launch(ca: str) -> None:
                 result = await scan_base_token_blocks(
                     db,
                     session,
-                    rpc_url=os.getenv("ALCHEMY_RPC_URL", ""),
+                    rpc_url=settings.alchemy_rpc_url or os.getenv("ALCHEMY_RPC_URL", ""),
                     token_id=ca.lower(),
                     dex=market or (launch_row.market_json if launch_row else None),
                     launch=launch,

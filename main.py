@@ -186,7 +186,7 @@ TELEGRAM_BACKGROUND_COMMAND_LIMIT = int(os.getenv("TELEGRAM_BACKGROUND_COMMAND_L
 PUSHOVER_USER_KEY = os.getenv("PUSHOVER_USER_KEY", "")
 PUSHOVER_API_TOKEN = os.getenv("PUSHOVER_API_TOKEN", "")
 
-ALCHEMY_RPC_URL = os.getenv("ALCHEMY_RPC_URL", "")
+ALCHEMY_RPC_URL = settings.alchemy_rpc_url or os.getenv("ALCHEMY_RPC_URL", "")
 
 BANKR_API_URL = "https://api.bankr.bot/token-launches"
 CLANKER_API_URL = "https://www.clanker.world/api/tokens"

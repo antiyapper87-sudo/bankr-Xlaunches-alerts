@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     coingecko_poll_interval: int = 720
     coingecko_rate_limit_per_min: int = 12
 
+    alchemy_rpc_url: str = ""
+
     database_url: str = "postgresql+asyncpg://user:pass@localhost:5432/bankr_alerts"
     local_database_url: str = "sqlite+aiosqlite:///data/bot.db"
     database_auto_create: bool = True
