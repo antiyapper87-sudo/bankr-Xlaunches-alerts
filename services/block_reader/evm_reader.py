@@ -82,11 +82,29 @@ async def scan_base_token_blocks(
     from_block = max(0, int(pair_block) - PAIR_WINDOW_BEFORE_BLOCKS)
     to_block = min(latest, int(pair_block) + PAIR_WINDOW_AFTER_BLOCKS)
     dex_type = normalize_dex_type(dex.get("dex_id") or dex.get("dex_type") or "")
-    transfers = (await fetch_token_transfers(rpc, token=token_id, from_block=from_block, to_block=to_block, max_logs=MAX_LOGS_PER_SCAN))[:MAX_TX_TO_PARSE]
+    try:
+        transfers = (await fetch_token_transfers(rpc, token=token_id, from_block=from_block, to_block=to_block, max_logs=MAX_LOGS_PER_SCAN))[:MAX_TX_TO_PARSE]
+    except Exception as exc:
+        await upsert_block_scan(
+            db,
+            chain="base",
+            token_id=token_id,
+            pair_address=pair_address,
+            from_block=from_block,
+            to_block=to_block,
+            status="failed",
+            confidence="LOW",
+            summary_json={"reason": "transfer log scan failed", "error": str(exc)[:240], "free_tier_mode": True},
+            error=str(exc),
+        )
+        return {"provider": "alchemy", "status": "failed", "confidence": "LOW", "signals": [], "bundle_risk": 0, "prebuy_risk": 0, "error": str(exc)[:160]}
     first_buyers = first_buyers_from_transfers(transfers, pair_address=pair_address, limit=MAX_FIRST_BUYERS)
     first_wallets = [pos.wallet for pos in first_buyers]
     positions = compute_positions_from_transfers(transfers, pair_address=pair_address, wallets=set(first_wallets))
-    balances = await get_current_balances(rpc, token=token_id, wallets=first_wallets[:MAX_FIRST_BUYERS], batch_size=BALANCE_BATCH_SIZE)
+    try:
+        balances = await get_current_balances(rpc, token=token_id, wallets=first_wallets[:MAX_FIRST_BUYERS], batch_size=BALANCE_BATCH_SIZE)
+    except Exception:
+        balances = {}
     for wallet, balance in balances.items():
         if wallet in positions:
             positions[wallet].current_balance_raw = balance
@@ -137,7 +155,10 @@ async def scan_base_token_blocks(
         pair_address=pair_address,
         early_wallets=set(first_wallets),
     )
-    liq_logs = await fetch_pool_liquidity_logs(rpc, pair_address=pair_address, dex_type=dex_type, from_block=from_block, to_block=to_block)
+    try:
+        liq_logs = await fetch_pool_liquidity_logs(rpc, pair_address=pair_address, dex_type=dex_type, from_block=from_block, to_block=to_block)
+    except Exception:
+        liq_logs = []
     liq = score_liquidity_logs(liq_logs, dex_type=dex_type, pair_created_block=int(pair_block))
     confidence = "HIGH" if len(transfers) >= 20 and first_buyers else "MEDIUM" if first_buyers else "LOW"
     summary = BlockRiskSummary(

@@ -7,6 +7,7 @@ from services.block_reader.base_rpc import AsyncJsonRpcClient, get_logs_chunked,
 from services.block_reader.constants import (
     BALANCE_OF_SELECTOR,
     DECIMALS_SELECTOR,
+    GET_LOGS_CHUNK_BLOCKS,
     MAX_LOGS_PER_SCAN,
     TOTAL_SUPPLY_SELECTOR,
     TRANSFER_TOPIC,
@@ -68,7 +69,7 @@ async def fetch_token_transfers(
         topics=[TRANSFER_TOPIC],
         from_block=from_block,
         to_block=to_block,
-        chunk_size=80,
+        chunk_size=GET_LOGS_CHUNK_BLOCKS,
         max_logs=max_logs,
     )
     decoded = [decode_transfer_log(item) for item in logs]

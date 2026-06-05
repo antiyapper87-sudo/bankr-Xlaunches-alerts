@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from services.block_reader.base_rpc import AsyncJsonRpcClient, get_logs_chunked, parse_hex_int
-from services.block_reader.constants import V2_BURN_TOPIC, V2_MINT_TOPIC, V3_BURN_TOPIC, V3_INITIALIZE_TOPIC, V3_MINT_TOPIC
+from services.block_reader.constants import GET_LOGS_CHUNK_BLOCKS, V2_BURN_TOPIC, V2_MINT_TOPIC, V3_BURN_TOPIC, V3_INITIALIZE_TOPIC, V3_MINT_TOPIC
 
 
 LIQUIDITY_TOPICS = {
@@ -42,7 +42,7 @@ async def fetch_pool_liquidity_logs(
         topics=[[topic.lower() for topic in topic_map]],
         from_block=from_block,
         to_block=to_block,
-        chunk_size=80,
+        chunk_size=GET_LOGS_CHUNK_BLOCKS,
         max_logs=1_000,
     )
 

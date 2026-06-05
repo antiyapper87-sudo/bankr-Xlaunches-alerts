@@ -103,7 +103,7 @@ async def get_logs_chunked(
     topics: list[Any] | None,
     from_block: int,
     to_block: int,
-    chunk_size: int = 80,
+    chunk_size: int = 10,
     max_logs: int = 5_000,
 ) -> list[dict[str, Any]]:
     logs: list[dict[str, Any]] = []
