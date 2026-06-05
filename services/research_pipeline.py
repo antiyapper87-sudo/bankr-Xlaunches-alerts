@@ -9,6 +9,7 @@ from database import (
     Launch,
     complete_token_research,
     fail_token_research,
+    get_latest_block_scan,
     get_deployer_history,
     get_launch,
     list_recent_wallet_events_for_ca,
@@ -323,6 +324,26 @@ async def run_research_pipeline(
                 "ticker_context_tweets": (launch.raw_json or {}).get("social_confirmation", {}).get("social_evidence", {}).get("ticker_context_tweets") or [],
             },
         )
+        block_scan = await get_latest_block_scan(db, chain="base", token_id=launch.ca)
+        onchain = (
+            {
+                **(block_scan.summary_json or {}),
+                "provider": block_scan.provider,
+                "scan_status": block_scan.status,
+                "confidence": block_scan.confidence,
+                "pair_address": block_scan.pair_address or "",
+                "from_block": block_scan.from_block,
+                "to_block": block_scan.to_block,
+            }
+            if block_scan and block_scan.status == "completed"
+            else {
+                "provider": "stub",
+                "scan_status": "pending",
+                "wallet_profile": "pending",
+                "bundle": {},
+                "holder_distribution": "pending",
+            }
+        )
         processed = {
             "schema": "token-research-v2.1",
             "symbol": (launch.ticker or "").lstrip("$"),
@@ -344,12 +365,7 @@ async def run_research_pipeline(
                 "key": deployer_key,
                 **deployer_history,
             },
-            "onchain": {
-                "provider": "stub",
-                "wallet_profile": "pending",
-                "bundle": {},
-                "holder_distribution": "pending",
-            },
+            "onchain": onchain,
             "smart_money": smart_money,
             "flags": flags,
             "brief_inputs": {

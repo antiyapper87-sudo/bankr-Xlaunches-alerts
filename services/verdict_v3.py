@@ -8,7 +8,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import create_verdict_v3, get_latest_token_research, list_bundle_signals, utc_now
+from database import create_verdict_v3, get_latest_block_scan, get_latest_token_research, list_bundle_signals, utc_now
 from services.agent_memory import build_memory_context
 
 
@@ -144,14 +144,17 @@ def score_lore(lore: dict[str, Any]) -> tuple[float, list[str], list[str]]:
 
 
 def score_onchain(onchain: dict[str, Any]) -> tuple[float, list[str], list[str]]:
-    bundle_risk = num(onchain.get("bundle_risk"))
+    bundle_risk = num(onchain.get("bundle_risk") or onchain.get("bundle_risk_score"))
+    sniper_risk = num(onchain.get("sniper_score"))
     prebuy_risk = num(onchain.get("prebuy_risk"))
-    holder_risk = num(onchain.get("holder_concentration_risk"))
-    risk = max(bundle_risk, prebuy_risk, holder_risk)
+    dev_risk = num(onchain.get("dev_dump_risk") or onchain.get("dev_risk_score"))
+    liquidity_risk = num(onchain.get("liquidity_risk") or onchain.get("liquidity_risk_score"))
+    holder_risk = num(onchain.get("holder_concentration_risk") or onchain.get("holder_concentration_score"))
+    risk = max(bundle_risk, sniper_risk, prebuy_risk, dev_risk, liquidity_risk, holder_risk, num(onchain.get("overall_risk_score")))
     reasons: list[str] = []
     risks: list[str] = []
     if risk >= 80:
-        risks.append("high bundle/prebuy risk")
+        risks.append("high on-chain manipulation risk")
         return 0.0, reasons, risks
     if risk >= 50:
         risks.append("medium on-chain risk")
@@ -159,6 +162,17 @@ def score_onchain(onchain: dict[str, Any]) -> tuple[float, list[str], list[str]]
     if onchain.get("provider") == "stub" or not onchain:
         risks.append("on-chain bundle scan pending")
         return 6.0, reasons, risks
+    if bundle_risk >= 25:
+        wallets = int(onchain.get("suspected_bundle_wallets_count") or 0)
+        risks.append(f"suspected early wallet cluster: {wallets} wallets")
+    if sniper_risk >= 25:
+        risks.append("sniper-like first-block launch pattern detected")
+    if dev_risk >= 25:
+        risks.append("deployer-linked behavior detected")
+    if liquidity_risk >= 25:
+        risks.append("liquidity removal/anomaly detected")
+    if risks:
+        return 8.0, reasons, risks
     reasons.append("no severe on-chain bundle risk")
     return 12.0, reasons, risks
 
@@ -333,6 +347,15 @@ async def build_verdict_v3(db: AsyncSession, *, ca: str, launch: dict[str, Any])
         launch_source=launch.get("source") or source.get("source") or "",
     )
     bundle_signals = await list_bundle_signals(db, chain="base", token_id=ca)
+    block_scan = await get_latest_block_scan(db, chain="base", token_id=ca)
+    if block_scan and block_scan.status == "completed":
+        research["onchain"] = {
+            **(research.get("onchain") or {}),
+            **(block_scan.summary_json or {}),
+            "provider": block_scan.provider,
+            "scan_status": block_scan.status,
+            "confidence": block_scan.confidence,
+        }
     if bundle_signals:
         max_risk = max(float(item.risk_score or 0) for item in bundle_signals)
         research["onchain"] = {

@@ -1975,6 +1975,16 @@ async def list_bundle_signals(db: AsyncSession, *, chain: str, token_id: str) ->
     return list(await db.scalars(stmt))
 
 
+async def get_latest_block_scan(db: AsyncSession, *, chain: str, token_id: str, provider: str = "alchemy") -> BlockScan | None:
+    stmt = (
+        select(BlockScan)
+        .where(BlockScan.identity_key == identity_key(chain, token_id), BlockScan.provider == provider)
+        .order_by(BlockScan.updated_at.desc())
+        .limit(1)
+    )
+    return await db.scalar(stmt)
+
+
 async def upsert_spoof_signal(
     db: AsyncSession,
     *,

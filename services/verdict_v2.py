@@ -62,11 +62,12 @@ Narrative must be concrete, e.g. "AI inference marketplace on Base", "decentrali
 """
 
 WEIGHTS = {
-    "market": 32,
-    "social": 28,
-    "risk": 20,
-    "deployer": 12,
+    "market": 28,
+    "social": 25,
+    "risk": 18,
+    "deployer": 11,
     "narrative": 8,
+    "onchain": 10,
 }
 
 
@@ -90,6 +91,8 @@ def fmt_usd_short(value: float) -> str:
 
 
 def label_for_score(score: float, hard_risks: list[str]) -> str:
+    if any("critical on-chain" in risk.lower() or "high on-chain" in risk.lower() for risk in hard_risks):
+        return "HIGH RISK" if score >= 56 else "SKIP"
     if any("prior $" in risk.lower() or "ticker collision" in risk.lower() for risk in hard_risks):
         return "SKIP" if score < 72 else "WAIT"
     if score >= 72:
@@ -431,6 +434,47 @@ def score_narrative(research: dict[str, Any]) -> tuple[float, list[str], list[st
     return clamp(score, 0, WEIGHTS["narrative"]), reasons, risks
 
 
+def score_onchain(research: dict[str, Any]) -> tuple[float, list[str], list[str]]:
+    onchain = research.get("onchain") or {}
+    if not onchain or onchain.get("provider") == "stub":
+        return WEIGHTS["onchain"] * 0.55, [], ["on-chain scan pending"]
+    confidence = str(onchain.get("confidence") or "LOW").upper()
+    if confidence == "LOW":
+        return WEIGHTS["onchain"] * 0.6, [], ["on-chain confidence is low"]
+
+    bundle = num(onchain.get("bundle_risk") or onchain.get("bundle_risk_score"))
+    sniper = num(onchain.get("sniper_score"))
+    prebuy = num(onchain.get("prebuy_risk"))
+    dev = num(onchain.get("dev_dump_risk") or onchain.get("dev_risk_score"))
+    liquidity = num(onchain.get("liquidity_risk") or onchain.get("liquidity_risk_score"))
+    holder = num(onchain.get("holder_concentration_risk") or onchain.get("holder_concentration_score"))
+    overall = max(bundle, sniper, prebuy, dev, liquidity, holder, num(onchain.get("overall_risk_score")))
+
+    score = float(WEIGHTS["onchain"])
+    reasons: list[str] = []
+    risks: list[str] = []
+    if overall >= 80:
+        score -= 9
+        risks.append("critical on-chain manipulation risk")
+    elif overall >= 50:
+        score -= 6
+        risks.append("high on-chain manipulation risk")
+    elif overall >= 25:
+        score -= 3.5
+        risks.append("medium on-chain manipulation risk")
+    else:
+        reasons.append("quick on-chain scan found no severe launch manipulation")
+    if bundle >= 25:
+        risks.append(f"suspected early wallet cluster: {int(onchain.get('suspected_bundle_wallets_count') or 0)} wallets")
+    if sniper >= 25:
+        risks.append("sniper-like first-block launch pattern detected")
+    if dev >= 25:
+        risks.append("deployer-linked launch behavior detected")
+    if liquidity >= 25:
+        risks.append("liquidity removal/anomaly detected")
+    return clamp(score, 0, WEIGHTS["onchain"]), reasons, risks
+
+
 def confidence_for(research: dict[str, Any], spoof_signals: list[dict[str, Any]]) -> str:
     social = research.get("social") or {}
     market = research.get("market") or {}
@@ -563,6 +607,7 @@ async def build_verdict_v2(
     risk_score, risk_reasons, risk_risks = score_risk(spoof, research)
     deployer_score, deployer_reasons, deployer_risks = score_deployer(research)
     narrative_score, narrative_reasons, narrative_risks = score_narrative(research)
+    onchain_score, onchain_reasons, onchain_risks = score_onchain(research)
 
     categories = {
         "market": round(market_score, 1),
@@ -570,9 +615,10 @@ async def build_verdict_v2(
         "risk": round(risk_score, 1),
         "deployer": round(deployer_score, 1),
         "narrative": round(narrative_score, 1),
+        "onchain": round(onchain_score, 1),
     }
-    reasons = market_reasons + social_reasons + risk_reasons + deployer_reasons + narrative_reasons
-    risks = risk_risks + market_risks + social_risks + deployer_risks + narrative_risks
+    reasons = market_reasons + social_reasons + risk_reasons + deployer_reasons + narrative_reasons + onchain_reasons
+    risks = risk_risks + market_risks + social_risks + deployer_risks + narrative_risks + onchain_risks
     raw_score = sum(categories.values())
     score = round(clamp(raw_score, 0, 100), 1)
     label = label_for_score(score, risks)

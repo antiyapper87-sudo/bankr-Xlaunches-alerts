@@ -110,6 +110,8 @@ from research_pipeline import (
     format_verdict_block,
 )
 from services.delivery import prepare_signal_fanout
+from services.block_reader.evm_reader import scan_base_token_blocks
+from services.block_reader.formatter import format_onchain_block
 from services.fomo import (
     FOMO_DEFAULT_CHAIN_ID,
     FOMO_ENABLED,
@@ -3777,6 +3779,7 @@ async def research_token(
         dex=dex,
         social_evidence=social_evidence,
     )
+    onchain_summary = await run_manual_onchain_scan(session, address, dex, launch_for_narrative) if address else None
 
     body = format_research_card(
         title=title,
@@ -3790,6 +3793,7 @@ async def research_token(
         nitter_mentions=nitter_mentions,
         social_evidence=social_evidence,
         project_narrative=project_narrative.to_dict(),
+        onchain_summary=onchain_summary,
         launch_status=launch_status,
     )
     keyboard = build_signal_keyboard(address, ticker) if address else None
@@ -4709,6 +4713,34 @@ def build_research_takeaway(dex: dict | None, x_mentions: list[dict], influencer
     return f"{left}. Risk: {right}."
 
 
+async def run_manual_onchain_scan(
+    session: aiohttp.ClientSession,
+    address: str,
+    dex: dict | None,
+    launch: dict | None = None,
+    *,
+    timeout_sec: float = 18,
+) -> dict | None:
+    if not ALCHEMY_RPC_URL or not is_base_contract(address) or not dex or not dex.get("pair_address"):
+        return None
+    try:
+        async with db_session() as db:
+            return await asyncio.wait_for(
+                scan_base_token_blocks(
+                    db,
+                    session,
+                    rpc_url=ALCHEMY_RPC_URL,
+                    token_id=address.lower(),
+                    dex=dex,
+                    launch=launch or {"address": address.lower()},
+                ),
+                timeout=timeout_sec,
+            )
+    except Exception as exc:
+        log.warning(f"Manual on-chain scan skipped for {address[:10]}...: {exc}")
+        return None
+
+
 def infer_research_token_type(token_name: str, ticker: str, x_mentions: list[dict]) -> str:
     text = " ".join([token_name, ticker] + [m.get("text", "")[:160] for m in x_mentions[:3]]).lower()
     if any(term in text for term in ("agent", "ai", "bot", "inference", "autonomous")):
@@ -5108,6 +5140,7 @@ def format_research_card(
     nitter_mentions: list[dict] | None = None,
     social_evidence: dict | None = None,
     project_narrative: dict | None = None,
+    onchain_summary: dict | None = None,
     launch_status: str | None = None,
     title: str = "Research",
 ) -> str:
@@ -5166,13 +5199,15 @@ def format_research_card(
             address=address,
         ),
     ]
+    if onchain_summary:
+        blocks.append(format_onchain_block(onchain_summary))
     return safe_join_blocks(blocks, limit=3900, truncation_note="Research output truncated.")
 
 
 SOURCE_EMOJIS = {"bankr": "🤖", "clanker": "⚙️", "virtuals": "🤖", "dexscreener": "📊", "coingecko": "🦎"}
 
 
-def format_signal_telegram(launch: dict, dex: dict | None) -> str:
+def format_signal_telegram(launch: dict, dex: dict | None, onchain_summary: dict | None = None) -> str:
     source_key = launch["source"]
     source = h(source_key.upper())
     name = h(launch["name"])
@@ -5235,6 +5270,7 @@ def format_signal_telegram(launch: dict, dex: dict | None) -> str:
         f"•{one_h_emoji} <b>1h:</b> {change_1h:+.1f}%\n\n"
         f"🔗 " + " · ".join(links) + "\n\n"
         f"{build_ai_summary_placeholder(launch, dex)}"
+        + (f"\n\n{format_onchain_block(onchain_summary)}" if onchain_summary else "")
     )
 
 
@@ -5849,6 +5885,7 @@ async def analyze_ca_for_command(
     language: str = "en",
 ) -> dict:
     launch, dex = await ensure_launch_for_analysis(session, ca)
+    await run_manual_onchain_scan(session, ca, dex, launch)
     async with db_session() as db:
         return await analyze_token_intelligence(
             db,
@@ -5873,7 +5910,8 @@ async def send_signal(session: aiohttp.ClientSession, launch: dict, dex: dict, s
     _address_map[addr_truncated] = address
     await persist_callback_ref(addr_truncated, address, kind="xsignal")
 
-    tg_text = format_signal_telegram(launch, dex)
+    onchain_summary = await run_manual_onchain_scan(session, address, dex, launch, timeout_sec=6)
+    tg_text = format_signal_telegram(launch, dex, onchain_summary=onchain_summary)
     wa_text = format_alert_whatsapp(launch, dex)
     keyboard = build_signal_keyboard(address, symbol)
     delivery_payload = {
